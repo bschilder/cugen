@@ -586,8 +586,10 @@ def read_cugen(path: str, device: int = 0,
 
 
 def write_cugen(*a, **kw):
-    """Write a cugen file. v0.2 — for v0.1 use the existing pgen_to_cugen pipeline."""
-    raise NotImplementedError(
-        "cugen.io.write_cugen is planned for v0.2 — see README roadmap. "
-        "For v0.1, build cugen files using the legacy build_*_cugen.sh scripts."
-    )
+    """Write a .cugen file. See cugen.write.write_cugen for the signature.
+
+    Kept here so `from cugen.io import write_cugen` works; the implementation
+    lives in cugen.write alongside CugenWriter and validate_cugen.
+    """
+    from .write import write_cugen as _w
+    return _w(*a, **kw)

@@ -164,3 +164,7 @@ __all__ = [
     "realized_relationship_matrix",
     "set_toolkit",
 ]
+
+# --- writing / conversion (v0.1.8) ------------------------------------------
+from .write import CugenWriter, write_cugen, validate_cugen  # noqa: E402,F401
+from .convert import pgen2cugen, vcf2cugen, bed2cugen        # noqa: E402,F401
