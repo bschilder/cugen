@@ -47,6 +47,26 @@ def read_vcor(path):
     return df
 
 
+def _bfile_with_unique_ids(bfile, workdir="/tmp/_cmp"):
+    """plink joins are keyed on variant ID, and real datasets often have none:
+    every ID in 1000 Genomes chr22 after --make-bed is literally '.', so a
+    naive merge on (ID_A, ID_B) becomes a full cartesian product (it tried to
+    allocate 755 TiB). Rewrite the .bim with IDs equal to the row index, which
+    is also exactly the gidx bed2cugen assigns."""
+    os.makedirs(workdir, exist_ok=True)
+    bim = pd.read_csv(bfile + ".bim", sep="\t", header=None)
+    n_dup = len(bim) - bim[1].nunique()
+    bim[1] = [f"v{i}" for i in range(len(bim))]
+    out = os.path.join(workdir, "u")
+    bim.to_csv(out + ".bim", sep="\t", header=False, index=False)
+    for ext in (".bed", ".fam"):
+        dst = out + ext
+        if os.path.islink(dst) or os.path.exists(dst):
+            os.remove(dst)
+        os.symlink(os.path.abspath(bfile + ext), dst)
+    return out, len(bim), n_dup
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bfile", required=True)
@@ -55,7 +75,10 @@ def main():
     ap.add_argument("--window", type=int, default=500)
     a = ap.parse_args()
 
-    # restrict plink to the same leading p variants
+    a.bfile, n_var, n_dup = _bfile_with_unique_ids(a.bfile)
+    if n_dup:
+        print(f"note: {n_dup:,}/{n_var:,} variant IDs were non-unique; "
+              f"rewrote IDs as row indices for an exact join")
     bim = pd.read_csv(a.bfile + ".bim", sep="\t", header=None)
     keep = bim.iloc[:a.p, 1]
     keep_file = "/tmp/_keep.txt"
@@ -83,6 +106,9 @@ def main():
     ids = bim.iloc[:a.p, 1].to_numpy()
     df = df.assign(_a=ids[df["gidx_a"].to_numpy()],
                    _b=ids[df["gidx_b"].to_numpy()])
+    for g, nm in ((gu, "unphased"), (gp, "phased")):
+        if g.duplicated(["ID_A", "ID_B"]).any():
+            raise SystemExit(f"{nm} .vcor has duplicate (ID_A,ID_B) keys")
     m = df.merge(gu[["ID_A", "ID_B", "UNPHASED_R"]],
                  left_on=["_a", "_b"], right_on=["ID_A", "ID_B"], how="inner")
     m = m.merge(gp[["ID_A", "ID_B", "D", "DPRIME"]].rename(
