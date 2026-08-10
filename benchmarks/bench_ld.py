@@ -48,7 +48,8 @@ def _free_bytes():
     return cp.cuda.Device().mem_info[0] if HAS_CUPY else 0
 
 
-def run_once(path, p, *, stats, min_r2, window, tile_size, backend):
+def run_once(path, p, *, stats, min_r2, window, tile_size, backend,
+             max_pairs=1e15):
     """One timed run. Peak memory is measured as the largest observed dip in
     free device memory, sampled before and after -- CuPy's pool reports its own
     high-water mark, which is what we actually want."""
@@ -60,7 +61,7 @@ def run_once(path, p, *, stats, min_r2, window, tile_size, backend):
     t0 = time.perf_counter()
     df = ld_matrix(path, variant_range=(0, p), stats=stats, min_r2=min_r2,
                    window=window, tile_size=tile_size, backend=backend,
-                   verbose=False)
+                   max_pairs=int(max_pairs), verbose=False)
     dt = time.perf_counter() - t0
     peak = pool.total_bytes() if pool is not None else 0
     n_pairs = p * (p - 1) // 2 if window is None else None
@@ -91,6 +92,7 @@ def main():
     ap.add_argument("--tile-size", type=int, default=None)
     ap.add_argument("--backend", default="auto")
     ap.add_argument("--stats", default="r,r2")
+    ap.add_argument("--max-pairs", type=float, default=1e15)
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
@@ -122,9 +124,11 @@ def main():
         # warm the kernel/cuBLAS handles once so the first row isn't an outlier
         if p == grid[0]:
             ld_matrix(a.cugen, variant_range=(0, min(256, p)), stats=stats,
-                      backend=a.backend, verbose=False)
+                      backend=a.backend, max_pairs=int(a.max_pairs),
+                      verbose=False)
         r = run_once(a.cugen, p, stats=stats, min_r2=a.min_r2,
-                     window=a.window, tile_size=a.tile_size, backend=a.backend)
+                     window=a.window, tile_size=a.tile_size, backend=a.backend,
+                     max_pairs=a.max_pairs)
         results.append(r)
         print(f"{r['p']:>10,} {r['wall_s']:>10.3f} {r['peak_pool_gib']:>10.3f} "
               f"{(r['pairs_considered'] or 0):>16,} {r['pairs_emitted']:>12,} "
