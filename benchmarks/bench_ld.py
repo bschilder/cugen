@@ -20,10 +20,11 @@ if os.path.join(_ROOT, "tests") not in sys.path:
 
 import argparse
 import json
-import threading
 import time
 
 import numpy as np
+
+from _peak import PeakSampler
 
 import cugen as cg
 from cugen.ld import ld_matrix
@@ -49,37 +50,6 @@ def _free_bytes():
     return cp.cuda.Device().mem_info[0] if HAS_CUPY else 0
 
 
-class _PeakSampler:
-    """Sample live device allocations during a run.
-
-    NB pool.total_bytes() at the end is NOT the peak: cugen.ld calls
-    free_all_blocks() inside its tile loop, which shrinks the pool mid-run and
-    destroys the monotonic high-water property. (Symptom: 'peak' at p=50k
-    reading lower than at p=1k.) So sample used_bytes() on a thread instead.
-    """
-
-    def __init__(self, interval=0.002):
-        self.interval, self.peak, self._stop = interval, 0, False
-
-    def __enter__(self):
-        if HAS_CUPY:
-            self._t = threading.Thread(target=self._run, daemon=True)
-            self._t.start()
-        return self
-
-    def _run(self):
-        pool = cp.get_default_memory_pool()
-        while not self._stop:
-            self.peak = max(self.peak, pool.used_bytes())
-            time.sleep(self.interval)
-
-    def __exit__(self, *exc):
-        self._stop = True
-        if HAS_CUPY:
-            self._t.join(timeout=1.0)
-            self.peak = max(self.peak, cp.get_default_memory_pool().used_bytes())
-
-
 def run_once(path, p, *, stats, min_r2, window, tile_size, backend,
              max_pairs=1e15):
     """One timed run, with a sampled peak-memory measurement."""
@@ -88,7 +58,7 @@ def run_once(path, p, *, stats, min_r2, window, tile_size, backend,
     if pool is not None:
         pool.free_all_blocks()
     free_before = _free_bytes()
-    with _PeakSampler() as sampler:
+    with PeakSampler() as sampler:
         t0 = time.perf_counter()
         df = ld_matrix(path, variant_range=(0, p), stats=stats, min_r2=min_r2,
                        window=window, tile_size=tile_size, backend=backend,

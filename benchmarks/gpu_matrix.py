@@ -31,6 +31,8 @@ import time
 
 import numpy as np
 
+from _peak import PeakSampler
+
 
 
 def device_info():
@@ -131,12 +133,12 @@ def main():
                 npairs = p * (p - 1) // 2
                 rec["runs"].append({
                     "p": p, "wall_s": round(dt, 4),
-                    "peak_pool_gib": round(pool.total_bytes() / 2**30, 3),
+                    "peak_pool_gib": sampler.peak_gib,
                     "pairs": npairs,
                     "pairs_per_s": round(npairs / dt, 1),
                     "emitted": int(len(df)),
                 })
-                print(f"p={p:>7,}  {dt:7.3f}s  peak={pool.total_bytes()/2**30:6.3f} GiB"
+                print(f"p={p:>7,}  {dt:7.3f}s  peak={sampler.peak_gib:6.3f} GiB"
                       f"  {npairs/dt/1e6:9.1f} Mpair/s")
             except Exception as e:                            # noqa: BLE001
                 rec["runs"].append({"p": p, "error": f"{type(e).__name__}: {e}"})
