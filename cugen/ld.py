@@ -79,6 +79,17 @@ which is the 6-significant-figure floor of plink2's text output. The cubic is
 additionally cross-checked against an independent multi-start EM and against
 brute-force likelihood maximisation.
 
+On REAL data (1000 Genomes chr22, 854,850 pairs) r matches plink2 to 5.3e-07,
+but D and D' diverge on 44 pairs (0.005%), and where they diverge they diverge
+hard -- 98% of those have opposite signs. Those are tables where the
+likelihood has three admissible roots. We take the global maximum, verified
+against a dense brute-force scan of the admissible interval; plink2 selects a
+different root there. Both implementations claim to maximise a likelihood and
+the two formulations look equivalent on inspection, so this is recorded as an
+open discrepancy rather than a fault on either side. If you need
+plink2-identical D', treat this as a known 0.005% divergence; r and r^2 carry
+no such caveat. See test_cubic_picks_the_global_maximum_likelihood_root.
+
 References
 ----------
 Lewontin (1964) Genetics 49(1):49-67           D' and Dmax

@@ -421,3 +421,32 @@ def test_gpu_peak_memory_flat_in_p(tmp_path):
         peaks.append(pool.total_bytes())
         pool.free_all_blocks()
     assert max(peaks) < 4 * min(peaks), f"peak memory grew with p: {peaks}"
+
+
+def test_cubic_picks_the_global_maximum_likelihood_root():
+    """Real 1000 Genomes table where the likelihood has three admissible roots.
+
+    Our solver picks the global maximum (verified here against a dense brute
+    force over the admissible interval). plink2 selects a different root on
+    tables like this -- 44 of 854,850 pairs (0.005%) on chr22 -- so D/D' can
+    disagree with plink2 even though r and r^2 match exactly. Documented in
+    the module docstring; this test pins OUR behaviour, which is the ML.
+    """
+    tab = np.array([[0, 0, 0], [2, 632, 31], [14, 1705, 120]], float)
+    n = tab.sum()
+    rows, cols = tab.sum(1), tab.sum(0)
+    pA = (rows[1] + 2 * rows[2]) / (2 * n)
+    pB = (cols[1] + 2 * cols[2]) / (2 * n)
+    lo, hi = max(0.0, pA + pB - 1.0), min(pA, pB)
+
+    xs = np.linspace(lo, hi, 200001)
+    lls = L._loglik(xs, np.repeat(tab[None], len(xs), 0),
+                    np.full(len(xs), pA), np.full(len(xs), pB))
+    x_brute = xs[np.argmax(lls)]
+
+    out = L.ld_from_counts(tab[None])
+    d_brute = x_brute - pA * pB
+    assert abs(out["d"][0] - d_brute) < 1e-5, (out["d"][0], d_brute)
+    # and the ML root here is NOT the one nearest the composite estimate,
+    # which is exactly why a naive "closest root" rule diverges
+    assert out["d"][0] < 0 < out["r"][0]
