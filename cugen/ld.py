@@ -470,12 +470,100 @@ void build_ld_planes(const unsigned char* packed,
 
 assert _LD_PLANES_SRC.isascii(), "kernel source must be pure ASCII (cf. 34b4a59)"
 
+_LD_DOSAGE_KERNEL = None
+
+# Fast path for r / r^2 / signed r^2. Those need only S = sum(g_i g_j) and the
+# per-variant moments -- NOT the 3x3 contingency table. Building the full table
+# costs nine B x B arrays plus ~8 elementwise passes to derive the outer cells,
+# i.e. roughly 9x the memory traffic, to produce something one GEMM already
+# gives. D and D' still need the table; r does not.
+_LD_DOSAGE_SRC = r'''
+extern "C" __global__
+void build_dosage_planes(const unsigned char* packed,
+                         float* G, float* G2, float* M,
+                         const long long n_samples,
+                         const long long n_variants,
+                         const long long bytes_per_variant)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = n_variants * n_samples;
+    if (idx >= total) return;
+    long long v = idx / n_samples;
+    long long s = idx - v * n_samples;
+    unsigned char byte = packed[v * bytes_per_variant + (s >> 2)];
+    int code = (byte >> (6 - 2 * (s & 3))) & 3;
+    float g = (code == 3) ? 0.0f : (float)code;   /* missing contributes 0 */
+    G[idx]  = g;
+    G2[idx] = g * g;
+    M[idx]  = (code != 3) ? 1.0f : 0.0f;
+}
+'''
+
+assert _LD_DOSAGE_SRC.isascii(), "kernel source must be pure ASCII (cf. 34b4a59)"
+
 
 def _get_planes_kernel():
     global _LD_PLANES_KERNEL
     if _LD_PLANES_KERNEL is None and HAS_CUPY:
         _LD_PLANES_KERNEL = cp.RawKernel(_LD_PLANES_SRC, "build_ld_planes")
     return _LD_PLANES_KERNEL
+
+
+def _get_dosage_kernel():
+    global _LD_DOSAGE_KERNEL
+    if _LD_DOSAGE_KERNEL is None and HAS_CUPY:
+        _LD_DOSAGE_KERNEL = cp.RawKernel(_LD_DOSAGE_SRC, "build_dosage_planes")
+    return _LD_DOSAGE_KERNEL
+
+
+def _build_dosage(packed2d, rows, n_samples, bytes_per_variant):
+    """(G, G2, M) planes for a block of variant rows."""
+    blk = packed2d[rows].ravel()
+    b, ns = int(len(rows)), int(n_samples)
+    G = cp.empty((b, ns), dtype=cp.float32)
+    G2 = cp.empty((b, ns), dtype=cp.float32)
+    M = cp.empty((b, ns), dtype=cp.float32)
+    tpb = 256
+    total = b * ns
+    _get_dosage_kernel()(((total + tpb - 1) // tpb,), (tpb,),
+                         (blk, G, G2, M, np.int64(ns), np.int64(b),
+                          np.int64(bytes_per_variant)))
+    return G, G2, M
+
+
+def _r_block(pl_a, pl_b, n_samples, has_missing):
+    """Pairwise-complete r for one tile, without materialising the 3x3 table.
+
+    1 GEMM when the file has no missing calls, 4 when it does (S, n, and the
+    two co-observed moment products; their B-side twins come free by
+    transpose). Returns (r, n_obs).
+    """
+    Ga, G2a, Ma = pl_a
+    Gb, G2b, Mb = pl_b
+    ns = float(n_samples)
+    S = Ga @ Gb.T
+    if has_missing:
+        n = Ma @ Mb.T
+        sA = Ga @ Mb.T            # sum of g_i over samples co-observed with j
+        sB = (Ma @ Gb.T)
+        qA = G2a @ Mb.T
+        qB = (Ma @ G2b.T)
+    else:
+        n = cp.float32(ns)
+        sA = cp.broadcast_to(Ga.sum(axis=1)[:, None], S.shape)
+        sB = cp.broadcast_to(Gb.sum(axis=1)[None, :], S.shape)
+        qA = cp.broadcast_to(G2a.sum(axis=1)[:, None], S.shape)
+        qB = cp.broadcast_to(G2b.sum(axis=1)[None, :], S.shape)
+    vA = n * qA - sA * sA
+    vB = n * qB - sB * sB
+    ok = (vA > 0) & (vB > 0)
+    if has_missing:
+        ok &= n > 0
+    den = cp.sqrt(cp.where(ok, vA, 1.0)) * cp.sqrt(cp.where(ok, vB, 1.0))
+    r = cp.where(ok, (n * S - sA * sB) / den, cp.nan)
+    # With no missingness every pair sees every sample, so return the scalar
+    # rather than materialising a B x B array of a constant.
+    return cp.clip(r, -1.0, 1.0), (n if has_missing else float(ns))
 
 
 def _build_planes(packed2d, rows, n_samples, bytes_per_variant):
@@ -548,19 +636,32 @@ def _r_from_counts_gpu(c):
     return cp.clip(r, -1.0, 1.0), n
 
 
-def _tile_size_for(n_samples: int, budget_frac: float = 0.35) -> int:
-    """Pick B so planes + counts fit the free device memory.
+def _tile_size_for(n_samples: int, budget_frac: float = 0.35,
+                   window: Optional[int] = None) -> int:
+    """Pick B so planes + counts fit free device memory.
 
     planes  = 2 * 3 * B * n_samples * 4
     counts  = 9 * B * B * 4
     Peak is a function of B and n_samples only -- NOT of the variant count.
+
+    When a narrow `window` is in play, a large B is actively harmful: a tile
+    evaluates B x (B + window) cells but only B * window of them can survive
+    the band, so useful work is window / (B + window). At B = 8192 and
+    window = 500 that is 5.8% -- which is what made the windowed path ~19x
+    slower than plink2. Sizing B to the window lifts it to ~50%, at the cost
+    of smaller (but still tensor-core-sized) GEMMs.
     """
     free, _total = cp.cuda.Device().mem_info
     budget = budget_frac * free
     a = 36.0
     b = 24.0 * n_samples
     B = int((-b + (b * b + 4 * a * budget) ** 0.5) / (2 * a))
-    return max(256, min(8192, (B // 256) * 256))
+    B = max(256, min(8192, (B // 256) * 256))
+    if window is not None:
+        # round the window up to a multiple of 256, and never grow B
+        wb = max(256, ((int(window) + 255) // 256) * 256)
+        B = min(B, wb)
+    return B
 
 
 @dataclass(frozen=True)
@@ -589,6 +690,25 @@ class LDMatrix:
 # ---------------------------------------------------------------------------
 # Backends
 # ---------------------------------------------------------------------------
+def _r_only_result(r_arr, n_arr, reader, rows, pairs_local):
+    """Shape the r-only fast path into the same dict ld_from_counts returns.
+
+    D/D' are NaN here by construction -- this path is only taken when neither
+    was requested. pA/pB come from the header's per-variant mean dosage, which
+    is the right quantity for allele ORIENTATION (a per-variant property, and
+    what plink2 orients on) even though it is not the per-pair co-observed
+    frequency.
+    """
+    r = np.asarray(r_arr, dtype=np.float64)
+    af = np.asarray(reader.mu_x, dtype=np.float64)[rows] / 2.0
+    nan = np.full(r.shape, np.nan)
+    return {"n": np.asarray(n_arr, dtype=np.float64),
+            "pA": af[pairs_local[:, 0]], "pB": af[pairs_local[:, 1]],
+            "r": r, "r2": np.clip(r * r, 0.0, 1.0),
+            "r2_signed": np.clip(r * np.abs(r), -1.0, 1.0),
+            "d": nan, "dp": nan}
+
+
 def _dosages_numpy(reader) -> np.ndarray:
     """(n_variants, n_samples) uint8 with 3 = missing, no CuPy required."""
     from .write import unpack_2bit
@@ -600,7 +720,7 @@ def _dosages_numpy(reader) -> np.ndarray:
 
 
 def _scan_gpu(reader, rows, window, window_kb, positions, min_r2, min_obs,
-              tile_size=None, verbose=False):
+              tile_size=None, verbose=False, need_table=True):
     """Tiled upper-triangle scan. Returns (pairs_local, tables) for survivors.
 
     Peak device memory is a function of tile size and sample count only, never
@@ -616,15 +736,16 @@ def _scan_gpu(reader, rows, window, window_kb, positions, min_r2, min_obs,
     bpv = int(reader.bytes_per_variant)
     p = len(rows)
     has_missing = bool(reader.has_missing)
-    B = int(tile_size) if tile_size else _tile_size_for(ns)
+    B = int(tile_size) if tile_size else _tile_size_for(ns, window=window)
+    build = _build_planes if need_table else _build_dosage
 
     packed = cp.asarray(np.frombuffer(reader.read_packed_bytes(), dtype=np.uint8))
     packed = packed.reshape(int(reader.n_variants), bpv)[cp.asarray(rows)]
 
-    out_pairs, out_tabs = [], []
+    out_pairs, out_tabs, out_r, out_n = [], [], [], []
     for i0 in range(0, p, B):
         i1 = min(i0 + B, p)
-        pl_a = _build_planes(packed, cp.arange(i0, i1), ns, bpv)
+        pl_a = build(packed, cp.arange(i0, i1), ns, bpv)
         # column extent: upper triangle, bounded by whichever windows are set
         hi = p
         if window is not None:
@@ -635,10 +756,14 @@ def _scan_gpu(reader, rows, window, window_kb, positions, min_r2, min_obs,
                 side="right")))
         for j0 in range(i0, hi, B):
             j1 = min(j0 + B, hi)
-            pl_b = pl_a if j0 == i0 else _build_planes(
+            pl_b = pl_a if j0 == i0 else build(
                 packed, cp.arange(j0, j1), ns, bpv)
-            c = _counts_block(pl_a, pl_b, ns, has_missing)
-            r, n = _r_from_counts_gpu(c)
+            if need_table:
+                c = _counts_block(pl_a, pl_b, ns, has_missing)
+                r, n = _r_from_counts_gpu(c)
+            else:
+                c = None
+                r, n = _r_block(pl_a, pl_b, ns, has_missing)
 
             ii = cp.arange(i0, i1)[:, None]
             jj = cp.arange(j0, j1)[None, :]
@@ -653,11 +778,17 @@ def _scan_gpu(reader, rows, window, window_kb, positions, min_r2, min_obs,
 
             idx = cp.nonzero(keep)
             if idx[0].size:
-                tabs = cp.empty((idx[0].size, 3, 3), dtype=cp.float32)
-                for a in range(3):
-                    for b in range(3):
-                        tabs[:, a, b] = c[a, b][idx]
-                out_tabs.append(cp.asnumpy(tabs))
+                if need_table:
+                    tabs = cp.empty((idx[0].size, 3, 3), dtype=cp.float32)
+                    for a in range(3):
+                        for b in range(3):
+                            tabs[:, a, b] = c[a, b][idx]
+                    out_tabs.append(cp.asnumpy(tabs))
+                else:
+                    out_r.append(cp.asnumpy(r[idx]))
+                    out_n.append(cp.asnumpy(
+                        n[idx] if has_missing
+                        else cp.full(idx[0].size, float(ns), dtype=cp.float32)))
                 out_pairs.append(np.stack([cp.asnumpy(idx[0]) + i0,
                                            cp.asnumpy(idx[1]) + j0], axis=1))
             del c, r, n, keep, idx
@@ -669,8 +800,13 @@ def _scan_gpu(reader, rows, window, window_kb, positions, min_r2, min_obs,
     del packed
     cp.get_default_memory_pool().free_all_blocks()
     if not out_pairs:
-        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3, 3))
-    return np.concatenate(out_pairs), np.concatenate(out_tabs)
+        empty = np.zeros((0, 2), dtype=np.int64)
+        return (empty, np.zeros((0, 3, 3)) if need_table
+                else (np.zeros(0), np.zeros(0)))
+    pairs = np.concatenate(out_pairs)
+    if need_table:
+        return pairs, np.concatenate(out_tabs)
+    return pairs, (np.concatenate(out_r), np.concatenate(out_n))
 
 
 # ---------------------------------------------------------------------------
@@ -843,19 +979,27 @@ def ld_matrix(
         return _empty_pairs(stats)
 
     # ---- counts ----------------------------------------------------------
+    # D and D' need the 3x3 table; r-family statistics do not, and skipping it
+    # avoids ~9x the memory traffic per tile.
+    need_table = bool({"d", "dp"} & set(stats))
+
     if use_gpu:
         cp.cuda.Device(device).use()
-        pairs_local, tables = _scan_gpu(
+        pairs_local, payload = _scan_gpu(
             reader, rows, window, window_kb, positions, min_r2, min_obs,
-            tile_size=tile_size, verbose=verbose)
+            tile_size=tile_size, verbose=verbose, need_table=need_table)
         if len(pairs_local) == 0:
             return _empty_pairs(stats)
+        if need_table:
+            res = ld_from_counts(payload, dprime_method=dprime_method)
+        else:
+            r_arr, n_arr = payload
+            res = _r_only_result(r_arr, n_arr, reader, rows, pairs_local)
     else:
         pairs_local, _ = _plan_pairs(len(rows), positions, window, window_kb)
         dos = _dosages_numpy(reader)[rows]
         tables = contingency_tables(dos, pairs_local)
-
-    res = ld_from_counts(tables, dprime_method=dprime_method)
+        res = ld_from_counts(tables, dprime_method=dprime_method)
 
     # ---- orientation -----------------------------------------------------
     # Flipping BOTH variants leaves r unchanged; flipping exactly one negates
