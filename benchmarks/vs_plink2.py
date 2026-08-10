@@ -38,13 +38,24 @@ def peak_rss_gib():
     return r / (1024 ** 2) if sys.platform == "darwin" else r / (1024 ** 2)
 
 
+HAVE_GNU_TIME = os.path.exists("/usr/bin/time")
+
+
 def run_plink(bfile, keep, out, window, min_r2, threads):
-    """Returns (wall_s, peak_rss_gib, n_rows)."""
-    cmd = ["/usr/bin/time", "-v", "plink2", "--bfile", bfile,
-           "--extract", keep, "--r2-unphased", "allow-ambiguous-allele",
-           "cols=chrom,pos,id", "--ld-window", str(window + 1),
-           "--ld-window-kb", "999999", "--ld-window-r2", str(min_r2),
-           "--threads", str(threads), "--out", out, "--silent"]
+    """Returns (wall_s, peak_rss_gib, n_rows, err).
+
+    Peak RSS comes from GNU time when present, else from RUSAGE_CHILDREN.
+    NB ru_maxrss over children is a running maximum across all reaped
+    children, so it is only a per-run peak because p increases monotonically
+    here and plink's footprint grows with p. Don't reuse this helper for a
+    descending sweep without fixing that.
+    """
+    base = ["plink2", "--bfile", bfile,
+            "--extract", keep, "--r2-unphased", "allow-ambiguous-allele",
+            "cols=chrom,pos,id", "--ld-window", str(window + 1),
+            "--ld-window-kb", "999999", "--ld-window-r2", str(min_r2),
+            "--threads", str(threads), "--out", out, "--silent"]
+    cmd = (["/usr/bin/time", "-v"] + base) if HAVE_GNU_TIME else base
     t0 = time.perf_counter()
     r = subprocess.run(cmd, capture_output=True, text=True)
     dt = time.perf_counter() - t0
@@ -54,6 +65,9 @@ def run_plink(bfile, keep, out, window, min_r2, threads):
     for line in r.stderr.splitlines():
         if "Maximum resident set size" in line:
             peak = int(line.split()[-1]) / (1024 ** 2)      # kB -> GiB
+    if peak is None:
+        ru = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+        peak = ru / (1024 ** 2) if sys.platform != "darwin" else ru / (1024 ** 3)
     n = 0
     p = out + ".vcor"
     if os.path.exists(p):
