@@ -55,10 +55,15 @@ one variant of a pair has ALT frequency > 0.5.
 
 MEMORY
 ------
-Peak device memory is a function of tile size and sample count, NOT of the
-number of variants: the scan is an anchor/halo band with a rolling buffer, and
-each pair is emitted exactly once. Whole-chromosome runs are bounded by wall
-time, not memory.
+Above the tile size, peak device memory is a function of tile size and sample
+count -- NOT of the number of variants. Below it the tile is the whole matrix,
+so cost is O(p^2); the two regimes meet where p equals the tile size.
+
+Measured on 1000 Genomes chr22 (2504 samples, A100 80GB): peak held at
+~5.6 GiB from p = 20,000 to p = 170,949, i.e. across a 73x growth in pair
+count. The plateau height is set by the DEVICE -- the tile auto-tuner takes a
+fraction of free VRAM -- so a smaller card plateaus lower, not higher. Whole-
+chromosome runs are therefore bounded by wall time, not by memory.
 
 VALIDATION
 ----------

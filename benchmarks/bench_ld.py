@@ -181,9 +181,21 @@ def main():
         print(f"time scaling exponent, full range     : {slope:.2f}")
         print(f"time scaling exponent, largest 3 p    : {slope_tail:.2f}   "
               f"(2.0 == O(p^2); < 2 means the GPU is still filling up)")
-        print(f"peak memory min/max across the sweep  : "
-              f"{mem.min():.3f} / {mem.max():.3f} GiB   "
-              f"(flat == independent of p)")
+        # Memory is NOT flat across the whole sweep and saying so would be
+        # wrong: while p < tile size the tile IS the whole matrix, so cost is
+        # O(p^2). Above the tile size it plateaus. Report the plateau, which is
+        # the actual claim, and let the small-p region speak for itself.
+        big = ps >= 20000
+        if big.sum() >= 2:
+            mb = mem[big]
+            print(f"peak memory, p >= 20k                 : "
+                  f"{mb.min():.2f} - {mb.max():.2f} GiB over a "
+                  f"{ps[big].max()/ps[big].min():.0f}x range in p "
+                  f"({(ps[big].max()/ps[big].min())**2:.0f}x in pairs)")
+        print(f"peak memory, full sweep               : "
+              f"{mem.min():.3f} - {mem.max():.3f} GiB "
+              f"(grows until p reaches the tile size, then plateaus; the "
+              f"plateau is set by DEVICE memory, not by p)")
 
     payload = {"file": a.cugen, "header": {k: str(v) for k, v in hdr.items()},
                "results": results}
