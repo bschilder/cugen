@@ -37,7 +37,7 @@ def device_info():
     import cupy as cp
     d = cp.cuda.Device()
     free, total = d.mem_info
-    cc = d.compute_capability
+    cc = d.compute_capability   # CuPy returns e.g. "86", not (8, 6)
     try:
         name = cp.cuda.runtime.getDeviceProperties(d.id)["name"].decode()
     except Exception:
@@ -50,7 +50,8 @@ def device_info():
         drv = "unknown"
     return {
         "gpu_name": name,
-        "compute_capability": f"{cc[0]}.{cc[1]}" if not isinstance(cc, str) else cc,
+        "compute_capability": (f"{cc[:-1]}.{cc[-1]}" if isinstance(cc, str)
+                               else f"{cc[0]}.{cc[1]}"),
         "total_mem_gib": round(total / 2**30, 2),
         "free_mem_gib": round(free / 2**30, 2),
         "driver": drv,
@@ -119,9 +120,13 @@ def main():
             pool.free_all_blocks()
             try:
                 t0 = time.perf_counter()
+                # max_pairs is a user-facing guard against accidental huge
+                # runs; the probe is deliberate, so opt out. Without this every
+                # device fails at p=20,000 (200M pairs) on the guard, not on
+                # any hardware limit.
                 df = ld_matrix("/tmp/bench.cugen", variant_range=(0, p),
                                stats=("r", "r2"), min_r2=0.5,
-                               backend="gpu", verbose=False)
+                               max_pairs=10**15, backend="gpu", verbose=False)
                 dt = time.perf_counter() - t0
                 npairs = p * (p - 1) // 2
                 rec["runs"].append({
