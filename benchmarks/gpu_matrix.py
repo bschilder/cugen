@@ -121,15 +121,17 @@ def main():
         for p in [int(x) for x in a.p_grid.split(",")]:
             pool.free_all_blocks()
             try:
-                t0 = time.perf_counter()
-                # max_pairs is a user-facing guard against accidental huge
-                # runs; the probe is deliberate, so opt out. Without this every
-                # device fails at p=20,000 (200M pairs) on the guard, not on
-                # any hardware limit.
-                df = ld_matrix("/tmp/bench.cugen", variant_range=(0, p),
-                               stats=("r", "r2"), min_r2=0.5,
-                               max_pairs=10**15, backend="gpu", verbose=False)
-                dt = time.perf_counter() - t0
+                with PeakSampler() as sampler:
+                    t0 = time.perf_counter()
+                    # max_pairs is a user-facing guard against accidental huge
+                    # runs; the probe is deliberate, so opt out. Without this
+                    # every device fails at p=20,000 (200M pairs) on the guard,
+                    # not on any hardware limit.
+                    df = ld_matrix("/tmp/bench.cugen", variant_range=(0, p),
+                                   stats=("r", "r2"), min_r2=0.5,
+                                   max_pairs=10**15, backend="gpu",
+                                   verbose=False)
+                    dt = time.perf_counter() - t0
                 npairs = p * (p - 1) // 2
                 rec["runs"].append({
                     "p": p, "wall_s": round(dt, 4),
