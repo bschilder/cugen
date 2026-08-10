@@ -20,6 +20,7 @@ if os.path.join(_ROOT, "tests") not in sys.path:
 
 import argparse
 import json
+import threading
 import time
 
 import numpy as np
@@ -48,22 +49,52 @@ def _free_bytes():
     return cp.cuda.Device().mem_info[0] if HAS_CUPY else 0
 
 
+class _PeakSampler:
+    """Sample live device allocations during a run.
+
+    NB pool.total_bytes() at the end is NOT the peak: cugen.ld calls
+    free_all_blocks() inside its tile loop, which shrinks the pool mid-run and
+    destroys the monotonic high-water property. (Symptom: 'peak' at p=50k
+    reading lower than at p=1k.) So sample used_bytes() on a thread instead.
+    """
+
+    def __init__(self, interval=0.002):
+        self.interval, self.peak, self._stop = interval, 0, False
+
+    def __enter__(self):
+        if HAS_CUPY:
+            self._t = threading.Thread(target=self._run, daemon=True)
+            self._t.start()
+        return self
+
+    def _run(self):
+        pool = cp.get_default_memory_pool()
+        while not self._stop:
+            self.peak = max(self.peak, pool.used_bytes())
+            time.sleep(self.interval)
+
+    def __exit__(self, *exc):
+        self._stop = True
+        if HAS_CUPY:
+            self._t.join(timeout=1.0)
+            self.peak = max(self.peak, cp.get_default_memory_pool().used_bytes())
+
+
 def run_once(path, p, *, stats, min_r2, window, tile_size, backend,
              max_pairs=1e15):
-    """One timed run. Peak memory is measured as the largest observed dip in
-    free device memory, sampled before and after -- CuPy's pool reports its own
-    high-water mark, which is what we actually want."""
+    """One timed run, with a sampled peak-memory measurement."""
     _peak_reset()
     pool = cp.get_default_memory_pool() if HAS_CUPY else None
     if pool is not None:
         pool.free_all_blocks()
     free_before = _free_bytes()
-    t0 = time.perf_counter()
-    df = ld_matrix(path, variant_range=(0, p), stats=stats, min_r2=min_r2,
-                   window=window, tile_size=tile_size, backend=backend,
-                   max_pairs=int(max_pairs), verbose=False)
-    dt = time.perf_counter() - t0
-    peak = pool.total_bytes() if pool is not None else 0
+    with _PeakSampler() as sampler:
+        t0 = time.perf_counter()
+        df = ld_matrix(path, variant_range=(0, p), stats=stats, min_r2=min_r2,
+                       window=window, tile_size=tile_size, backend=backend,
+                       max_pairs=int(max_pairs), verbose=False)
+        dt = time.perf_counter() - t0
+    peak = sampler.peak
     n_pairs = p * (p - 1) // 2 if window is None else None
     return {
         "p": p,
@@ -140,9 +171,16 @@ def main():
         mem = np.array([r["peak_pool_gib"] for r in results], float)
         ok = ts > 0
         slope = np.polyfit(np.log(ps[ok]), np.log(ts[ok]), 1)[0]
+        # The full-range slope is dragged down by fixed overhead at small p,
+        # where the device is nowhere near saturated. The asymptotic slope over
+        # the largest points is the honest number to quote.
+        tail = slice(-3, None)
+        slope_tail = (np.polyfit(np.log(ps[ok][tail]), np.log(ts[ok][tail]), 1)[0]
+                      if ok.sum() >= 3 else float("nan"))
         print()
-        print(f"time scaling exponent (log-log slope) : {slope:.2f}   "
-              f"(2.0 == O(p^2))")
+        print(f"time scaling exponent, full range     : {slope:.2f}")
+        print(f"time scaling exponent, largest 3 p    : {slope_tail:.2f}   "
+              f"(2.0 == O(p^2); < 2 means the GPU is still filling up)")
         print(f"peak memory min/max across the sweep  : "
               f"{mem.min():.3f} / {mem.max():.3f} GiB   "
               f"(flat == independent of p)")
