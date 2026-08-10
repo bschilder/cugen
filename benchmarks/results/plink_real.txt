@@ -1,0 +1,18 @@
+########## PLINK2 PARITY ON REAL 1KG chr22 (unique-ID fix) ##########
+note: 170,948/170,949 variant IDs were non-unique; rewrote IDs as row indices for an exact join
+comparing first 3,000 variants, window=300
+plink2 wall (both runs) :     0.62 s
+cugen  wall (all stats) :     1.95 s   -> 854,850 pairs
+speedup                 :     0.32x
+
+pairs matched to plink2 : 854,850
+
+quantity                  max |err|          rms  verdict
+--------------------------------------------------------------
+r  vs UNPHASED_R          5.272e-07    1.954e-07  PASS
+D  vs D                   3.090e-01    1.127e-03  FAIL
+D' vs DPRIME              1.695e+00    8.427e-03  FAIL
+
+plink2 text .vcor carries ~6 significant figures, so ~1e-6 is the
+format floor, not our error.
+########## PHASE3 DONE ##########

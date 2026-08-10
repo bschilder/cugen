@@ -1,0 +1,15 @@
+{
+  "dataset": "1000 Genomes chr22, MAF>=0.01, first 3,000 variants, window 300",
+  "pairs_matched": 854850,
+  "plink2_version": "v2.0.0-a.7.0LM",
+  "plink2_wall_s": 0.62,
+  "cugen_wall_s": 1.95,
+  "stats": [
+    {"quantity": "r vs UNPHASED_R", "max_abs": 5.272e-07, "rms": 1.954e-07, "verdict": "PASS"},
+    {"quantity": "D vs D (phased)", "max_abs": 3.090e-01, "rms": 1.127e-03, "verdict": "DIVERGES"},
+    {"quantity": "D' vs DPRIME", "max_abs": 1.695e+00, "rms": 8.427e-03, "verdict": "DIVERGES"}
+  ],
+  "dprime_divergent_pairs": 44,
+  "dprime_divergent_frac": 5.1e-05,
+  "dprime_sign_disagreement_pct": 97.7
+}

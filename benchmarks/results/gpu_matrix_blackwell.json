@@ -1,0 +1,159 @@
+[
+  {
+    "gpu_id": "NVIDIA GeForce RTX 5090",
+    "label": "RTX 5090 (Blackwell)",
+    "vram_advertised": 32,
+    "ok": true,
+    "stage": "done",
+    "pod_id": "0gzfxx6ur3ovu6",
+    "datacenter": null,
+    "cost_hr": 0.99,
+    "stdout_tail": "      \"peak_pool_gib\": 1.9356,\n      \"pairs\": 12497500,\n      \"pairs_per_s\": 16936073.7,\n      \"emitted\": 554951\n    },\n    {\n      \"p\": 10000,\n      \"wall_s\": 3.9936,\n      \"peak_pool_gib\": 4.2352,\n      \"pairs\": 49995000,\n      \"pairs_per_s\": 12518797.4,\n      \"emitted\": 2144957\n    },\n    {\n      \"p\": 20000,\n      \"wall_s\": 14.0578,\n      \"peak_pool_gib\": 5.3034,\n      \"pairs\": 199990000,\n      \"pairs_per_s\": 14226228.3,\n      \"emitted\": 8587693\n    }\n  ],\n  \"errors\": [],\n  \"gpu_name\": \"NVIDIA GeForce RTX 5090\",\n  \"compute_capability\": \"12.0\",\n  \"total_mem_gib\": 31.36,\n  \"free_mem_gib\": 30.86,\n  \"driver\": \"580.126.09\",\n  \"cupy\": \"14.1.1\",\n  \"cuda_runtime\": 12090,\n  \"python\": \"3.12.3\",\n  \"kernel_compile_s\": 2.922,\n  \"correctness\": {\n    \"pairs\": 276,\n    \"pair_sets_equal\": true,\n    \"max_abs_err_R\": 0.0,\n    \"max_abs_err_D\": 0.0,\n    \"max_abs_err_DP\": 0.0\n  }\n}\n",
+    "probe": {
+      "label": "RTX 5090 (Blackwell)",
+      "ok": true,
+      "stage": "done",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.2281,
+          "peak_pool_gib": 0.3589,
+          "pairs": 1999000,
+          "pairs_per_s": 8765386.7,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.7379,
+          "peak_pool_gib": 1.9356,
+          "pairs": 12497500,
+          "pairs_per_s": 16936073.7,
+          "emitted": 554951
+        },
+        {
+          "p": 10000,
+          "wall_s": 3.9936,
+          "peak_pool_gib": 4.2352,
+          "pairs": 49995000,
+          "pairs_per_s": 12518797.4,
+          "emitted": 2144957
+        },
+        {
+          "p": 20000,
+          "wall_s": 14.0578,
+          "peak_pool_gib": 5.3034,
+          "pairs": 199990000,
+          "pairs_per_s": 14226228.3,
+          "emitted": 8587693
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA GeForce RTX 5090",
+      "compute_capability": "12.0",
+      "total_mem_gib": 31.36,
+      "free_mem_gib": 30.86,
+      "driver": "580.126.09",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.922,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      }
+    },
+    "wall_s": 68.0
+  },
+  {
+    "gpu_id": "NVIDIA RTX PRO 4500 Blackwell",
+    "label": "RTX PRO 4500 (Blackwell)",
+    "vram_advertised": 32,
+    "ok": true,
+    "stage": "done",
+    "pod_id": "me5ug9kg03j0c3",
+    "datacenter": null,
+    "cost_hr": 0.72,
+    "stdout_tail": "      \"peak_pool_gib\": 1.633,\n      \"pairs\": 12497500,\n      \"pairs_per_s\": 19578040.6,\n      \"emitted\": 554951\n    },\n    {\n      \"p\": 10000,\n      \"wall_s\": 3.2679,\n      \"peak_pool_gib\": 5.0476,\n      \"pairs\": 49995000,\n      \"pairs_per_s\": 15298618.8,\n      \"emitted\": 2144957\n    },\n    {\n      \"p\": 20000,\n      \"wall_s\": 30.7111,\n      \"peak_pool_gib\": 5.5802,\n      \"pairs\": 199990000,\n      \"pairs_per_s\": 6511975.9,\n      \"emitted\": 8587693\n    }\n  ],\n  \"errors\": [],\n  \"gpu_name\": \"NVIDIA RTX PRO 4500 Blackwell\",\n  \"compute_capability\": \"12.0\",\n  \"total_mem_gib\": 31.37,\n  \"free_mem_gib\": 31.11,\n  \"driver\": \"580.173.02\",\n  \"cupy\": \"14.1.1\",\n  \"cuda_runtime\": 12090,\n  \"python\": \"3.12.3\",\n  \"kernel_compile_s\": 2.591,\n  \"correctness\": {\n    \"pairs\": 276,\n    \"pair_sets_equal\": true,\n    \"max_abs_err_R\": 0.0,\n    \"max_abs_err_D\": 0.0,\n    \"max_abs_err_DP\": 0.0\n  }\n}\n",
+    "probe": {
+      "label": "RTX PRO 4500 (Blackwell)",
+      "ok": true,
+      "stage": "done",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.2065,
+          "peak_pool_gib": 0.3254,
+          "pairs": 1999000,
+          "pairs_per_s": 9682252.8,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.6383,
+          "peak_pool_gib": 1.633,
+          "pairs": 12497500,
+          "pairs_per_s": 19578040.6,
+          "emitted": 554951
+        },
+        {
+          "p": 10000,
+          "wall_s": 3.2679,
+          "peak_pool_gib": 5.0476,
+          "pairs": 49995000,
+          "pairs_per_s": 15298618.8,
+          "emitted": 2144957
+        },
+        {
+          "p": 20000,
+          "wall_s": 30.7111,
+          "peak_pool_gib": 5.5802,
+          "pairs": 199990000,
+          "pairs_per_s": 6511975.9,
+          "emitted": 8587693
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA RTX PRO 4500 Blackwell",
+      "compute_capability": "12.0",
+      "total_mem_gib": 31.37,
+      "free_mem_gib": 31.11,
+      "driver": "580.173.02",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.591,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      }
+    },
+    "wall_s": 98.8
+  },
+  {
+    "gpu_id": "NVIDIA RTX PRO 5000 Blackwell",
+    "label": "RTX PRO 5000 (Blackwell)",
+    "vram_advertised": 48,
+    "ok": false,
+    "stage": "no_ssh",
+    "pod_id": "1gtpxb7fmqchia",
+    "datacenter": null,
+    "cost_hr": 0.82,
+    "wall_s": 320.0
+  },
+  {
+    "gpu_id": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "label": "RTX PRO 6000 (Blackwell)",
+    "vram_advertised": 96,
+    "ok": false,
+    "stage": "create_failed",
+    "error": "{'_error': 500, '_body': '{\"error\":\"create pod: There are no instances currently available\",\"status\":500}\\n'}"
+  }
+]
