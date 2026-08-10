@@ -25,7 +25,12 @@ import time
 from pathlib import Path
 from typing import Optional, Union
 
-import cupy as cp
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:                                            # noqa: BLE001
+    cp = None
+    HAS_CUPY = False
 import numpy as np
 import pandas as pd
 

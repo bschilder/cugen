@@ -34,7 +34,12 @@ Usage (Tier 2 — targeted UltraMAP with cached stats):
 import argparse
 import gc
 import numpy as np
-import cupy as cp
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:                                            # noqa: BLE001
+    cp = None
+    HAS_CUPY = False
 import pandas as pd
 import time
 import os
