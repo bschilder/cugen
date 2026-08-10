@@ -315,18 +315,19 @@ def _parse_region(region: str) -> Tuple[str, Optional[int], Optional[int]]:
     return chrom, start, end
 
 
-def _plan_pairs(n_rows: int, positions: Optional[np.ndarray],
-                window: Optional[int], window_kb: Optional[float]):
-    """Upper-triangle pair plan. Returns (pairs, n_pairs) with i < j.
+def _pair_bounds(n_rows: int, positions: Optional[np.ndarray],
+                 window: Optional[int], window_kb: Optional[float]):
+    """Per-row exclusive upper column bound for the upper-triangle scan.
 
     Both window predicates AND together, matching PLINK. Banding by position
-    uses searchsorted so the column extent is O(band), not O(p).
+    uses searchsorted so the column extent is O(band), not O(p). Returns
+    (starts, hi) so the pair COUNT can be taken without materialising pairs --
+    at p = 1.1M the materialised list would be ~6e11 entries.
     """
     if window_kb is not None and positions is None:
         raise ValueError("window_kb requires variant positions; pass annotation=")
     if positions is not None and len(positions):
-        d = np.diff(positions)
-        if np.any(d < 0):
+        if np.any(np.diff(positions) < 0):
             raise ValueError("positions are not non-decreasing along file rows; "
                              "banding would be silently wrong. Sort the .cugen "
                              "or drop window_kb.")
@@ -338,7 +339,19 @@ def _plan_pairs(n_rows: int, positions: Optional[np.ndarray],
         span = int(round(float(window_kb) * 1000))
         hi = np.minimum(hi, np.searchsorted(positions, positions + span,
                                             side="right").astype(np.int64))
-    starts = lo + 1
+    return lo + 1, hi
+
+
+def _count_pairs(n_rows: int, positions, window, window_kb) -> int:
+    starts, hi = _pair_bounds(n_rows, positions, window, window_kb)
+    return int(np.maximum(hi - starts, 0).sum())
+
+
+def _plan_pairs(n_rows: int, positions: Optional[np.ndarray],
+                window: Optional[int], window_kb: Optional[float]):
+    """Materialised upper-triangle pair list, for the NumPy reference path."""
+    starts, hi = _pair_bounds(n_rows, positions, window, window_kb)
+    lo = np.arange(n_rows, dtype=np.int64)
     counts = np.maximum(hi - starts, 0)
     total = int(counts.sum())
     if total == 0:
@@ -449,46 +462,51 @@ def _get_planes_kernel():
     return _LD_PLANES_KERNEL
 
 
-def _counts_gpu(packed, n_samples, n_variants, bytes_per_variant, has_missing):
-    """Full 3x3 count stack for every ordered pair in a tile, on device.
-
-    Returns a (3, 3, p, p) float32 array of exact integer counts.
-    3 distinct GEMMs when there is no missingness (n12 = n21^T, and the
-    marginals are per-variant constants), 6 when there is.
-    """
-    p, ns = int(n_variants), int(n_samples)
-    if ns > _FP32_EXACT_MAX_SAMPLES:
-        raise ValueError(
-            f"n_samples={ns:,} exceeds {_FP32_EXACT_MAX_SAMPLES:,}, above which "
-            f"fp32 accumulation of 4*n is no longer exact. Refusing rather than "
-            f"returning quietly-wrong counts.")
-    M = cp.empty((p, ns), dtype=cp.float32)
-    I1 = cp.empty((p, ns), dtype=cp.float32)
-    I2 = cp.empty((p, ns), dtype=cp.float32)
-    total = p * ns
+def _build_planes(packed2d, rows, n_samples, bytes_per_variant):
+    """Indicator planes (M, I1, I2) for a block of variant rows, on device."""
+    blk = packed2d[rows].ravel()
+    b = int(len(rows))
+    ns = int(n_samples)
+    M = cp.empty((b, ns), dtype=cp.float32)
+    I1 = cp.empty((b, ns), dtype=cp.float32)
+    I2 = cp.empty((b, ns), dtype=cp.float32)
     tpb = 256
+    total = b * ns
     _get_planes_kernel()(((total + tpb - 1) // tpb,), (tpb,),
-                         (packed, M, I1, I2, np.int64(ns), np.int64(p),
+                         (blk, M, I1, I2, np.int64(ns), np.int64(b),
                           np.int64(bytes_per_variant)))
+    return M, I1, I2
 
-    n11 = I1 @ I1.T
-    n22 = I2 @ I2.T
-    n12 = I1 @ I2.T
-    n21 = n12.T
+
+def _counts_block(pl_a, pl_b, n_samples, has_missing):
+    """(3, 3, ba, bb) exact integer counts for one row-block x col-block tile.
+
+    3 GEMMs when the file has no missing calls (n21 = n12^T and the marginals
+    are per-variant constants), 6 when it does.
+    """
+    Ma, I1a, I2a = pl_a
+    Mb, I1b, I2b = pl_b
+    ba, bb = I1a.shape[0], I1b.shape[0]
+    ns = int(n_samples)
+
+    n11 = I1a @ I1b.T
+    n22 = I2a @ I2b.T
+    n12 = I1a @ I2b.T
+    n21 = I2a @ I1b.T
     if has_missing:
-        nn = M @ M.T
-        rr1 = I1 @ M.T
-        rr2 = I2 @ M.T
-        cc1, cc2 = rr1.T, rr2.T
+        nn = Ma @ Mb.T
+        rr1 = I1a @ Mb.T
+        rr2 = I2a @ Mb.T
+        cc1 = Ma @ I1b.T
+        cc2 = Ma @ I2b.T
     else:
-        nn = cp.full((p, p), float(ns), dtype=cp.float32)
-        m1 = I1.sum(axis=1)[:, None]
-        m2 = I2.sum(axis=1)[:, None]
-        rr1 = cp.broadcast_to(m1, (p, p))
-        rr2 = cp.broadcast_to(m2, (p, p))
-        cc1, cc2 = rr1.T, rr2.T
+        nn = cp.full((ba, bb), float(ns), dtype=cp.float32)
+        rr1 = cp.broadcast_to(I1a.sum(axis=1)[:, None], (ba, bb))
+        rr2 = cp.broadcast_to(I2a.sum(axis=1)[:, None], (ba, bb))
+        cc1 = cp.broadcast_to(I1b.sum(axis=1)[None, :], (ba, bb))
+        cc2 = cp.broadcast_to(I2b.sum(axis=1)[None, :], (ba, bb))
 
-    out = cp.empty((3, 3, p, p), dtype=cp.float32)
+    out = cp.empty((3, 3, ba, bb), dtype=cp.float32)
     out[1, 1], out[1, 2], out[2, 1], out[2, 2] = n11, n12, n21, n22
     out[1, 0] = rr1 - n11 - n12
     out[2, 0] = rr2 - n21 - n22
@@ -496,9 +514,37 @@ def _counts_gpu(packed, n_samples, n_variants, bytes_per_variant, has_missing):
     out[0, 2] = cc2 - n12 - n22
     out[0, 0] = nn - (out[1, 1] + out[1, 2] + out[2, 1] + out[2, 2]
                       + out[1, 0] + out[2, 0] + out[0, 1] + out[0, 2])
-    del M, I1, I2
-    cp.get_default_memory_pool().free_all_blocks()
     return out
+
+
+def _r_from_counts_gpu(c):
+    """Cheap on-device r, used only to threshold before the host transfer."""
+    n = c.sum(axis=(0, 1))
+    sA = c[1].sum(axis=0) + 2.0 * c[2].sum(axis=0)
+    sB = c[:, 1].sum(axis=0) + 2.0 * c[:, 2].sum(axis=0)
+    qA = c[1].sum(axis=0) + 4.0 * c[2].sum(axis=0)
+    qB = c[:, 1].sum(axis=0) + 4.0 * c[:, 2].sum(axis=0)
+    S = c[1, 1] + 2.0 * c[1, 2] + 2.0 * c[2, 1] + 4.0 * c[2, 2]
+    vA, vB = n * qA - sA * sA, n * qB - sB * sB
+    ok = (n > 0) & (vA > 0) & (vB > 0)
+    den = cp.sqrt(cp.where(ok, vA, 1.0)) * cp.sqrt(cp.where(ok, vB, 1.0))
+    r = cp.where(ok, (n * S - sA * sB) / den, cp.nan)
+    return cp.clip(r, -1.0, 1.0), n
+
+
+def _tile_size_for(n_samples: int, budget_frac: float = 0.35) -> int:
+    """Pick B so planes + counts fit the free device memory.
+
+    planes  = 2 * 3 * B * n_samples * 4
+    counts  = 9 * B * B * 4
+    Peak is a function of B and n_samples only -- NOT of the variant count.
+    """
+    free, _total = cp.cuda.Device().mem_info
+    budget = budget_frac * free
+    a = 36.0
+    b = 24.0 * n_samples
+    B = int((-b + (b * b + 4 * a * budget) ** 0.5) / (2 * a))
+    return max(256, min(8192, (B // 256) * 256))
 
 
 @dataclass(frozen=True)
@@ -537,14 +583,77 @@ def _dosages_numpy(reader) -> np.ndarray:
                      for v in range(p)])
 
 
-def _tables_from_gpu_counts(counts_dev, pairs) -> np.ndarray:
-    i = cp.asarray(pairs[:, 0])
-    j = cp.asarray(pairs[:, 1])
-    out = cp.empty((len(pairs), 3, 3), dtype=cp.float32)
-    for a in range(3):
-        for b in range(3):
-            out[:, a, b] = counts_dev[a, b][i, j]
-    return cp.asnumpy(out)
+def _scan_gpu(reader, rows, window, window_kb, positions, min_r2, min_obs,
+              tile_size=None, verbose=False):
+    """Tiled upper-triangle scan. Returns (pairs_local, tables) for survivors.
+
+    Peak device memory is a function of tile size and sample count only, never
+    of the number of variants: each (row-block, col-block) tile allocates its
+    own planes and counts and frees them before the next.
+    """
+    ns = int(reader.n_samples)
+    if ns > _FP32_EXACT_MAX_SAMPLES:
+        raise ValueError(
+            f"n_samples={ns:,} exceeds {_FP32_EXACT_MAX_SAMPLES:,}, above which "
+            f"fp32 accumulation of 4*n is no longer exact. Refusing rather than "
+            f"returning quietly-wrong counts.")
+    bpv = int(reader.bytes_per_variant)
+    p = len(rows)
+    B = int(tile_size) if tile_size else _tile_size_for(ns)
+
+    packed = cp.asarray(np.frombuffer(reader.read_packed_bytes(), dtype=np.uint8))
+    packed = packed.reshape(int(reader.n_variants), bpv)[cp.asarray(rows)]
+
+    out_pairs, out_tabs = [], []
+    for i0 in range(0, p, B):
+        i1 = min(i0 + B, p)
+        pl_a = _build_planes(packed, cp.arange(i0, i1), ns, bpv)
+        # column extent: upper triangle, bounded by whichever windows are set
+        hi = p
+        if window is not None:
+            hi = min(hi, i1 - 1 + int(window) + 1)
+        if window_kb is not None:
+            hi = min(hi, int(np.searchsorted(
+                positions, positions[i1 - 1] + int(round(window_kb * 1000)),
+                side="right")))
+        for j0 in range(i0, hi, B):
+            j1 = min(j0 + B, hi)
+            pl_b = pl_a if j0 == i0 else _build_planes(
+                packed, cp.arange(j0, j1), ns, bpv)
+            c = _counts_block(pl_a, pl_b, ns, has_missing)
+            r, n = _r_from_counts_gpu(c)
+
+            ii = cp.arange(i0, i1)[:, None]
+            jj = cp.arange(j0, j1)[None, :]
+            keep = (jj > ii) & cp.isfinite(r) & (n >= min_obs)
+            if window is not None:
+                keep &= (jj - ii) <= int(window)
+            if window_kb is not None:
+                pos = cp.asarray(positions)
+                keep &= (pos[jj] - pos[ii]) <= int(round(window_kb * 1000))
+            if min_r2 > 0:
+                keep &= (r * r) >= min_r2
+
+            idx = cp.nonzero(keep)
+            if idx[0].size:
+                tabs = cp.empty((idx[0].size, 3, 3), dtype=cp.float32)
+                for a in range(3):
+                    for b in range(3):
+                        tabs[:, a, b] = c[a, b][idx]
+                out_tabs.append(cp.asnumpy(tabs))
+                out_pairs.append(np.stack([cp.asnumpy(idx[0]) + i0,
+                                           cp.asnumpy(idx[1]) + j0], axis=1))
+            del c, r, n, keep, idx
+            if pl_b is not pl_a:
+                del pl_b
+        del pl_a
+        cp.get_default_memory_pool().free_all_blocks()
+
+    del packed
+    cp.get_default_memory_pool().free_all_blocks()
+    if not out_pairs:
+        return np.zeros((0, 2), dtype=np.int64), np.zeros((0, 3, 3))
+    return np.concatenate(out_pairs), np.concatenate(out_tabs)
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +678,7 @@ def ld_matrix(
     annotation=None,
     output: Optional[Union[str, Path]] = None,
     backend: str = "auto",
+    tile_size: Optional[int] = None,
     max_pairs: int = 100_000_000,
     device: int = 0,
     verbose: bool = True,
@@ -706,7 +816,7 @@ def ld_matrix(
         positions = np.array([pos_map.get(int(g), 0) for g in gidx_all[rows]],
                              dtype=np.int64)
 
-    pairs_local, n_pairs = _plan_pairs(len(rows), positions, window, window_kb)
+    n_pairs = _count_pairs(len(rows), positions, window, window_kb)
     if n_pairs > max_pairs:
         raise ValueError(
             f"plan would emit {n_pairs:,} pairs, above max_pairs={max_pairs:,}. "
@@ -716,18 +826,15 @@ def ld_matrix(
         return _empty_pairs(stats)
 
     # ---- counts ----------------------------------------------------------
-    has_missing = bool(reader.has_missing)
     if use_gpu:
         cp.cuda.Device(device).use()
-        packed = cp.asarray(np.frombuffer(reader.read_packed_bytes(), dtype=np.uint8))
-        bpv = int(reader.bytes_per_variant)
-        sel = cp.asarray(rows.astype(np.int64))
-        packed = packed.reshape(p_all, bpv)[sel].ravel()
-        counts_dev = _counts_gpu(packed, reader.n_samples, len(rows), bpv, has_missing)
-        tables = _tables_from_gpu_counts(counts_dev, pairs_local)
-        del counts_dev, packed
-        cp.get_default_memory_pool().free_all_blocks()
+        pairs_local, tables = _scan_gpu(
+            reader, rows, window, window_kb, positions, min_r2, min_obs,
+            tile_size=tile_size, verbose=verbose)
+        if len(pairs_local) == 0:
+            return _empty_pairs(stats)
     else:
+        pairs_local, _ = _plan_pairs(len(rows), positions, window, window_kb)
         dos = _dosages_numpy(reader)[rows]
         tables = contingency_tables(dos, pairs_local)
 
