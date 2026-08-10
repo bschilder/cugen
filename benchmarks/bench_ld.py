@@ -7,6 +7,17 @@ demonstrate that; the scaling sweep does.
     python benchmarks/bench_ld.py --cugen chr22.cugen --scaling --out scale.json
     python benchmarks/bench_ld.py --cugen chr22.cugen --p 170000 --min-r2 0.2
 """
+import os
+import sys
+
+# Make `python benchmarks/<script>.py` work from a source checkout: running a
+# script puts ITS directory on sys.path, not the repo root.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+if os.path.join(_ROOT, "tests") not in sys.path:
+    sys.path.insert(0, os.path.join(_ROOT, "tests"))
+
 import argparse
 import json
 import time

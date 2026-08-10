@@ -11,6 +11,17 @@ What it answers:
   * does the tile auto-tuner cope with this device's memory (6 GB .. 180 GB)?
   * how long does a fixed workload take, and what is peak pool memory?
 """
+import os
+import sys
+
+# Make `python benchmarks/<script>.py` work from a source checkout: running a
+# script puts ITS directory on sys.path, not the repo root.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+if os.path.join(_ROOT, "tests") not in sys.path:
+    sys.path.insert(0, os.path.join(_ROOT, "tests"))
+
 import argparse
 import json
 import platform
@@ -20,7 +31,6 @@ import time
 
 import numpy as np
 
-sys.path.insert(0, "tests")
 
 
 def device_info():
