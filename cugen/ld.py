@@ -599,6 +599,7 @@ def _scan_gpu(reader, rows, window, window_kb, positions, min_r2, min_obs,
             f"returning quietly-wrong counts.")
     bpv = int(reader.bytes_per_variant)
     p = len(rows)
+    has_missing = bool(reader.has_missing)
     B = int(tile_size) if tile_size else _tile_size_for(ns)
 
     packed = cp.asarray(np.frombuffer(reader.read_packed_bytes(), dtype=np.uint8))
