@@ -370,3 +370,54 @@ def test_plink2_n_obs_matches_pairwise_complete(tmp_path):
     row = df[(df["gidx_a"] == 4) & (df["gidx_b"] == 9)].iloc[0]
     both = (dos[4] != 3) & (dos[9] != 3)
     assert int(row["N_OBS"]) == int(both.sum()) < 60
+
+
+@requires_gpu
+@pytest.mark.gpu
+@pytest.mark.parametrize("tile", [2, 3, 5, 7])
+def test_gpu_tiling_is_boundary_exact(small_cugen, tile):
+    """Tiny tiles force many block boundaries. The emitted pair SET and every
+    statistic must be identical to the untiled NumPy reference -- off-by-one at
+    a tile edge is the classic failure and a count check alone would miss it."""
+    path, _ = small_cugen
+    ref = L.ld_matrix(path, backend="numpy", verbose=False)
+    got = L.ld_matrix(path, backend="gpu", tile_size=tile, verbose=False)
+    assert _pairs_index(got) == _pairs_index(ref)
+    a = ref.sort_values(["gidx_a", "gidx_b"]).reset_index(drop=True)
+    b = got.sort_values(["gidx_a", "gidx_b"]).reset_index(drop=True)
+    for col in ("R", "R2", "D", "DP", "N_OBS"):
+        np.testing.assert_allclose(a[col], b[col], atol=1e-5, err_msg=col)
+
+
+@requires_gpu
+@pytest.mark.gpu
+@pytest.mark.parametrize("tile", [2, 4])
+def test_gpu_tiling_with_window_and_missing(missing_cugen, tile):
+    path, _ = missing_cugen
+    ref = L.ld_matrix(path, window=4, backend="numpy", verbose=False)
+    got = L.ld_matrix(path, window=4, backend="gpu", tile_size=tile,
+                      verbose=False)
+    assert _pairs_index(got) == _pairs_index(ref)
+    a = ref.sort_values(["gidx_a", "gidx_b"]).reset_index(drop=True)
+    b = got.sort_values(["gidx_a", "gidx_b"]).reset_index(drop=True)
+    np.testing.assert_array_equal(a["N_OBS"], b["N_OBS"])
+    np.testing.assert_allclose(a["R"], b["R"], atol=1e-5)
+
+
+@requires_gpu
+@pytest.mark.gpu
+def test_gpu_peak_memory_flat_in_p(tmp_path):
+    """The scalability claim: peak pool bytes must not grow with p."""
+    import cupy as cp
+    dos = simulate_haplotypes(400, 1200, seed=2)
+    p = tmp_path / "chr1.cugen"
+    write_cugen(str(p), dos.T.astype(np.uint8))
+    peaks = []
+    for n in (300, 600, 1200):
+        pool = cp.get_default_memory_pool()
+        pool.free_all_blocks()
+        L.ld_matrix(str(p), variant_range=(0, n), stats=("r", "r2"),
+                    min_r2=0.9, tile_size=256, backend="gpu", verbose=False)
+        peaks.append(pool.total_bytes())
+        pool.free_all_blocks()
+    assert max(peaks) < 4 * min(peaks), f"peak memory grew with p: {peaks}"
