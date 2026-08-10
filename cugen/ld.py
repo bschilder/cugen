@@ -440,14 +440,19 @@ def _merge_annotation(df: pd.DataFrame, ann: Optional[pd.DataFrame],
 
 
 def _finalize(df: pd.DataFrame, stats: Sequence[str]) -> pd.DataFrame:
+    """Coerce to the canonical schema, skipping columns already correct.
+
+    An unconditional astype copies every column; at 5M rows that is real
+    time for nothing when most columns were built at the right dtype.
+    """
     tmpl = _empty_pairs(stats)
     for c, dt in tmpl.dtypes.items():
-        if c in df.columns:
+        if c in df.columns and df[c].dtype != dt:
             try:
-                df[c] = df[c].astype(dt)
+                df[c] = df[c].astype(dt, copy=False)
             except (ValueError, TypeError):
                 pass
-    return df[list(tmpl.columns)].reset_index(drop=True)
+    return df[list(tmpl.columns)]
 
 
 def ld_clump(*a, **kw):
@@ -719,12 +724,13 @@ def _r_only_result(r_arr, n_arr, reader, rows, pairs_local):
     """
     r = np.asarray(r_arr, dtype=np.float64)
     af = np.asarray(reader.mu_x, dtype=np.float64)[rows] / 2.0
-    nan = np.full(r.shape, np.nan)
+    # No NaN d/dp arrays: this path is only taken when neither was requested,
+    # and allocating two full-length arrays of NaN to immediately drop them
+    # costs real time at 5M rows.
     return {"n": np.asarray(n_arr, dtype=np.float64),
             "pA": af[pairs_local[:, 0]], "pB": af[pairs_local[:, 1]],
             "r": r, "r2": np.clip(r * r, 0.0, 1.0),
-            "r2_signed": np.clip(r * np.abs(r), -1.0, 1.0),
-            "d": nan, "dp": nan}
+            "r2_signed": np.clip(r * np.abs(r), -1.0, 1.0)}
 
 
 def _dosages_numpy(reader) -> np.ndarray:
@@ -1025,7 +1031,8 @@ def ld_matrix(
     if sign_reference == "major":
         flip = (res["pA"] > 0.5) ^ (res["pB"] > 0.5)
         for k in ("r", "r2_signed", "d", "dp"):
-            res[k] = np.where(flip, -res[k], res[k])
+            if k in res:
+                res[k] = np.where(flip, -res[k], res[k])
 
     keep = np.isfinite(res["r"]) & (res["n"] >= min_obs)
     if min_r2 > 0:
