@@ -53,10 +53,14 @@ def corr_note(x, y):
     def pval(p):
         return f"< {_TINY:.0e}, underflow" if p < _TINY else f"= {p:.1e}"
 
+    # Two lines: the coefficients are the message and stay on the first, the
+    # p-values go below. On one line this ran wider than the panel and
+    # collided with the neighbouring subplot's title.
     if pval(pp) == pval(sp):
-        return f"Pearson {coef(pr)},  Spearman {coef(sr)}   (both p {pval(pp)})"
-    return (f"Pearson {coef(pr)} (p {pval(pp)}),  "
-            f"Spearman {coef(sr)} (p {pval(sp)})")
+        return (f"Pearson {coef(pr)},  Spearman {coef(sr)}\n"
+                f"both p {pval(pp)}")
+    return (f"Pearson {coef(pr)},  Spearman {coef(sr)}\n"
+            f"p {pval(pp)} and p {pval(sp)}")
 
 # The parquet is ~40 MB and is not committed; regenerate it with
 #   python benchmarks/concordance.py --bfile <bed> --cugen <cugen> \
@@ -106,7 +110,7 @@ for ax, (name, c1, c2, xlabel) in zip(axes, panels):
     ax.set_xlabel(xlabel, fontsize=9.5, color=INK2)
     ax.set_ylabel(f"cugen {name}", fontsize=9.5, color=INK2)
     ax.set_title(f"{name}   max|Δ| = {err.max():.2e}", fontsize=11,
-                 color=INK, loc="left", pad=24)
+                 color=INK, loc="left", pad=38)
     ax.text(0.0, 1.012, corr_note(x, y), transform=ax.transAxes,
             fontsize=8.5, color=INK2, ha="left", va="bottom")
     ax.grid(color=GRID, linewidth=0.7)
@@ -190,7 +194,7 @@ if bad.any():
     ax2[0].set_aspect("equal")
     ax2[0].set_title(f"D' — {int(bad.sum()):,} of {len(df):,} disagree "
                      f"({100*bad.mean():.3f}%)", fontsize=11, loc="left",
-                     pad=24)
+                     pad=38)
     _x, _y = df["dp_plink"].to_numpy(), df["dp_cugen"].to_numpy()
     _ok = np.isfinite(_x) & np.isfinite(_y)
     ax2[0].text(0.0, 1.012, corr_note(_x[_ok], _y[_ok]),
