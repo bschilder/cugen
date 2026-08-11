@@ -740,17 +740,27 @@ def _get_g_only_kernel():
     return _LD_G_ONLY_KERNEL
 
 
-def _build_g(packed2d, rows, n_samples, bytes_per_variant):
-    """Just the dosage plane -- a third of the writes of _build_dosage."""
-    blk = packed2d[rows].ravel()
-    b, ns = int(len(rows)), int(n_samples)
-    G = cp.empty((b, ns), dtype=cp.float32)
+def _build_g(packed2d, lo, hi, n_samples, bytes_per_variant, out=None):
+    """Dosage plane for the CONTIGUOUS row range [lo, hi).
+
+    Takes a range rather than an index array on purpose. The rows are always
+    contiguous here, but packed2d[cp.arange(lo, hi)] is a fancy-index gather
+    that copies the whole packed slice -- measured at 40.6 ms against 18.3 ms
+    for the unpack kernel itself, which already runs at 99% of the pure-fill
+    bandwidth floor. A slice is a zero-copy view.
+
+    `out` reuses a caller-owned buffer; allocating a fresh B x n plane per
+    tile was costing about as much again as the kernel.
+    """
+    b, ns = int(hi - lo), int(n_samples)
+    blk = packed2d[lo:hi].ravel()                  # view, not a copy
+    G = out if out is not None else cp.empty((b, ns), dtype=cp.float32)
     tpb = 256
     total = b * ns
     _get_g_only_kernel()(((total + tpb - 1) // tpb,), (tpb,),
                          (blk, G, np.int64(ns), np.int64(b),
                           np.int64(bytes_per_variant)))
-    return G
+    return G[:b] if out is not None else G
 
 
 def _get_dosage_kernel():
@@ -992,17 +1002,21 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
         out_r = cp.empty(capacity, dtype=cp.float32)
         counter = cp.zeros(1, dtype=cp.uint64)
         kern = _get_epilogue_kernel()
+        # Two reusable plane buffers for the whole scan. A fresh B x n
+        # allocation per tile cost roughly as much as the unpack kernel.
+        bufA = cp.empty((B, ns), dtype=cp.float32)
+        bufB = cp.empty((B, ns), dtype=cp.float32)
         with _Tf32(tf32):
             for i0 in range(0, p, B):
                 i1 = min(i0 + B, p)
                 hi = p if window is None else min(p, i1 - 1 + int(window) + 1)
-                Ga = _build_g(packed, cp.arange(i0, i1), ns, bpv)
+                Ga = _build_g(packed, i0, i1, ns, bpv, out=bufA)
                 for j0 in range(i0, hi, B):
                     j1 = min(j0 + B, hi)
                     if j0 == i0:
                         Gb = Ga
                     else:
-                        Gb = _build_g(packed, cp.arange(j0, j1), ns, bpv)
+                        Gb = _build_g(packed, j0, j1, ns, bpv, out=bufB)
                     S = Ga @ Gb.T
                     bi, bj = i1 - i0, j1 - j0
                     nthread = bi * bj
@@ -1013,9 +1027,7 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
                           np.int64(window if window else 0), np.float32(min_r2),
                           out_i, out_j, out_r, counter, np.int64(capacity)))
                     del S
-                    if Gb is not Ga:
-                        del Gb
-                del Ga
+        del bufA, bufB
         return out_i, out_j, out_r, int(counter[0])
 
     # optimistic capacity, then one exact retry if it overflowed
