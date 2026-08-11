@@ -407,19 +407,45 @@ def test_gpu_tiling_with_window_and_missing(missing_cugen, tile):
 @requires_gpu
 @pytest.mark.gpu
 def test_gpu_peak_memory_flat_in_p(tmp_path):
-    """The scalability claim: peak pool bytes must not grow with p."""
+    """The scalability claim: peak device memory must not grow with p.
+
+    Peak has to be SAMPLED during the run. Reading pool.total_bytes()
+    afterwards is not a high-water mark -- ld_matrix frees blocks as it goes,
+    so once the allocations got smaller that read returned 0 for every size
+    and the test compared 0 < 4*0.
+    """
+    import threading
+    import time as _time
+
     import cupy as cp
-    dos = simulate_haplotypes(400, 1200, seed=2)
+
+    dos = simulate_haplotypes(400, 1600, seed=2)
     p = tmp_path / "chr1.cugen"
     write_cugen(str(p), dos.T.astype(np.uint8))
-    peaks = []
-    for n in (300, 600, 1200):
+
+    def peak_for(n):
         pool = cp.get_default_memory_pool()
         pool.free_all_blocks()
+        best = [0]
+        stop = [False]
+
+        def sample():
+            while not stop[0]:
+                best[0] = max(best[0], pool.used_bytes())
+                _time.sleep(0.001)
+
+        t = threading.Thread(target=sample, daemon=True)
+        t.start()
         L.ld_matrix(str(p), variant_range=(0, n), stats=("r", "r2"),
-                    min_r2=0.9, tile_size=256, backend="gpu", verbose=False)
-        peaks.append(pool.total_bytes())
+                    min_r2=0.5, tile_size=256, backend="gpu", verbose=False)
+        stop[0] = True
+        t.join(timeout=1.0)
         pool.free_all_blocks()
+        return best[0]
+
+    peaks = [peak_for(n) for n in (400, 800, 1600)]
+    assert min(peaks) > 0, f"sampler recorded nothing: {peaks}"
+    # 4x headroom over a 4x growth in p: bounded, not proportional
     assert max(peaks) < 4 * min(peaks), f"peak memory grew with p: {peaks}"
 
 
