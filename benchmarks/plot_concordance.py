@@ -76,6 +76,27 @@ for ax, (name, c1, c2, xlabel) in zip(axes, panels):
         ax.spines[s].set_visible(False)
     ax.tick_params(colors=INK2, labelsize=8.5)
 
+def unit_scale(v):
+    """Choose a power-of-ten divisor and an axis-label suffix for it.
+
+    matplotlib's default for tiny values is an offset multiplier parked in the
+    axis corner as a 7pt `1e-7`, leaving the ticks reading -5..5. On a residual
+    between two correlations that is actively misleading -- it looks like the
+    disagreement spans the whole admissible range of r. Fold the exponent into
+    the axis LABEL, which is read, and let the ticks be plain numbers.
+
+    Returns (1.0, "") when the values are already O(1), so the D/D' panels --
+    whose residuals really do reach -1.7 -- are left alone.
+    """
+    m = float(np.nanmax(np.abs(v))) if len(v) else 0.0
+    if not np.isfinite(m) or m == 0.0:
+        return 1.0, ""
+    e = int(np.floor(np.log10(m)))
+    if -1 <= e <= 1:
+        return 1.0, ""
+    return 10.0 ** e, f"  (×10$^{{{e}}}$)"
+
+
 # --- residual row: delta vs value, where density is visible ---------------
 for ax, (name, c1, c2, xlabel) in zip(allax[1], panels):
     x, y = df[c2].to_numpy(), df[c1].to_numpy()
@@ -83,14 +104,18 @@ for ax, (name, c1, c2, xlabel) in zip(allax[1], panels):
     x, y = x[ok], y[ok]
     d = y - x
     bad = np.abs(d) > TOL
+    div, suffix = unit_scale(d)
     ax.axhline(0.0, color=INK2, lw=1.2, ls="--", zorder=1)
-    ax.scatter(x[~bad], d[~bad], s=2, c=BLUE, alpha=0.02, linewidths=0,
+    ax.scatter(x[~bad], d[~bad] / div, s=2, c=BLUE, alpha=0.02, linewidths=0,
                zorder=2, rasterized=True)
     if bad.any():
-        ax.scatter(x[bad], d[bad], s=18, c=RED, alpha=0.9, linewidths=0,
+        ax.scatter(x[bad], d[bad] / div, s=18, c=RED, alpha=0.9, linewidths=0,
                    zorder=3)
+    # Belt and braces: with the exponent now in the label, a leftover corner
+    # offset would be a second, contradictory scale on the same axis.
+    ax.ticklabel_format(axis="y", style="plain", useOffset=False)
     ax.set_xlabel(xlabel, fontsize=9.5, color=INK2)
-    ax.set_ylabel(f"cugen {name} − plink2", fontsize=9.5, color=INK2)
+    ax.set_ylabel(f"cugen {name} − plink2{suffix}", fontsize=9.5, color=INK2)
     rms = float(np.sqrt((d ** 2).mean()))
     ax.set_title(f"{name} residual   rms = {rms:.1e}", fontsize=11, color=INK,
                  loc="left", pad=8)
