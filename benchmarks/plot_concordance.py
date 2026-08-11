@@ -20,6 +20,43 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy import stats
+
+_TINY = np.finfo(float).tiny        # 2.2e-308 -- where a float p-value dies
+
+
+def corr_note(x, y):
+    """Pearson and Spearman with p-values, formatted to stay informative.
+
+    Two traps at this sample size, handled here rather than papered over:
+
+      * Both coefficients round to 1.000000 at any readable number of decimals
+        (Pearson on r is 0.9999999999997). Near 1 they are therefore reported
+        as `1 - 2.6e-13`: the DISTANCE from 1 is the only part carrying
+        information, and it varies over nine orders of magnitude across these
+        four panels.
+      * Both p-values underflow to exactly 0.0 in double precision. Printing
+        "p = 0" asserts a precision the float does not hold, so report the
+        underflow bound instead.
+
+    The p-values are reported because they were asked for, but they are close
+    to meaningless here: the null they reject is "two tools computing the same
+    statistic on the same genotypes are unrelated". The coefficient's distance
+    from 1 is the number to read.
+    """
+    pr, pp = stats.pearsonr(x, y)
+    sr, sp = stats.spearmanr(x, y)
+
+    def coef(v):
+        return f"1 − {1 - v:.1e}" if 1 - v < 1e-6 else f"{v:.6f}"
+
+    def pval(p):
+        return f"< {_TINY:.0e}, underflow" if p < _TINY else f"= {p:.1e}"
+
+    if pval(pp) == pval(sp):
+        return f"Pearson {coef(pr)},  Spearman {coef(sr)}   (both p {pval(pp)})"
+    return (f"Pearson {coef(pr)} (p {pval(pp)}),  "
+            f"Spearman {coef(sr)} (p {pval(sp)})")
 
 # The parquet is ~40 MB and is not committed; regenerate it with
 #   python benchmarks/concordance.py --bfile <bed> --cugen <cugen> \
@@ -69,7 +106,9 @@ for ax, (name, c1, c2, xlabel) in zip(axes, panels):
     ax.set_xlabel(xlabel, fontsize=9.5, color=INK2)
     ax.set_ylabel(f"cugen {name}", fontsize=9.5, color=INK2)
     ax.set_title(f"{name}   max|Δ| = {err.max():.2e}", fontsize=11,
-                 color=INK, loc="left", pad=8)
+                 color=INK, loc="left", pad=24)
+    ax.text(0.0, 1.012, corr_note(x, y), transform=ax.transAxes,
+            fontsize=8.5, color=INK2, ha="left", va="bottom")
     ax.grid(color=GRID, linewidth=0.7)
     ax.set_axisbelow(True)
     for s in ("top", "right"):
@@ -150,7 +189,13 @@ if bad.any():
                ylim=(-1.05, 1.05))
     ax2[0].set_aspect("equal")
     ax2[0].set_title(f"D' — {int(bad.sum()):,} of {len(df):,} disagree "
-                     f"({100*bad.mean():.3f}%)", fontsize=11, loc="left")
+                     f"({100*bad.mean():.3f}%)", fontsize=11, loc="left",
+                     pad=24)
+    _x, _y = df["dp_plink"].to_numpy(), df["dp_cugen"].to_numpy()
+    _ok = np.isfinite(_x) & np.isfinite(_y)
+    ax2[0].text(0.0, 1.012, corr_note(_x[_ok], _y[_ok]),
+                transform=ax2[0].transAxes, fontsize=8.5, color=INK2,
+                ha="left", va="bottom")
 
     mm = np.minimum(df["maf_a"], df["maf_b"])
     ax2[1].scatter(mm[~bad], (df["dp_cugen"] - df["dp_plink"]).abs()[~bad],
