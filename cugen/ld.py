@@ -844,17 +844,19 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
     packed = cp.asarray(np.frombuffer(reader.read_packed_bytes(), dtype=np.uint8))
     packed = packed.reshape(int(reader.n_variants), bpv)[cp.asarray(rows)]
 
-    # per-variant moments, computed once for the whole selection
-    G_all = cp.empty((p, ns), dtype=cp.float32)
-    G2_all = cp.empty((p, ns), dtype=cp.float32)
-    M_all = cp.empty((p, ns), dtype=cp.float32)
-    tpb = 256
-    _get_dosage_kernel()(((p * ns + tpb - 1) // tpb,), (tpb,),
-                         (packed.ravel(), G_all, G2_all, M_all,
-                          np.int64(ns), np.int64(p), np.int64(bpv)))
-    s_v = G_all.sum(axis=1).astype(cp.float32)
-    q_v = G2_all.sum(axis=1).astype(cp.float32)
-    del G2_all, M_all
+    # Per-variant moments in one streamed pass. Materialising G/G2/M for all
+    # p variants would be 3 * p * n * 4 bytes -- 48 GB at p=4000, n=1e6 --
+    # before a single tile runs. s_v and q_v are only p floats each, and the
+    # GEMM only ever needs G for the two blocks in play.
+    s_v = cp.empty(p, dtype=cp.float32)
+    q_v = cp.empty(p, dtype=cp.float32)
+    chunk = max(1, min(p, int(2e8 // max(ns, 1))))
+    for c0 in range(0, p, chunk):
+        c1 = min(c0 + chunk, p)
+        Gc, G2c, _Mc = _build_dosage(packed, cp.arange(c0, c1), ns, bpv)
+        s_v[c0:c1] = Gc.sum(axis=1, dtype=cp.float32)
+        q_v[c0:c1] = G2c.sum(axis=1, dtype=cp.float32)
+        del Gc, G2c, _Mc
     cp.get_default_memory_pool().free_all_blocks()
 
     def run(capacity):
@@ -866,10 +868,14 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
         for i0 in range(0, p, B):
             i1 = min(i0 + B, p)
             hi = p if window is None else min(p, i1 - 1 + int(window) + 1)
-            Ga = G_all[i0:i1]
+            Ga, _, _ = _build_dosage(packed, cp.arange(i0, i1), ns, bpv)
             for j0 in range(i0, hi, B):
                 j1 = min(j0 + B, hi)
-                S = Ga @ G_all[j0:j1].T
+                if j0 == i0:
+                    Gb = Ga
+                else:
+                    Gb, _, _ = _build_dosage(packed, cp.arange(j0, j1), ns, bpv)
+                S = Ga @ Gb.T
                 bi, bj = i1 - i0, j1 - j0
                 nthread = bi * bj
                 kern(((nthread + 255) // 256,), (256,),
@@ -879,6 +885,9 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
                       np.int64(window if window else 0), np.float32(min_r2),
                       out_i, out_j, out_r, counter, np.int64(capacity)))
                 del S
+                if Gb is not Ga:
+                    del Gb
+            del Ga
         return out_i, out_j, out_r, int(counter[0])
 
     # optimistic capacity, then one exact retry if it overflowed
@@ -891,7 +900,7 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
         del out_i, out_j, out_r
         cp.get_default_memory_pool().free_all_blocks()
         out_i, out_j, out_r, found = run(found)
-    del G_all, packed
+    del packed
     cp.get_default_memory_pool().free_all_blocks()
     return out_i[:found], out_j[:found], out_r[:found]
 
