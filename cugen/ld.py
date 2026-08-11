@@ -1220,9 +1220,21 @@ def ld_clump(
 
     want_gpu = backend == "gpu" or (backend == "auto" and HAS_CUPY)
     reader = read_cugen(str(cugen))
-    on_device = want_gpu and HAS_CUPY and not reader.has_missing
     if backend == "gpu" and not HAS_CUPY:
         raise RuntimeError("backend='gpu' but CuPy is not available")
+    # The FUSED path additionally needs a file with no missing calls. When it
+    # cannot be used we still want the GPU -- the previous version dropped
+    # straight to backend="numpy" here, so a .cugen carrying the HAS_MISSING
+    # flag silently ran the O(p * window * n) NumPy reference even under
+    # backend="gpu". On chr22 that is ~1e12 operations and an OOM kill, and it
+    # looked like a memory bug in the device path rather than what it was:
+    # the device path never ran.
+    on_device = want_gpu and HAS_CUPY and not reader.has_missing
+    if verbose:
+        path = ("fused device kernels" if on_device else
+                "gpu, non-fused (file has missing calls)" if want_gpu else
+                "numpy reference (CPU)")
+        print(f"[clump] path: {path}")
 
     if on_device:
         # --- everything below runs on the device -------------------------
@@ -1270,10 +1282,14 @@ def ld_clump(
                   f"index selection converged in {rounds} parallel round(s); "
                   f"{len(a):,} memberships returned to host")
     else:
-        # --- CPU reference: same algorithm, NumPy in place of the kernels --
+        # --- non-fused: same algorithm, edges via the general scan ---------
+        # backend is passed THROUGH, not forced to numpy. Hardcoding numpy
+        # here is what turned "this file has missing calls" into "run the CPU
+        # reference on a whole chromosome".
         pairs = ld_matrix(
             cugen, variants=rel_gidx, annotation=ann, window_kb=kb, min_r2=r2,
-            stats=("r2",), output_format="pairs", backend="numpy",
+            stats=("r2",), output_format="pairs", backend=backend,
+            precision=precision, tile_size=tile_size, device=device,
             max_pairs=max_pairs, verbose=False)
         pairs = pairs.to_pandas() if hasattr(pairs, "to_pandas") else pairs
         row_of = pd.Series(np.arange(len(rel)), index=rel_gidx)

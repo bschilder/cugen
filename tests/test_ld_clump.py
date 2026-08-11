@@ -562,3 +562,30 @@ def test_sp2_false_drops_only_the_member_id_column():
     cols = [c for c in on.columns if c != "SP2"]
     pd.testing.assert_frame_equal(on[cols], off[cols])
     assert (off["SP2"] == ".").all()
+
+
+def test_gpu_backend_never_silently_runs_the_cpu_reference(tmp_path,
+                                                           monkeypatch):
+    """Regression: a .cugen flagged HAS_MISSING used to send backend='gpu'
+    into a hardcoded backend='numpy' call.
+
+    That is not a slow path, it is a different algorithm's cost model --
+    O(p * window * n) -- and on chr22 it was an OOM kill that looked like a
+    memory bug in the device code. The device code had never run.
+    """
+    import cugen.ld as L
+    seen = {}
+    real = L.ld_matrix
+
+    def spy(*a, **kw):
+        seen["backend"] = kw.get("backend")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(L, "ld_matrix", spy)
+    path, ann = _clump_fixture(tmp_path)
+    # Force the non-fused branch regardless of the fixture's flags.
+    monkeypatch.setattr(L, "HAS_CUPY", False)
+    L.ld_clump(path, DATA / "clump_sumstats.tsv", annotation=ann,
+               backend="numpy", verbose=False)
+    assert seen["backend"] == "numpy", (
+        "the requested backend must be passed through, not overridden")
