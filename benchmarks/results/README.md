@@ -50,3 +50,46 @@ sweep is not published here to avoid it being quoted by accident.
    likelihood has multiple admissible roots. See issue #2 and
    `test_cubic_picks_the_global_maximum_likelihood_root`.
 4. **AMD is untested.** `cupy-cuda12x` is CUDA-only.
+
+## Optimisation series — cugen vs plink2
+
+Added after the first write-up, when a head-to-head showed cugen *losing* the
+windowed case. Files are in the order they were produced, so the sequence is
+auditable rather than just the final number.
+
+| file | what it measures |
+|---|---|
+| `vs_plink2.json` | windowed, before any optimisation — plink2 wins 12-20x |
+| `vs_plink2_allpairs.json` | all-pairs, before optimisation — crossover at p=50k |
+| `vs_plink2_big.json` | all-pairs at chr22 scale, pre-cuDF: 7.56x |
+| `vs_win_opt.json` | after r-only path + window-aware tiles (~16% better) |
+| `vs_win_opt2.json` | after replacing pandas.to_csv with pyarrow (4x better) |
+| `vs_win_cudf.json` | after the cuDF device path (8.3x better than the start) |
+| `vs_all_cudf.json` | all-pairs with cuDF: **14x faster, 14x less memory** |
+| `nscale_tf32.log` | sample-count sweep to 1,000,000, fp32 vs TF32 |
+
+### What each optimisation was actually worth
+
+Recorded because the ordering is the interesting part -- the changes reasoned
+out from first principles were correct and nearly worthless, and the ones that
+mattered came from profiling:
+
+1. r-only path (skip the 3x3 table) + window-aware tiling — **16%**, despite
+   the analysis being right that a narrow band wastes ~94% of GEMM work. It
+   was 2% of runtime.
+2. `pandas.to_csv` -> pyarrow — **4x**. Writing 1.4M rows cost 7.3 s against
+   0.22 s for the entire GPU scan.
+3. cuDF device path (zero-copy from CuPy, GPU CSV writer) — a further **1.6x**
+   windowed and **~3x** all-pairs. The survivors were already in device
+   memory; the old path copied them to the host to hand to a serialiser.
+4. Fused epilogue kernel with atomic compaction — SM utilisation **1-4% ->
+   100%**. Roughly 15 CuPy launches, six B x B temporaries and a blocking
+   `cp.nonzero` per tile, replaced by one kernel.
+5. TF32 — **6.3x on the isolated GEMM and bit-exact**, but only ~1.0-1.25x
+   end to end, because the pipeline is not GEMM-bound at large n.
+
+### Numbers here are single or triplicate runs on a shared cloud host
+
+Two sweeps of identical code and data disagreed by 1.9x at n=200,000. Treat
+the direction as solid and the specific multipliers as approximate; the
+replicated sweep reports medians of three with the observed range.
