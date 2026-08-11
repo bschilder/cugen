@@ -553,3 +553,36 @@ def test_tf32_is_bit_identical_to_fp32(tmp_path):
     a = a.sort_values(["gidx_a", "gidx_b"]).reset_index(drop=True)
     b = b.sort_values(["gidx_a", "gidx_b"]).reset_index(drop=True)
     np.testing.assert_array_equal(a["R"].to_numpy(), b["R"].to_numpy())
+
+
+@requires_gpu
+@pytest.mark.gpu
+def test_fused_path_matches_plink2_golden(tmp_path, capsys):
+    """plink2 parity ON THE FUSED PATH, and proof that path was taken.
+
+    The first parity check after the optimisation work passed while silently
+    exercising the table path: compare_plink.py requests D/D' and no output
+    file, both of which force need_table and route around the fused kernel,
+    cuDF assembly and the r-only moment formula. A green result on the wrong
+    path is worse than no check, so assert the path explicitly.
+    """
+    dos = np.load(DATA / "ld_fixture.npy")
+    clean = dos.copy()
+    clean[clean == 3] = 0          # fused path requires no missingness
+    clean = np.delete(clean, 11, axis=0)      # drop the monomorphic variant
+    path = tmp_path / "chr22.cugen"
+    write_cugen(str(path), clean.T.astype(np.uint8))
+
+    ref = L.ld_matrix(str(path), stats=("r", "r2"), min_r2=0.0,
+                      backend="numpy", verbose=False)
+    got = L.ld_matrix(str(path), stats=("r", "r2"), min_r2=0.0,
+                      backend="gpu", output=str(tmp_path / "o.tsv"),
+                      max_pairs=10 ** 12, verbose=True)
+    assert "fused kernel" in capsys.readouterr().out, \
+        "fused path was not taken -- this test would be checking nothing"
+
+    got = got.to_pandas() if hasattr(got, "to_pandas") else got
+    a = ref.sort_values(["gidx_a", "gidx_b"]).reset_index(drop=True)
+    b = got.sort_values(["gidx_a", "gidx_b"]).reset_index(drop=True)
+    assert len(a) == len(b) and len(a) > 20
+    np.testing.assert_allclose(a["R"], b["R"], atol=1e-5)
