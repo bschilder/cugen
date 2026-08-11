@@ -109,3 +109,23 @@ against plink2's 771.78 s on 128 cores -- **513x**, with GPU memory flat at
 Crossovers: p ~= 5,000 on the variant axis, n ~= 10,000 on the sample axis.
 Below those the GPU's fixed costs dominate and plink2 wins; the variant sweep
 also runs at n=2,504, which is cugen's worst regime.
+
+## Corrections applied 2026-08-11
+
+`nscale.json` was regenerated. The version first published came from a sweep
+run at 23:13 the previous night -- three optimisation commits BEFORE the ones
+that landed at 23:16, 23:29 and 23:38 -- while `psweep.json` was measured at
+00:26 with all of them. One comment carried a current variant table beside a
+stale sample table. Both now come from the same code.
+
+That stale table *understated* cugen (52x peak where the corrected sweep shows
+70x), which is why nothing looked wrong: an inconsistency that flatters you
+gets caught, one that under-reports does not.
+
+Re-measuring also exposed a real bug: `_tile_size_for` bounded tile size by
+MEMORY but not by p, so at p=4,000 with n=100,000 it chose B=31,744 and
+allocated a 31,744 x 100,000 plane buffer to hold 4,000 rows. Fixed by
+`B = min(B, p)`; GPU memory at n=100,000 fell 24.12 -> 3.44 GiB.
+
+`concordance.parquet` holds 854,850 matched cugen/plink2 pairs behind
+`concordance.png` and `concordance_dprime.png`.
