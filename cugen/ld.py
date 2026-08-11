@@ -705,6 +705,54 @@ def _get_epilogue_kernel():
     return _LD_EPILOGUE_KERNEL
 
 
+_LD_G_ONLY_KERNEL = None
+
+# The fused scan consumes only G, but _build_dosage writes G, G2 and M -- three
+# planes of B x n x 4 bytes when one is used. At n = 1e6 that is 12 GB written
+# per tile to consume 4 GB, and plane construction is what bounds the run once
+# n passes ~200k. s_v/q_v still need G2, but they are computed once in the
+# streaming pre-pass, not per tile.
+_LD_G_ONLY_SRC = r'''
+extern "C" __global__
+void build_g_plane(const unsigned char* packed, float* G,
+                   const long long n_samples,
+                   const long long n_variants,
+                   const long long bytes_per_variant)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = n_variants * n_samples;
+    if (idx >= total) return;
+    long long v = idx / n_samples;
+    long long s = idx - v * n_samples;
+    unsigned char byte = packed[v * bytes_per_variant + (s >> 2)];
+    int code = (byte >> (6 - 2 * (s & 3))) & 3;
+    G[idx] = (code == 3) ? 0.0f : (float)code;
+}
+'''
+
+assert _LD_G_ONLY_SRC.isascii(), "kernel source must be pure ASCII (cf. 34b4a59)"
+
+
+def _get_g_only_kernel():
+    global _LD_G_ONLY_KERNEL
+    if _LD_G_ONLY_KERNEL is None and HAS_CUPY:
+        _LD_G_ONLY_KERNEL = cp.RawKernel(_LD_G_ONLY_SRC, "build_g_plane")
+    return _LD_G_ONLY_KERNEL
+
+
+def _build_g(packed2d, rows, n_samples, bytes_per_variant):
+    """Just the dosage plane -- a third of the writes of _build_dosage."""
+    blk = packed2d[rows].ravel()
+    b, ns = int(len(rows)), int(n_samples)
+    G = cp.empty((b, ns), dtype=cp.float32)
+    tpb = 256
+    total = b * ns
+    _get_g_only_kernel()(((total + tpb - 1) // tpb,), (tpb,),
+                         (blk, G, np.int64(ns), np.int64(b),
+                          np.int64(bytes_per_variant)))
+    return G
+
+
 def _get_dosage_kernel():
     global _LD_DOSAGE_KERNEL
     if _LD_DOSAGE_KERNEL is None and HAS_CUPY:
@@ -948,13 +996,13 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
             for i0 in range(0, p, B):
                 i1 = min(i0 + B, p)
                 hi = p if window is None else min(p, i1 - 1 + int(window) + 1)
-                Ga, _, _ = _build_dosage(packed, cp.arange(i0, i1), ns, bpv)
+                Ga = _build_g(packed, cp.arange(i0, i1), ns, bpv)
                 for j0 in range(i0, hi, B):
                     j1 = min(j0 + B, hi)
                     if j0 == i0:
                         Gb = Ga
                     else:
-                        Gb, _, _ = _build_dosage(packed, cp.arange(j0, j1), ns, bpv)
+                        Gb = _build_g(packed, cp.arange(j0, j1), ns, bpv)
                     S = Ga @ Gb.T
                     bi, bj = i1 - i0, j1 - j0
                     nthread = bi * bj
