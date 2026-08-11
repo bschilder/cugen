@@ -19,6 +19,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+# The parquet is ~40 MB and is not committed; regenerate it with
+#   python benchmarks/concordance.py --bfile <bed> --cugen <cugen> \
+#       --p 3000 --window 300 --out concordance.parquet
 SRC = sys.argv[1] if len(sys.argv) > 1 else "concordance.parquet"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "."
 TOL = 1e-4
