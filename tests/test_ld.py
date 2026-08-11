@@ -560,7 +560,7 @@ def test_tf32_is_bit_identical_to_fp32(tmp_path):
     np.testing.assert_array_equal(a["R"].to_numpy(), b["R"].to_numpy())
 
 
-@requires_gpu
+@requires_cudf
 @pytest.mark.gpu
 def test_fused_path_matches_plink2_golden(tmp_path, capsys):
     """plink2 parity ON THE FUSED PATH, and proof that path was taken.
