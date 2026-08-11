@@ -316,11 +316,20 @@ def test_annotation_is_required_with_an_actionable_message():
         ld_clump("nofile.cugen", pd.DataFrame({"ID": ["a"], "P": [1e-9]}))
 
 
-def test_swapped_thresholds_are_rejected_not_silently_degenerate():
+def test_p1_above_p2_is_allowed_it_is_the_prs_configuration():
+    """p1=1, p2=0.01 is clumping-and-thresholding for polygenic scores: index
+    on every variant, list only the significant members. An earlier version
+    rejected it on the false premise that p2 gates membership, which blocked
+    the most valuable configuration. plink2 accepts it, so we must too.
+
+    Reaching the missing file proves validation let it through.
+    """
     ann = pd.DataFrame({"gidx": [0], "ID": ["a"], "POS": [1]})
-    with pytest.raises(ValueError, match="Did you swap them"):
-        ld_clump("nofile.cugen", pd.DataFrame({"ID": ["a"], "P": [1e-9]}),
-                 annotation=ann, p1=0.01, p2=1e-4)
+    ss = pd.DataFrame({"ID": ["a"], "P": [1e-9]})
+    with pytest.raises((FileNotFoundError, OSError)) as e:
+        ld_clump("nofile.cugen", ss, annotation=ann, p1=1.0, p2=0.01,
+                 backend="numpy", verbose=False)
+    assert "swap" not in str(e.value).lower()
 
 
 def test_r2_outside_zero_one_is_rejected():

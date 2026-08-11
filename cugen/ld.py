@@ -838,11 +838,13 @@ def ld_clump(
             "neither of which a .cugen stores.")
     if not 0.0 <= r2 <= 1.0:
         raise ValueError(f"r2 must be in [0, 1], got {r2}")
-    if p2 < p1:
-        raise ValueError(
-            f"p2 ({p2:g}) < p1 ({p1:g}): no variant could clear the member "
-            "threshold without also being an index candidate, so every clump "
-            "would be a singleton. Did you swap them?")
+    # There is deliberately NO p2 >= p1 guard. An earlier version raised on
+    # p2 < p1, reasoning that no variant could be a member without also being
+    # an index candidate -- which follows only from the false premise that p2
+    # gates membership. It does not (see _greedy_clump), and p1=1 with p2=0.01
+    # is the standard clumping-and-thresholding configuration for polygenic
+    # scores: index on everything, list only the significant members. plink2
+    # accepts it, so that guard rejected the single most valuable use case.
 
     ann = (annotation if isinstance(annotation, pd.DataFrame)
            else pd.read_csv(str(annotation), sep=None, engine="python"))
