@@ -84,6 +84,11 @@ def main():
     ap.add_argument("--sumstats", default=None,
                     help="default: synthesise from the annotation")
     ap.add_argument("--out", default="clump_bench.json")
+    ap.add_argument("--cpu-subset", type=int, default=20000,
+                    help="variants for the host-path datapoint (0 to skip). "
+                         "The numpy reference is O(p*window*n) and will not "
+                         "finish at chromosome scale, so it is measured on a "
+                         "capped prefix and reported as such.")
     a = ap.parse_args()
 
     from cugen.ld import ld_clump
@@ -115,32 +120,51 @@ def main():
         rec = {"label": label, "p1": p1, "p2": p2, "r2": r2, "kb": kb}
         print(f"\n=== {label}: p1={p1:g} p2={p2:g} r2={r2:g} kb={kb} ===",
               flush=True)
-        for backend in ("gpu", "numpy"):
-            try:
-                with PeakSampler() as s:
-                    t0 = time.perf_counter()
-                    cg = ld_clump(a.cugen, ss_path, annotation=ann, p1=p1,
-                                  p2=p2, r2=r2, kb=kb, backend=backend,
-                                  verbose=(backend == "gpu"))
-                    dt = time.perf_counter() - t0
-                rec[f"{backend}_s"] = round(dt, 3)
-                rec[f"{backend}_peak_gib"] = s.peak_gib
-                rec[f"{backend}_clumps"] = int(len(cg))
-                print(f"  cugen[{backend}]  {dt:8.2f} s  "
-                      f"peak {s.peak_gib:6.2f} GiB  {len(cg):,} clumps")
-                if backend == "gpu":
-                    gpu_df = cg
-            except Exception as e:                        # noqa: BLE001
-                rec[f"{backend}_error"] = f"{type(e).__name__}: {e}"
-                print(f"  cugen[{backend}]  FAILED {type(e).__name__}: {e}")
-                if backend == "numpy":
-                    # The CPU reference is expected to fall over at C+T scale;
-                    # that failure IS the result, so record and continue.
-                    pass
+        # GPU only at full scale. The numpy reference is O(p * window * n) --
+        # about 1e12 operations on chr22 at a 250 kb window -- so running it
+        # here would not produce a slow number, it would produce no number at
+        # all and burn the whole session. Backend agreement is established on
+        # the fixture by the unit tests; the meaningful comparison at scale is
+        # against plink2. See --cpu-subset for a tractable host-path datapoint.
+        gpu_df = None
+        try:
+            with PeakSampler() as s:
+                t0 = time.perf_counter()
+                gpu_df = ld_clump(a.cugen, ss_path, annotation=ann, p1=p1,
+                                  p2=p2, r2=r2, kb=kb, backend="gpu",
+                                  verbose=True)
+                dt = time.perf_counter() - t0
+            rec["gpu_s"] = round(dt, 3)
+            rec["gpu_peak_gib"] = s.peak_gib
+            rec["gpu_clumps"] = int(len(gpu_df))
+            print(f"  cugen[gpu]  {dt:8.2f} s  peak {s.peak_gib:6.2f} GiB  "
+                  f"{len(gpu_df):,} clumps")
+        except Exception as e:                            # noqa: BLE001
+            rec["gpu_error"] = f"{type(e).__name__}: {e}"
+            print(f"  cugen[gpu]  FAILED {type(e).__name__}: {e}")
 
         pk_path, pk_s, err = run_plink(a.bfile, ss_path, p1, p2, r2, kb,
                                        f"/tmp/pk_{abs(hash(label)) % 9999}")
         rec["plink_s"] = round(pk_s, 3)
+        # One tractable host-path datapoint, on a prefix, so the device-vs-host
+        # memory claim rests on a measurement rather than an extrapolation.
+        if a.cpu_subset and gpu_df is not None:
+            sub = ann.head(a.cpu_subset)
+            try:
+                with PeakSampler() as s2:
+                    t2 = time.perf_counter()
+                    c = ld_clump(a.cugen, ss_path, annotation=sub, p1=p1,
+                                 p2=p2, r2=r2, kb=kb, backend="numpy",
+                                 verbose=False)
+                    rec["cpu_subset_s"] = round(time.perf_counter() - t2, 3)
+                rec["cpu_subset_n"] = int(len(sub))
+                rec["cpu_subset_peak_gib"] = s2.peak_gib
+                rec["cpu_subset_clumps"] = int(len(c))
+                print(f"  cugen[numpy, first {len(sub):,} variants]  "
+                      f"{rec['cpu_subset_s']:8.2f} s  {len(c):,} clumps")
+            except Exception as e:                        # noqa: BLE001
+                rec["cpu_subset_error"] = f"{type(e).__name__}: {e}"
+                print(f"  cugen[numpy subset] FAILED {type(e).__name__}: {e}")
         if err:
             rec["plink_error"] = err[:400]
             print(f"  plink2         FAILED: {err[:160]}")
