@@ -99,11 +99,26 @@ def main():
     if a.sumstats:
         ss_path = a.sumstats
     else:
-        # Synthetic p-values, seeded. A real GWAS would be better but the
-        # clump ALGORITHM does not care where p came from, and this keeps the
-        # benchmark self-contained and reproducible.
+        # Synthetic p-values, seeded, shaped like a REAL GWAS.
+        #
+        # The first version drew the exponent uniformly on [0.05, 14], which
+        # puts 72% of variants below 5e-8 -- a genome-wide-significant rate
+        # about a thousand times too high. Every configuration then behaved
+        # like the most extreme one, and the membership count it produced OOM
+        # killed the benchmark on chr22. The clump ALGORITHM does not care
+        # where p came from, but the SHAPE of the distribution sets the edge
+        # count, so it has to be plausible.
+        #
+        # Null-dominated with a small significant tail: ~0.1% of variants
+        # carry real signal, which is what a well-powered GWAS looks like.
         rng = np.random.default_rng(20260811)
-        pv = 10.0 ** (-rng.uniform(0.05, 14.0, size=len(ann)))
+        pv = rng.uniform(0.0, 1.0, size=len(ann))
+        n_hit = max(1, len(ann) // 1000)
+        hits = rng.choice(len(ann), size=n_hit, replace=False)
+        pv[hits] = 10.0 ** (-rng.uniform(5.0, 20.0, size=n_hit))
+        print(f"synthetic sumstats: {len(ann):,} variants, "
+              f"{int((pv <= 5e-8).sum()):,} genome-wide significant "
+              f"({100 * (pv <= 5e-8).mean():.3f}%)")
         ss_path = "/tmp/bench_ss.tsv"
         pd.DataFrame({"ID": ann["ID"], "P": pv}).to_csv(
             ss_path, sep="\t", index=False)

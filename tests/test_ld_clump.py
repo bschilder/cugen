@@ -521,3 +521,44 @@ def test_gpu_path_handles_p1_of_one(tmp_path):
     pd.testing.assert_frame_equal(g.reset_index(drop=True),
                                   c.reset_index(drop=True))
     assert len(g) > 0
+
+
+def test_vectorised_frame_matches_the_list_builder():
+    """The production path builds the table straight from arrays; the list
+    builder survives only as the tests' oracle. They must not drift.
+
+    The list form boxes every membership into a Python int, which is fine here
+    and cost an OOM kill on real chr22 -- so the fast path is the one that
+    ships, and this is what keeps it honest.
+    """
+    from cugen.ld import _clumps_frame_vec
+    rng = np.random.default_rng(5)
+    for _ in range(40):
+        n, pv, eu, ev, order, rank, nb = _random_clump_case(rng)
+        rel = pd.DataFrame({
+            "gidx": np.arange(n), "ID": [f"v{i}" for i in range(n)],
+            "POS": np.arange(n) * 1000, "P": pv, "CHR": "1"})
+        for ov in (False, True):
+            is_idx, owner, _ = clump_core(eu, ev, rank, pv <= 1.0, ov, xp=np)
+            a, b = membership_pairs(is_idx, owner, rank, eu, ev, ov, xp=np)
+            slow = _clumps_to_frame(
+                _clumps_from_pairs(is_idx, rank, a, b), rel, _CLUMP_BINS, 0.01)
+            fast = _clumps_frame_vec(is_idx, rank, a, b, rel, _CLUMP_BINS, 0.01)
+            pd.testing.assert_frame_equal(slow.reset_index(drop=True),
+                                          fast.reset_index(drop=True))
+
+
+def test_sp2_false_drops_only_the_member_id_column():
+    """sp2=False is the O(clumps) escape hatch: counts must be unaffected."""
+    from cugen.ld import _clumps_frame_vec
+    rng = np.random.default_rng(9)
+    n, pv, eu, ev, order, rank, nb = _random_clump_case(rng)
+    rel = pd.DataFrame({"gidx": np.arange(n), "ID": [f"v{i}" for i in range(n)],
+                        "POS": np.arange(n) * 1000, "P": pv, "CHR": "1"})
+    is_idx, owner, _ = clump_core(eu, ev, rank, pv <= 1.0, False, xp=np)
+    a, b = membership_pairs(is_idx, owner, rank, eu, ev, False, xp=np)
+    on = _clumps_frame_vec(is_idx, rank, a, b, rel, _CLUMP_BINS, 0.01, sp2=True)
+    off = _clumps_frame_vec(is_idx, rank, a, b, rel, _CLUMP_BINS, 0.01, sp2=False)
+    cols = [c for c in on.columns if c != "SP2"]
+    pd.testing.assert_frame_equal(on[cols], off[cols])
+    assert (off["SP2"] == ".").all()

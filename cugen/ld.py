@@ -851,8 +851,87 @@ def membership_pairs(is_index, owner, rank, eu, ev, allow_overlap, xp=np):
     return rank_to_row[owner[b]], b
 
 
+def _clumps_frame_vec(is_index, rank, a, b, rel, bins, p2, sp2=True):
+    """Build the clump table straight from (index, member) arrays.
+
+    No Python-level member lists anywhere. :func:`_clumps_from_pairs` boxes
+    every membership into a Python int inside a list, which is harmless at test
+    sizes and cost an OOM kill on real chr22 -- a 250 kb window at r2 >= 0.5
+    produces millions of memberships, and a few million boxed ints in lists is
+    gigabytes.
+
+    TOTAL and the bins are ``bincount``s over the membership arrays. Only SP2
+    needs actual identifiers, and only for the ``p <= p2`` subset, so that is
+    the one place strings get built -- with a loop over CLUMPS, not members.
+    """
+    ids = rel["ID"].to_numpy()
+    pos = rel["POS"].to_numpy()
+    gidx = rel["gidx"].to_numpy()
+    pv = rel["P"].to_numpy(dtype=float)
+    chrom = (rel["CHR"].to_numpy() if "CHR" in rel.columns
+             else np.full(len(rel), "."))
+
+    is_index = np.asarray(is_index)
+    rank = np.asarray(rank)
+    idx_rows = np.flatnonzero(is_index)
+    if not len(idx_rows):
+        return _empty_clumps(bins)
+    order = idx_rows[np.argsort(rank[idx_rows])]     # plink's output order
+    k = len(order)
+    slot = np.full(len(rel), -1, dtype=np.int64)
+    slot[order] = np.arange(k)
+
+    a = np.asarray(a)
+    b = np.asarray(b)
+    sa = slot[a] if len(a) else np.empty(0, dtype=np.int64)
+    total = (np.bincount(sa, minlength=k) if len(a)
+             else np.zeros(k, dtype=np.int64))
+
+    asc = sorted(bins)
+    bin_cols = _bin_columns(bins)
+    counts = np.zeros((k, len(bin_cols)), dtype=np.int64)
+    if len(a):
+        mp = pv[b]
+        masks = [mp > asc[-1]] if asc else [np.ones(len(b), bool)]
+        for i in range(len(asc) - 1, -1, -1):
+            lo = -np.inf if i == 0 else asc[i - 1]
+            masks.append((mp > lo) & (mp <= asc[i]))
+        for c, m in enumerate(masks):
+            if m.any():
+                counts[:, c] = np.bincount(sa[m], minlength=k)
+
+    sp2_col = np.full(k, ".", dtype=object)
+    if sp2 and len(a):
+        keep = pv[b] <= p2
+        if keep.any():
+            ka, kb = sa[keep], b[keep]
+            o = np.lexsort((kb, ka))            # by clump, then position
+            ka, kb = ka[o], kb[o]
+            starts = np.flatnonzero(np.r_[True, ka[1:] != ka[:-1]])
+            ends = np.r_[starts[1:], len(ka)]
+            sid = ids[kb].astype(str)
+            for s, e in zip(starts, ends):
+                sp2_col[ka[s]] = ",".join(sid[s:e])
+
+    out = pd.DataFrame({
+        "CHR": chrom[order], "POS": pos[order].astype("int64"),
+        "ID": ids[order], "P": pv[order], "TOTAL": total})
+    for c, name in enumerate(bin_cols):
+        out[name] = counts[:, c]
+    out["SP2"] = sp2_col
+    out["gidx"] = gidx[order].astype("int64")
+    tmpl = _empty_clumps(bins)
+    return out[list(tmpl.columns)].astype(
+        {kk: v for kk, v in tmpl.dtypes.items() if kk in out.columns})
+
+
 def _clumps_from_pairs(is_index, rank, a, b):
-    """Group host-side (index, member) pairs into plink's clump order."""
+    """Group host-side (index, member) pairs into plink's clump order.
+
+    Retained for the tests, which compare against the sequential oracle's list
+    form. Production goes through :func:`_clumps_frame_vec` -- see its docstring
+    for why this shape does not survive real data.
+    """
     is_index = np.asarray(is_index)
     rank = np.asarray(rank)
     idx_rows = np.flatnonzero(is_index)
@@ -981,6 +1060,7 @@ def ld_clump(
     p_field: Sequence[str] = ("P", "PVAL", "P_VALUE", "p_value"),
     log10: bool = False,
     bins: Sequence[float] = _CLUMP_BINS,
+    sp2: bool = True,
     output: Optional[Union[str, Path]] = None,
     backend: str = "auto",
     precision: str = "auto",
@@ -1044,6 +1124,11 @@ def ld_clump(
         ``--clump-allow-overlap``). Default ``False``, matching plink.
     log10
         ``sumstats`` p-values are -log10(p) (plink2 ``--clump-log10``).
+    sp2
+        Build the ``SP2`` member-ID column. It is the only output whose size
+        grows with the number of MEMBERSHIPS rather than the number of clumps,
+        so setting it False makes the whole pipeline O(clumps) on the host.
+        Worth it when you only need the index variants.
 
     Returns
     -------
@@ -1184,7 +1269,6 @@ def ld_clump(
             print(f"[clump] {n_edges:,} edges at r2 >= {r2:g}; "
                   f"index selection converged in {rounds} parallel round(s); "
                   f"{len(a):,} memberships returned to host")
-        clumps = _clumps_from_pairs(is_index, rank, a, b)
     else:
         # --- CPU reference: same algorithm, NumPy in place of the kernels --
         pairs = ld_matrix(
@@ -1208,9 +1292,8 @@ def ld_clump(
                                              allow_overlap, xp=np)
         a, b = membership_pairs(is_index, owner, rank, eu, ev,
                                 allow_overlap, xp=np)
-        clumps = _clumps_from_pairs(is_index, rank, a, b)
 
-    out = _clumps_to_frame(clumps, rel, bins, p2)
+    out = _clumps_frame_vec(is_index, rank, a, b, rel, bins, p2, sp2)
     if verbose:
         print(f"[clump] {len(out):,} clumps covering "
               f"{int(out['TOTAL'].sum()) + len(out):,} variants")
