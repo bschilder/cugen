@@ -1142,9 +1142,29 @@ def ld_clump(
     if on_device:
         # --- everything below runs on the device -------------------------
         cp.cuda.Device(device).use()
-        rows = np.searchsorted(reader.gidx, rel_gidx) \
-            if hasattr(reader, "gidx") else rel_gidx
-        rows = np.asarray(rows, dtype=np.int64)
+        # gidx -> file row. NOT searchsorted: a .cugen carrying a gidx map is
+        # under no obligation to have it sorted, and searchsorted would then
+        # return confidently wrong rows rather than failing. An explicit lookup
+        # errors on a gidx the file does not contain.
+        lut = pd.Series(np.arange(int(reader.n_variants), dtype=np.int64),
+                        index=np.asarray(reader.gidx))
+        rows = lut.reindex(rel_gidx).to_numpy()
+        if np.isnan(rows).any():
+            missing = rel_gidx[np.isnan(rows)][:5]
+            raise ValueError(
+                f"{int(np.isnan(rows).sum())} annotation gidx values are not "
+                f"in {cugen} (first few: {list(missing)}). The annotation and "
+                "the .cugen disagree about which variants exist.")
+        rows = rows.astype(np.int64)
+        # The banded scan assumes rows ascend with position; rel is gidx-sorted
+        # and a .cugen is position-ordered, so this holds -- but silently wrong
+        # banding is the worst failure mode available, so check rather than
+        # assume.
+        if rows.size > 1 and not bool((np.diff(rows) > 0).all()):
+            raise ValueError(
+                "selected rows are not strictly increasing in file order; "
+                "the kb window would be banded against the wrong neighbours. "
+                "Is the .cugen sorted by position?")
         tf32 = _resolve_precision(precision, int(reader.n_samples), False)
         with _Tf32(tf32):
             eu, ev = _clump_edges_gpu(reader, rows, rel_pos, kb, r2,
