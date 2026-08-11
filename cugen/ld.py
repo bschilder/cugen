@@ -1,7 +1,9 @@
 """cugen.ld - GPU linkage disequilibrium from packed genotypes.
 
     ld_matrix(...)    signed r, r^2, signed r^2, D, D'     (alias: cg.r2)
-    ld_clump(...)     v0.2 roadmap, still a stub
+    ld_clump(...)     LD-based clumping of association results  (alias:
+                      cg.clump). plink2 --clump parity; builds on ld_matrix's
+                      r-only path rather than reimplementing LD.
 
 Integer counts, not floating-point correlations
 -----------------------------------------------
@@ -133,7 +135,6 @@ from typing import Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-from ._stubs import _stub
 from .io import ENCODING_2BIT, read_cugen
 
 try:
@@ -578,8 +579,358 @@ def _finalize(df: pd.DataFrame, stats: Sequence[str]) -> pd.DataFrame:
     return df[list(tmpl.columns)]
 
 
-def ld_clump(*a, **kw):
-    return _stub("ld.ld_clump")
+# ---------------------------------------------------------------------------
+# Clumping. The expensive half is embarrassingly parallel and the greedy half
+# is nearly free, so they are separated rather than interleaved -- see the
+# ld_clump docstring for why that is the whole design.
+# ---------------------------------------------------------------------------
+_CLUMP_BINS = (0.0001, 0.001, 0.01, 0.05)     # plink2 --clump-bins default
+
+
+def _load_sumstats(obj, id_field: Sequence[str], p_field: Sequence[str],
+                   log10: bool) -> pd.DataFrame:
+    """Read association results down to two columns: ID and P.
+
+    Field-name SEARCH ORDER rather than a fixed name, because the same
+    quantity is called ID by plink2, SNP by plink1.9, and something else again
+    by most published sumstats. plink2 solves this with --clump-id-field; we
+    mirror it, earlier names winning, matching its documented precedence.
+    """
+    if isinstance(obj, pd.DataFrame):
+        df = obj.copy()
+    else:
+        df = pd.read_csv(str(obj), sep=None, engine="python")
+    df = df.rename(columns={c: str(c).lstrip("#") for c in df.columns})
+
+    def pick(cands, what):
+        for c in cands:
+            if c in df.columns:
+                return c
+        raise ValueError(
+            f"no {what} column in sumstats: looked for {list(cands)}, found "
+            f"{list(df.columns)[:12]}. Pass {what}_field= to override.")
+
+    idc, pc = pick(id_field, "id"), pick(p_field, "p")
+    out = pd.DataFrame({"ID": df[idc].astype(str),
+                        "P": pd.to_numeric(df[pc], errors="coerce")})
+    if log10:
+        # plink2 --clump-log10: the column holds -log10(p). Convert once here
+        # so every threshold downstream stays in ordinary p-space; carrying
+        # two conventions with inverted comparisons invites a sign bug.
+        out["P"] = np.power(10.0, -out["P"].to_numpy(dtype=float))
+    out = out[np.isfinite(out["P"].to_numpy(dtype=float))]
+    return out.drop_duplicates(subset="ID", keep="first").reset_index(drop=True)
+
+
+def _greedy_clump(order: np.ndarray, pvals: np.ndarray, neighbours: dict,
+                  p1: float, allow_overlap: bool = False):
+    """The serial half of clumping: greedy assignment over a FIXED edge set.
+
+    Pure NumPy and GPU-free by construction, so the logic that decides the
+    answer is unit-testable anywhere; only the r^2 feeding it needs a device.
+
+    ``order`` is row indices sorted by ascending p; ``neighbours[i]`` lists the
+    rows whose r^2 with ``i`` cleared the threshold inside the kb window.
+    Returns ``[(index_row, [member_rows...]), ...]``.
+
+    This loop is O(edges), not O(p^2), because every r^2 it consults was
+    computed once, up front. plink recomputes LD per index variant -- the right
+    call when a pair is expensive and memory is precious, the wrong one when
+    the whole neighbourhood is a single batched GEMM.
+
+    NOTE p2 is deliberately absent. It does NOT gate membership: measured on a
+    400-variant fixture, plink2 v2.0.0-a.7.1 reports an IDENTICAL clump count
+    (182) and identical TOTAL (149) at p2=0.01 and p2=1.0, with only the SP2
+    column changing. p2 is a DISPLAY threshold -- it selects which members are
+    listed -- so it is applied when the frame is built, not here. Gating
+    membership on it under-counts TOTAL and zeroes the NONSIG bin, which is
+    exactly the bug this signature now makes impossible.
+
+    ``allow_overlap`` governs membership only. A variant absorbed into a clump
+    is barred from indexing one of its own either way, even if its p clears p1.
+    Also measured rather than inferred ("let non-index variants join multiple
+    clumps" is ambiguous): on a fixture with rsA=1e-9 and rsC=1e-5 at r^2=0.94,
+    plink2 emits byte-identical output with and without
+    --clump-allow-overlap, and rsC never indexes despite clearing p1.
+    """
+    can_index = np.ones(len(pvals), dtype=bool)   # not yet absorbed by a clump
+    can_join = np.ones(len(pvals), dtype=bool)    # not yet consumed as a member
+    clumps = []
+    for i in order:
+        if pvals[i] > p1:
+            break                       # order is sorted: no candidates left
+        if not can_index[i]:
+            continue                    # absorbed by a more significant index
+        members = [j for j in neighbours.get(int(i), ())
+                   if j != i and can_join[j]]
+        # Position order, not p order. plink2's SP2 lists members by
+        # coordinate; rows here are gidx-sorted, so the row index IS position
+        # order, and matching it lets the two outputs be diffed directly.
+        members.sort()
+        clumps.append((int(i), [int(j) for j in members]))
+        can_index[i] = can_join[i] = False
+        can_index[members] = False                # never index, either way
+        if not allow_overlap:
+            can_join[members] = False
+    return clumps
+
+
+def _bin_columns(bins: Sequence[float]):
+    """plink2's bin column NAMES, in its order: NONSIG then descending bounds.
+
+    Verified against plink2 v2.0.0-a.7.1 output rather than assumed: with the
+    default boundaries it writes `NONSIG S0.05 S0.01 S0.001 S0.0001`, i.e.
+    least significant band first. Generating the names from the boundaries
+    keeps a non-default --clump-bins diffable too.
+    """
+    return ["NONSIG"] + [f"S{b:g}" for b in sorted(bins, reverse=True)]
+
+
+def _clump_bin_counts(member_p: np.ndarray, bins: Sequence[float]):
+    """Member counts per p-value band, aligned to :func:`_bin_columns`."""
+    asc = sorted(bins)
+    counts = [int((member_p > asc[-1]).sum()) if asc else len(member_p)]
+    for k in range(len(asc) - 1, -1, -1):
+        lo = -np.inf if k == 0 else asc[k - 1]
+        counts.append(int(((member_p > lo) & (member_p <= asc[k])).sum()))
+    return counts
+
+
+def _empty_clumps(bins: Sequence[float] = _CLUMP_BINS) -> pd.DataFrame:
+    """Zero rows, full schema, correct dtypes -- same contract as _empty_pairs.
+
+    An empty result must not be a bare DataFrame(): downstream code doing
+    df['TOTAL'].sum() should get 0 rather than a KeyError, and concatenating
+    an empty result with a non-empty one must not silently widen dtypes.
+    """
+    cols = {"CHR": object, "POS": "int64", "ID": object, "P": "float64",
+            "TOTAL": "int64"}
+    cols.update({c: "int64" for c in _bin_columns(bins)})
+    cols.update({"SP2": object, "gidx": "int64"})
+    return pd.DataFrame({c: pd.Series([], dtype=d) for c, d in cols.items()})
+
+
+def _clumps_to_frame(clumps, rel: pd.DataFrame, bins, p2: float) -> pd.DataFrame:
+    """Render clumps in plink2's .clumps layout.
+
+    TOTAL and the bins count EVERY member; SP2 lists only those at p <= p2.
+    That asymmetry is plink2's, verified rather than assumed -- see the note in
+    _greedy_clump. Deriving both from one member list keeps them consistent by
+    construction, so TOTAL can never disagree with the bins.
+    """
+    if not clumps:
+        return _empty_clumps(bins)
+    ids, pos = rel["ID"].to_numpy(), rel["POS"].to_numpy()
+    gidx, pv = rel["gidx"].to_numpy(), rel["P"].to_numpy(dtype=float)
+    chrom = (rel["CHR"].to_numpy() if "CHR" in rel.columns
+             else np.full(len(rel), "."))
+    bin_cols = _bin_columns(bins)
+    rows = []
+    for i, m in clumps:
+        mp = pv[m] if m else np.empty(0)
+        listed = [j for j in m if pv[j] <= p2]
+        row = {"CHR": chrom[i], "POS": int(pos[i]), "ID": ids[i],
+               "P": float(pv[i]), "TOTAL": len(m)}
+        row.update(dict(zip(bin_cols, _clump_bin_counts(mp, bins))))
+        # '.' for an empty list, and bare IDs, both matching plink2's .clumps
+        # output so the two files can be diffed directly.
+        row["SP2"] = ",".join(str(ids[j]) for j in listed) or "."
+        row["gidx"] = int(gidx[i])
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    tmpl = _empty_clumps(bins)
+    return out[list(tmpl.columns)].astype(
+        {k: v for k, v in tmpl.dtypes.items() if k in out.columns})
+
+
+def ld_clump(
+    cugen: Union[str, Path],
+    sumstats,
+    *,
+    annotation=None,
+    p1: float = 1e-4,
+    p2: float = 0.01,
+    r2: float = 0.5,
+    kb: float = 250.0,
+    allow_overlap: bool = False,
+    id_field: Sequence[str] = ("ID", "SNP"),
+    p_field: Sequence[str] = ("P", "PVAL", "P_VALUE", "p_value"),
+    log10: bool = False,
+    bins: Sequence[float] = _CLUMP_BINS,
+    output: Optional[Union[str, Path]] = None,
+    backend: str = "auto",
+    precision: str = "auto",
+    tile_size: Optional[int] = None,
+    max_pairs: int = 100_000_000,
+    device: int = 0,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """LD-based clumping of association results (alias: ``cg.clump``).
+
+    plink2 ``--clump`` parity, with its defaults: ``p1=1e-4``, ``p2=0.01``,
+    ``r2=0.5``, ``kb=250`` (a RADIUS, as in plink).
+
+    Two structural choices carry the whole design, and both come from what the
+    LD work measured rather than from theory:
+
+    **1. Only variants with p <= p2 can participate at all.** A member must
+    clear p2 by definition, and an index must clear p1 (<= p2 in any sensible
+    configuration), so every other variant is irrelevant BEFORE a genotype is
+    read. On a typical GWAS that is ~1.1M variants down to a few thousand --
+    a reduction of two to three orders of magnitude in the O(p^2) term. This
+    is not an approximation, it is the definition of the problem.
+
+    **2. The parallel and serial halves are separated.** Clumping is greedy and
+    therefore sequential, but the r^2 values it consults never change while it
+    runs. So they are ALL computed first, in one batched windowed scan
+    (:func:`ld_matrix` with ``stats=("r2",)``, which selects the 1-GEMM path
+    and skips the 3x3 table entirely), and the greedy loop then walks a small
+    edge list. plink recomputes LD per index variant; that is right when a pair
+    is expensive and wrong when a whole neighbourhood is one GEMM over a tile.
+
+    Everything the LD path learned therefore applies here for free: the r-only
+    single GEMM, the fused epilogue kernel with atomic compaction (so only
+    pairs above ``r2`` ever leave the device), TF32 where the hardware has it,
+    and the cuDF device write path.
+
+    PHASE -- read this before comparing against plink
+    -------------------------------------------------
+    plink2 ``--clump`` uses **phased** r^2 by default and .cugen discards
+    phase, so compare against ``--clump-unphased``. On phased input (e.g. stock
+    1000 Genomes VCFs) the two cannot agree, for exactly the reason set out in
+    the module docstring. Our r^2 matches ``--r2-unphased`` exactly.
+
+    Parameters
+    ----------
+    cugen
+        Path to a ``.cugen`` file.
+    sumstats
+        Association results: a DataFrame, or a path to a TSV/CSV. Needs a
+        variant-ID column and a p-value column -- see ``id_field``/``p_field``.
+    annotation
+        Table with ``gidx``, ``ID`` and ``POS`` (``CHR`` optional). REQUIRED:
+        sumstats identify variants by ID and ``kb`` needs coordinates, and a
+        .cugen stores neither.
+    p1, p2
+        Index-variant and member p-value ceilings.
+    r2, kb
+        LD and distance thresholds; ``kb`` is a radius.
+    allow_overlap
+        Let a non-index variant join more than one clump (plink2
+        ``--clump-allow-overlap``). Default ``False``, matching plink.
+    log10
+        ``sumstats`` p-values are -log10(p) (plink2 ``--clump-log10``).
+
+    Returns
+    -------
+    One row per clump: ``CHR POS ID P TOTAL BINS SP2 gidx``. ``SP2`` lists the
+    members, ``TOTAL`` counts them, ``BINS`` bands them by p.
+
+    References
+    ----------
+    Purcell et al. (2007) AJHG 81:559-575     PLINK, --clump
+    Chang et al. (2015) GigaScience 4:7       PLINK 2, the parity reference
+    """
+    if annotation is None:
+        raise ValueError(
+            "ld_clump needs annotation= with gidx, ID and POS: sumstats "
+            "identify variants by ID and the kb window needs coordinates, "
+            "neither of which a .cugen stores.")
+    if not 0.0 <= r2 <= 1.0:
+        raise ValueError(f"r2 must be in [0, 1], got {r2}")
+    if p2 < p1:
+        raise ValueError(
+            f"p2 ({p2:g}) < p1 ({p1:g}): no variant could clear the member "
+            "threshold without also being an index candidate, so every clump "
+            "would be a singleton. Did you swap them?")
+
+    ann = (annotation if isinstance(annotation, pd.DataFrame)
+           else pd.read_csv(str(annotation), sep=None, engine="python"))
+    ann = ann.rename(columns={c: str(c).lstrip("#") for c in ann.columns})
+    for need in ("gidx", "ID", "POS"):
+        if need not in ann.columns:
+            raise ValueError(f"annotation lacks a {need!r} column; it has "
+                             f"{list(ann.columns)[:12]}")
+
+    keep = ["gidx", "ID", "POS"] + (["CHR"] if "CHR" in ann.columns else [])
+    merged = _load_sumstats(sumstats, id_field, p_field, log10) \
+        .merge(ann[keep], on="ID", how="inner")
+    if merged.empty:
+        raise ValueError(
+            "no sumstats ID matched the annotation. Check that both use the "
+            "same variant naming -- plink's --make-bed rewrites every ID to "
+            "'.' unless --set-all-var-ids was given, which silently produces "
+            "exactly this.")
+
+    # --- the reduction that makes the whole thing cheap --------------------
+    # A member must lie within kb of an INDEX CANDIDATE and clear r^2. So the
+    # only variants that can participate are the candidates (p <= p1) and
+    # whatever falls inside one of their windows; everything else cannot enter
+    # a clump by any route and is dropped before a genotype is read.
+    #
+    # NOT a p2 filter. p2 is presentational -- it selects which members appear
+    # in SP2 and changes nothing else -- so screening on it would silently
+    # under-count TOTAL and empty the NONSIG bin. Measured, not assumed.
+    merged = merged.sort_values("gidx").reset_index(drop=True)
+    n_all = len(merged)
+    pos_all = merged["POS"].to_numpy(dtype=np.int64)
+    is_cand = merged["P"].to_numpy(dtype=float) <= p1
+    if not is_cand.any():
+        if verbose:
+            print(f"[clump] no variant reached p1={p1:g}; nothing to clump")
+        return _empty_clumps(bins)
+
+    span = int(round(kb * 1000))
+    cand_pos = pos_all[is_cand]
+    # Vectorised union of the candidate windows: for each candidate the rows
+    # whose position is within +/-span. searchsorted on the (sorted) positions
+    # turns that into two index bounds per candidate.
+    lo = np.searchsorted(pos_all, cand_pos - span, side="left")
+    hi = np.searchsorted(pos_all, cand_pos + span, side="right")
+    keep_mask = np.zeros(n_all, dtype=bool)
+    for a, b in zip(lo, hi):
+        keep_mask[a:b] = True
+    rel = merged[keep_mask].reset_index(drop=True)
+    if verbose:
+        print(f"[clump] {n_all:,} variants with p-values -> {len(rel):,} "
+              f"within {kb:g} kb of one of {int(is_cand.sum()):,} index "
+              f"candidates ({100 * len(rel) / max(n_all, 1):.1f}%); LD is "
+              f"computed on those only")
+
+    # --- parallel half: every r^2 the greedy loop could ever consult -------
+    pairs = ld_matrix(
+        cugen, variants=rel["gidx"].to_numpy(), annotation=ann,
+        window_kb=kb, min_r2=r2, stats=("r2",), output_format="pairs",
+        backend=backend, precision=precision, tile_size=tile_size,
+        max_pairs=max_pairs, device=device, verbose=False)
+    pairs = pairs.to_pandas() if hasattr(pairs, "to_pandas") else pairs
+    if verbose:
+        print(f"[clump] {len(pairs):,} pairs at r2 >= {r2:g} within {kb:g} kb")
+
+    # --- serial half: cheap, and GPU-free ----------------------------------
+    row_of = pd.Series(np.arange(len(rel)), index=rel["gidx"].to_numpy())
+    neighbours: dict = {}
+    if len(pairs):
+        a = row_of.reindex(pairs["gidx_a"].to_numpy()).to_numpy()
+        b = row_of.reindex(pairs["gidx_b"].to_numpy()).to_numpy()
+        ok = np.isfinite(a) & np.isfinite(b)
+        for i, j in zip(a[ok].astype(int), b[ok].astype(int)):
+            neighbours.setdefault(i, []).append(j)
+            neighbours.setdefault(j, []).append(i)
+
+    pv = rel["P"].to_numpy(dtype=float)
+    # gidx breaks p ties deterministically: without it the clump assignment
+    # depends on row order, and two runs on the same data could disagree.
+    order = np.lexsort((rel["gidx"].to_numpy(), pv))
+    clumps = _greedy_clump(order, pv, neighbours, p1, allow_overlap)
+
+    out = _clumps_to_frame(clumps, rel, bins, p2)
+    if verbose:
+        print(f"[clump] {len(out):,} clumps covering "
+              f"{int(out['TOTAL'].sum()) + len(out):,} variants")
+    if output is not None:
+        _write_df(out, str(output))
+    return out
 
 
 # ---------------------------------------------------------------------------

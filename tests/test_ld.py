@@ -287,8 +287,13 @@ def test_alias_is_wired():
     assert cg.r2 is cg.ld_matrix
 
 
-def test_ld_clump_still_stubbed():
-    with pytest.raises(NotImplementedError):
+def test_ld_clump_is_implemented_and_aliased():
+    """Was `test_ld_clump_still_stubbed`. ld_clump is real now, so the alias
+    _stubs.py used to intercept must resolve to the implementation, and the
+    call must fail on its own signature rather than on NotImplementedError."""
+    import cugen as cg
+    assert cg.clump is L.ld_clump
+    with pytest.raises(TypeError):          # cugen and sumstats are required
         L.ld_clump()
 
 
