@@ -77,9 +77,12 @@ def main():
     ap.add_argument("--samples", type=int, default=2504)   # 1KG phase3 size
     ap.add_argument("--p-grid", default="2000,5000,10000,20000")
     ap.add_argument("--label", default="")
+    ap.add_argument("--precision", default="auto")
     a = ap.parse_args()
 
+    precision = a.precision
     rec = {"label": a.label, "ok": False, "stage": "import",
+           "precision_requested": a.precision,
            "n_samples": a.samples, "runs": [], "errors": []}
     try:
         import cupy as cp
@@ -115,6 +118,21 @@ def main():
             "max_abs_err_DP": float(np.abs(g["DP"] - c["DP"]).max()),
         }
         rec["stage"] = "bench"
+        # Record what the run ACTUALLY did, so a silent fallback cannot be
+        # mistaken for an optimised measurement.
+        import io as _io
+        from contextlib import redirect_stdout
+        _buf = _io.StringIO()
+        with redirect_stdout(_buf):
+            ld_matrix("/tmp/small.cugen", stats=("r", "r2"), min_r2=0.0,
+                      output="/tmp/probe_path.tsv", max_pairs=10**15,
+                      backend="gpu", verbose=True)
+        rec["fused_path"] = "fused kernel" in _buf.getvalue()
+        from cugen.ld import HAS_CUDF, _resolve_precision
+        rec["has_cudf"] = bool(HAS_CUDF)
+        rec["tf32_active"] = bool(_resolve_precision("auto", a.samples, False))
+        print(f"  fused_path={rec['fused_path']}  cudf={rec['has_cudf']}  "
+              f"tf32={rec['tf32_active']}")
 
         # --- fixed workload, r+r2 only (the hot path) ----------------------
         pool = cp.get_default_memory_pool()
@@ -127,8 +145,16 @@ def main():
                     # runs; the probe is deliberate, so opt out. Without this
                     # every device fails at p=20,000 (200M pairs) on the guard,
                     # not on any hardware limit.
+                    #
+                    # output= is REQUIRED to engage the optimised path. Without
+                    # it the run silently falls back to the table path and the
+                    # matrix reports pre-optimisation timings as if they were
+                    # current -- the same trap that made an earlier parity
+                    # check meaningless.
                     df = ld_matrix("/tmp/bench.cugen", variant_range=(0, p),
                                    stats=("r", "r2"), min_r2=0.5,
+                                   output=f"/tmp/probe_{p}.tsv",
+                                   precision=precision,
                                    max_pairs=10**15, backend="gpu",
                                    verbose=False)
                     dt = time.perf_counter() - t0
