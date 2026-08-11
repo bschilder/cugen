@@ -16,6 +16,19 @@ except ImportError:
 
 requires_gpu = pytest.mark.skipif(not _HAS_CUPY, reason="CuPy not available")
 
+try:
+    import cudf  # noqa: F401
+    _HAS_CUDF = True
+except ImportError:
+    _HAS_CUDF = False
+
+# The fused epilogue is only selected when cuDF is present (ld_matrix gates
+# `on_device` on it), so a test that ASSERTS the fused path ran cannot run
+# without cuDF. Skipping is the honest outcome there -- failing would report a
+# missing optional dependency as a code defect.
+requires_cudf = pytest.mark.skipif(
+    not (_HAS_CUPY and _HAS_CUDF), reason="CuPy+cuDF required for fused path")
+
 
 def simulate_haplotypes(n_samples, n_variants, seed=0, missing_rate=0.0,
                         straddle_half=True):

@@ -11,7 +11,7 @@ import pytest
 
 from cugen import ld as L
 from cugen.write import ENCODING_FLOAT32, write_cugen
-from conftest import requires_gpu, simulate_haplotypes
+from conftest import requires_cudf, requires_gpu, simulate_haplotypes
 
 CPU = dict(backend="numpy", verbose=False)
 
