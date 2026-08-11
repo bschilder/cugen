@@ -105,13 +105,22 @@ no such caveat. See test_cubic_picks_the_global_maximum_likelihood_root.
 
 References
 ----------
-Lewontin (1964) Genetics 49(1):49-67           D' and Dmax
-Hill & Robertson (1968) TAG 38(6):226-231      r^2 in finite populations
-Hill (1974) Heredity 33(2):229-239             ML haplotype freqs, unphased
-Weir (1979) Biometrics 35(1):235-254           Burrows' composite LD
-Excoffier & Slatkin (1995) MBE 12(5):921-927   EM (used only as a test oracle)
-Gaunt, Rodriguez & Day (2007) BMC Bioinf 8:428 CubeX exact cubic (production)
-Chang et al. (2015) GigaScience 4:7            PLINK, the behavioural reference
+Each was checked against the paper before the method went into the code.
+
+Lewontin (1964) Genetics 49(1):49-67            D' and Dmax
+    https://pubmed.ncbi.nlm.nih.gov/17248194/
+Hill & Robertson (1968) TAG 38(6):226-231       r^2 in finite populations
+    https://pubmed.ncbi.nlm.nih.gov/24442307/
+Hill (1974) Heredity 33(2):229-239              ML haplotype freqs, unphased
+    https://pubmed.ncbi.nlm.nih.gov/4531429/
+Weir (1979) Biometrics 35(1):235-254            Burrows' composite LD
+    https://pubmed.ncbi.nlm.nih.gov/497335/
+Excoffier & Slatkin (1995) MBE 12(5):921-927    EM -- test oracle only
+    https://pubmed.ncbi.nlm.nih.gov/7476138/
+Gaunt, Rodriguez & Day (2007) BMC Bioinf 8:428  CubeX exact cubic (production)
+    https://doi.org/10.1186/1471-2105-8-428
+Chang et al. (2015) GigaScience 4:7             PLINK, behavioural reference
+    https://pubmed.ncbi.nlm.nih.gov/25722852/
 """
 from __future__ import annotations
 
