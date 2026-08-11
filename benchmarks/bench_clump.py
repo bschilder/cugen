@@ -1,0 +1,161 @@
+"""cugen.ld.ld_clump against plink2 --clump, and device vs host.
+
+Two questions, deliberately separated:
+
+  1. CORRECTNESS at scale -- does the device path still reproduce plink2
+     exactly on real data, not just on a 150-variant fixture?
+  2. Does the device path actually hold memory flat where the host path
+     cannot? The interesting regime is clumping-and-thresholding for
+     polygenic scores (p1=1, r2=0.1), where every variant is an index
+     candidate and the edge set is orders of magnitude larger than at the
+     --clump-r2 0.5 default.
+
+    python benchmarks/bench_clump.py --cugen chr22.cugen --bfile chr22 \
+        --annotation chr22_ann.tsv --out clump_bench.json
+"""
+import os
+import sys
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+import argparse
+import json
+import subprocess
+import time
+
+import numpy as np
+import pandas as pd
+
+from _peak import PeakSampler
+
+PARITY_COLS = ["POS", "ID", "P", "TOTAL", "NONSIG", "SP2"]
+
+
+def run_plink(bfile, ss, p1, p2, r2, kb, out):
+    t0 = time.perf_counter()
+    r = subprocess.run(
+        ["plink2", "--bfile", bfile, "--clump", ss, "--clump-unphased",
+         "--clump-p1", str(p1), "--clump-p2", str(p2), "--clump-r2", str(r2),
+         "--clump-kb", str(kb), "--out", out, "--silent"],
+        capture_output=True, text=True)
+    dt = time.perf_counter() - t0
+    if r.returncode:
+        return None, dt, r.stdout[-800:] + r.stderr[-800:]
+    return f"{out}.clumps", dt, None
+
+
+def compare(cg, pk_path):
+    """Field-by-field, not just clump counts: an implementation can get the
+    right index variants with wrong TOTALs, which is exactly what happened
+    once already."""
+    pk = pd.read_csv(pk_path, sep="\t").rename(columns=lambda c: c.lstrip("#"))
+    out = {"plink_clumps": len(pk), "cugen_clumps": len(cg)}
+    if set(pk["ID"]) != set(cg["ID"]):
+        out["index_sets_equal"] = False
+        out["only_plink"] = sorted(set(pk.ID) - set(cg.ID))[:10]
+        out["only_cugen"] = sorted(set(cg.ID) - set(pk.ID))[:10]
+        return out
+    out["index_sets_equal"] = True
+    a = pk.sort_values("ID").reset_index(drop=True)
+    b = cg.sort_values("ID").reset_index(drop=True)
+    diff = {}
+    for c in PARITY_COLS:
+        if c not in a.columns or c not in b.columns:
+            continue
+        if c == "P":
+            d = ~np.isclose(a[c].to_numpy(float), b[c].to_numpy(float),
+                            rtol=1e-6)
+        else:
+            d = a[c].astype(str).to_numpy() != b[c].astype(str).to_numpy()
+        if d.any():
+            diff[c] = int(d.sum())
+    out["columns_differing"] = diff
+    out["identical"] = not diff
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cugen", required=True)
+    ap.add_argument("--bfile", required=True)
+    ap.add_argument("--annotation", required=True)
+    ap.add_argument("--sumstats", default=None,
+                    help="default: synthesise from the annotation")
+    ap.add_argument("--out", default="clump_bench.json")
+    a = ap.parse_args()
+
+    from cugen.ld import ld_clump
+
+    ann = pd.read_csv(a.annotation, sep=None, engine="python")
+    ann = ann.rename(columns={c: c.lstrip("#") for c in ann.columns})
+
+    if a.sumstats:
+        ss_path = a.sumstats
+    else:
+        # Synthetic p-values, seeded. A real GWAS would be better but the
+        # clump ALGORITHM does not care where p came from, and this keeps the
+        # benchmark self-contained and reproducible.
+        rng = np.random.default_rng(20260811)
+        pv = 10.0 ** (-rng.uniform(0.05, 14.0, size=len(ann)))
+        ss_path = "/tmp/bench_ss.tsv"
+        pd.DataFrame({"ID": ann["ID"], "P": pv}).to_csv(
+            ss_path, sep="\t", index=False)
+
+    results = []
+    # (p1, p2, r2, kb, label)
+    grid = [
+        (1e-4, 0.01, 0.50, 250, "standard GWAS clumping"),
+        (1e-2, 0.01, 0.50, 250, "loose p1"),
+        (1.0,  0.01, 0.20, 250, "C+T, r2=0.2"),
+        (1.0,  0.01, 0.10, 250, "C+T for PRS (p1=1, r2=0.1)"),
+    ]
+    for p1, p2, r2, kb, label in grid:
+        rec = {"label": label, "p1": p1, "p2": p2, "r2": r2, "kb": kb}
+        print(f"\n=== {label}: p1={p1:g} p2={p2:g} r2={r2:g} kb={kb} ===",
+              flush=True)
+        for backend in ("gpu", "numpy"):
+            try:
+                with PeakSampler() as s:
+                    t0 = time.perf_counter()
+                    cg = ld_clump(a.cugen, ss_path, annotation=ann, p1=p1,
+                                  p2=p2, r2=r2, kb=kb, backend=backend,
+                                  verbose=(backend == "gpu"))
+                    dt = time.perf_counter() - t0
+                rec[f"{backend}_s"] = round(dt, 3)
+                rec[f"{backend}_peak_gib"] = s.peak_gib
+                rec[f"{backend}_clumps"] = int(len(cg))
+                print(f"  cugen[{backend}]  {dt:8.2f} s  "
+                      f"peak {s.peak_gib:6.2f} GiB  {len(cg):,} clumps")
+                if backend == "gpu":
+                    gpu_df = cg
+            except Exception as e:                        # noqa: BLE001
+                rec[f"{backend}_error"] = f"{type(e).__name__}: {e}"
+                print(f"  cugen[{backend}]  FAILED {type(e).__name__}: {e}")
+                if backend == "numpy":
+                    # The CPU reference is expected to fall over at C+T scale;
+                    # that failure IS the result, so record and continue.
+                    pass
+
+        pk_path, pk_s, err = run_plink(a.bfile, ss_path, p1, p2, r2, kb,
+                                       f"/tmp/pk_{abs(hash(label)) % 9999}")
+        rec["plink_s"] = round(pk_s, 3)
+        if err:
+            rec["plink_error"] = err[:400]
+            print(f"  plink2         FAILED: {err[:160]}")
+        else:
+            print(f"  plink2         {pk_s:8.2f} s")
+            if "gpu_s" in rec:
+                rec["speedup_vs_plink"] = round(pk_s / rec["gpu_s"], 1)
+                rec["parity"] = compare(gpu_df, pk_path)
+                print(f"  speedup {rec['speedup_vs_plink']}x   "
+                      f"parity: {rec['parity'].get('identical')}")
+        results.append(rec)
+        json.dump(results, open(a.out, "w"), indent=2)
+
+    print(f"\nwrote {a.out}")
+
+
+if __name__ == "__main__":
+    main()
