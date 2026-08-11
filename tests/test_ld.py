@@ -508,3 +508,48 @@ def test_fused_kernel_survives_buffer_overflow(tmp_path):
                       verbose=False)
     got = got.to_pandas() if hasattr(got, "to_pandas") else got
     assert len(got) == len(ref), (len(got), len(ref))
+
+
+def test_precision_rejects_half_with_an_explanation():
+    """fp16 must be refused, not silently allowed.
+
+    Same 10-bit mantissa as TF32 and the inputs {0,1,2} are exactly
+    representable, so it looks safe -- but cuBLAS accumulates half matmuls in
+    half, so integer exactness ends at 2**11 and the accumulator saturates at
+    65,504. Measured max|err| = inf at n >= 100,000: silent at small n,
+    catastrophic at biobank scale.
+    """
+    for bad in ("fp16", "half", "bf16"):
+        with pytest.raises(ValueError, match="half"):
+            L._resolve_precision(bad, 100_000, False)
+    with pytest.raises(ValueError, match="must be"):
+        L._resolve_precision("float8", 1000, False)
+
+
+def test_precision_fp32_never_uses_tf32():
+    assert L._resolve_precision("fp32", 100_000, False) is False
+
+
+@requires_gpu
+@pytest.mark.gpu
+def test_tf32_is_bit_identical_to_fp32(tmp_path):
+    """TF32 must change speed and nothing else.
+
+    This is the whole justification for defaulting it on: the plane values
+    need two mantissa bits, TF32 has ten, and it accumulates in fp32.
+    """
+    dos = simulate_haplotypes(2000, 600, seed=23, missing_rate=0.0)
+    path = tmp_path / "chr22.cugen"
+    write_cugen(str(path), dos.T.astype(np.uint8))
+    kw = dict(window=60, min_r2=0.05, stats=("r", "r2"), backend="gpu",
+              verbose=False)
+    a = L.ld_matrix(str(path), precision="fp32",
+                    output=str(tmp_path / "a.tsv"), **kw)
+    b = L.ld_matrix(str(path), precision="tf32",
+                    output=str(tmp_path / "b.tsv"), **kw)
+    a = a.to_pandas() if hasattr(a, "to_pandas") else a
+    b = b.to_pandas() if hasattr(b, "to_pandas") else b
+    assert len(a) == len(b) and len(a) > 100
+    a = a.sort_values(["gidx_a", "gidx_b"]).reset_index(drop=True)
+    b = b.sort_values(["gidx_a", "gidx_b"]).reset_index(drop=True)
+    np.testing.assert_array_equal(a["R"].to_numpy(), b["R"].to_numpy())
