@@ -84,12 +84,13 @@ from .repair import repair, repair_cugen_dir, repair_cugen_file
 # v0.1.3: real implementations for QC + PRS scoring. ld/popstruct still stubs.
 from .qc import sample_qc, variant_qc
 from .score import score
-from .ld import ld_clump, ld_matrix
+from .ld import ld_clump, ld_matrix, ld_prune
 from .popstruct import grm, king, pca, pc_project
 
 # --- alias wiring (PLINK + Hail) ---
 from .aliases import (  # noqa: F401
     clump,
+    prune,
     exclude,
     extract,
     freq,
@@ -154,6 +155,7 @@ __all__ = [
     "freq",
     "glm",
     "clump",
+    "prune",
     "r2",
     "make_king",
     "make_grm",
