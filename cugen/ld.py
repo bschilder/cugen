@@ -936,35 +936,38 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
     cp.get_default_memory_pool().free_all_blocks()
 
     def run(capacity):
+        # Set the cuBLAS math mode ONCE for the whole scan. Doing it per GEMM
+        # cost two cuBLAS calls per tile, which showed up as TF32 being
+        # *slower* than fp32 at large n where tiles are many.
         out_i = cp.empty(capacity, dtype=cp.int64)
         out_j = cp.empty(capacity, dtype=cp.int64)
         out_r = cp.empty(capacity, dtype=cp.float32)
         counter = cp.zeros(1, dtype=cp.uint64)
         kern = _get_epilogue_kernel()
-        for i0 in range(0, p, B):
-            i1 = min(i0 + B, p)
-            hi = p if window is None else min(p, i1 - 1 + int(window) + 1)
-            Ga, _, _ = _build_dosage(packed, cp.arange(i0, i1), ns, bpv)
-            for j0 in range(i0, hi, B):
-                j1 = min(j0 + B, hi)
-                if j0 == i0:
-                    Gb = Ga
-                else:
-                    Gb, _, _ = _build_dosage(packed, cp.arange(j0, j1), ns, bpv)
-                with _Tf32(tf32):
+        with _Tf32(tf32):
+            for i0 in range(0, p, B):
+                i1 = min(i0 + B, p)
+                hi = p if window is None else min(p, i1 - 1 + int(window) + 1)
+                Ga, _, _ = _build_dosage(packed, cp.arange(i0, i1), ns, bpv)
+                for j0 in range(i0, hi, B):
+                    j1 = min(j0 + B, hi)
+                    if j0 == i0:
+                        Gb = Ga
+                    else:
+                        Gb, _, _ = _build_dosage(packed, cp.arange(j0, j1), ns, bpv)
                     S = Ga @ Gb.T
-                bi, bj = i1 - i0, j1 - j0
-                nthread = bi * bj
-                kern(((nthread + 255) // 256,), (256,),
-                     (S, s_v[i0:i1], s_v[j0:j1], q_v[i0:i1], q_v[j0:j1],
-                      np.float32(ns), np.int64(i0), np.int64(j0),
-                      np.int64(bi), np.int64(bj),
-                      np.int64(window if window else 0), np.float32(min_r2),
-                      out_i, out_j, out_r, counter, np.int64(capacity)))
-                del S
-                if Gb is not Ga:
-                    del Gb
-            del Ga
+                    bi, bj = i1 - i0, j1 - j0
+                    nthread = bi * bj
+                    kern(((nthread + 255) // 256,), (256,),
+                         (S, s_v[i0:i1], s_v[j0:j1], q_v[i0:i1], q_v[j0:j1],
+                          np.float32(ns), np.int64(i0), np.int64(j0),
+                          np.int64(bi), np.int64(bj),
+                          np.int64(window if window else 0), np.float32(min_r2),
+                          out_i, out_j, out_r, counter, np.int64(capacity)))
+                    del S
+                    if Gb is not Ga:
+                        del Gb
+                del Ga
         return out_i, out_j, out_r, int(counter[0])
 
     # optimistic capacity, then one exact retry if it overflowed
