@@ -9,12 +9,31 @@ be traced back to a file in this directory.
 
 | file | what it is |
 |---|---|
-| `gpu_matrix_results.json` | **the merged matrix** — 14 devices attempted, 12 measured. Source for the plots and the table. |
+| `gpu_matrix_all.json` | **the merged matrix** — every device ever attempted, across all passes. Source for the plots and the table. |
+| `gpu_matrix_results.json` | pass A: the original sweep on the **pre-optimisation** code — 14 attempted, 12 measured |
+| `gpu_matrix_opt.json` | pass B: re-run on the optimised code — 11 attempted, 7 measured |
+| `gpu_matrix_fanout_pass1.json` | pass C: wider fan-out, 17 devices, run 6-at-a-time |
+| `gpu_matrix_fanout_pass2.json` | pass D: retries + 7 additional devices, run concurrently with C |
 | `matrix_main.json` | first sweep (A2000 → H100), before the Blackwell retry |
 | `gpu_matrix_blackwell.json` | Blackwell retry: RTX 5090 and RTX PRO 4500 succeeded; PRO 5000 and PRO 6000 never returned a measurement |
 | `a100.json` | A100 80GB probe, run separately on the chr22 pod |
 | `gpu_matrix.png`, `gpu_scaling.png` | figures |
 | `gpu_matrix_table.md` | the same data as markdown |
+
+Passes C and D keep **every draw**, not just the kept one, so a re-draw is
+auditable. The merge rule is that a later pass overwrites an earlier record
+only if it actually measured the device — otherwise a retry that hit "no
+capacity" would erase a good measurement, which is the most destructive thing
+the merge could do and would leave a well-formed matrix behind while doing it.
+
+Fleet availability, not code, set the yield: many devices were lost to "no
+instances currently available", several of which the capacity API had listed as
+available minutes earlier. Those are recorded with their reason rather than
+dropped, because "no capacity at 11:20 on a Tuesday" and "the kernel does not
+compile" are different facts and a dash conflates them. Two devices (RTX 3070,
+RTX 5000 Ada — different architectures) failed CUDA device init before any
+cugen code ran, with `nvidia-smi` also returning nothing: broken
+driver/container pairings on those hosts, not results about this module.
 
 Probe workload: p = 20,000 variants, 2,504 samples, seeded synthetic genotypes
 (`tests/conftest.py::simulate_haplotypes`), `stats=(r, r2)`, `min_r2=0.5`.
@@ -42,14 +61,26 @@ sweep is not published here to avoid it being quoted by accident.
 ## Caveats that travel with these numbers
 
 1. **n = 1 pod per GPU**, so host quality is confounded with GPU model. The
-   RTX A4000 row (239 s vs 14 s for the architecturally similar A5000) is
-   almost certainly a slow host draw, not the chip.
-2. **Correctness is not affected by either caveat.** All 12 measured devices
-   returned results bit-identical to the CPU reference (`max|ΔR| = 0.0`).
-3. **D' diverges from plink2 on ~0.005% of real pairs** — tables where the
+   harness now re-draws automatically when throughput fails to grow with tile
+   size (see below), but a single draw is still a single draw.
+2. **Every pre-optimisation timing is an upper bound, not a capability.**
+   Throughput growth from p=2k to p=20k separates the two code versions with no
+   overlap: **12/12 pre-optimisation devices fall between 0.5x and 1.8x**, and
+   **0/19 optimised devices do** (they run 7.3x-38.2x). The old code was
+   host-bound on every device it ever ran on, which is what an SM utilisation
+   of 1-4% before the fused kernel implies. The RTX A4000's 239 s is the
+   extreme of that, not a uniquely bad chip.
+3. **Correctness is not affected by any of this.** All measured devices, on
+   both code versions, returned results bit-identical to the CPU reference
+   (`max|ΔR| = 0.0`). Bit-exactness does not care how slow the host was.
+4. **D' diverges from plink2 on ~0.005% of real pairs** — tables where the
    likelihood has multiple admissible roots. See issue #2 and
    `test_cubic_picks_the_global_maximum_likelihood_root`.
-4. **AMD is untested.** `cupy-cuda12x` is CUDA-only.
+5. **AMD is untested.** `cupy-cuda12x` is CUDA-only.
+6. **Turing (cc 7.5) is untested** — there is no T4, RTX 20-series or Quadro
+   RTX in RunPod's catalogue, so no Turing part can be obtained at any price.
+   It is bracketed by Volta (7.0) and Ampere (8.0), both of which work, but
+   that is an inference rather than a measurement.
 
 ## Optimisation series — cugen vs plink2
 
