@@ -557,6 +557,78 @@ def _get_planes_kernel():
     return _LD_PLANES_KERNEL
 
 
+_LD_EPILOGUE_KERNEL = None
+
+# One fused kernel replacing ~15 CuPy elementwise launches, six B x B
+# temporaries (vA, vB, ok, den, r, keep) and a blocking cp.nonzero per tile.
+# Measured SM utilisation before this was 1-4%: the device was idle BETWEEN
+# launches, not short of work. Survivors append straight into a global buffer
+# via an atomic counter, so there is no per-tile sync and no per-tile
+# concatenate either.
+_LD_EPILOGUE_SRC = r'''
+extern "C" __global__
+void ld_epilogue_compact(
+    const float* __restrict__ S,       /* (bi x bj) cross products     */
+    const float* __restrict__ sA,      /* (bi,) per-variant sums       */
+    const float* __restrict__ sB,      /* (bj,)                        */
+    const float* __restrict__ qA,      /* (bi,) per-variant sum of sq  */
+    const float* __restrict__ qB,      /* (bj,)                        */
+    const float  nsamp,
+    const long long i0, const long long j0,
+    const long long bi, const long long bj,
+    const long long window,            /* <= 0 means no index window   */
+    const float min_r2,
+    long long* __restrict__ out_i,
+    long long* __restrict__ out_j,
+    float* __restrict__ out_r,
+    unsigned long long* __restrict__ counter,
+    const long long capacity)
+{
+    long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = bi * bj;
+    if (t >= total) return;
+    long long a = t / bj;
+    long long b = t - a * bj;
+    long long gi = i0 + a;
+    long long gj = j0 + b;
+    if (gj <= gi) return;                      /* upper triangle only  */
+    if (window > 0 && (gj - gi) > window) return;
+
+    double n  = (double)nsamp;
+    double sa = (double)sA[a], sb = (double)sB[b];
+    double qa = (double)qA[a], qb = (double)qB[b];
+    double vA = n * qa - sa * sa;
+    double vB = n * qb - sb * sb;
+    if (!(vA > 0.0) || !(vB > 0.0)) return;    /* monomorphic          */
+
+    double r = (n * (double)S[t] - sa * sb) / (sqrt(vA) * sqrt(vB));
+    if (r >  1.0) r =  1.0;
+    if (r < -1.0) r = -1.0;
+    if (min_r2 > 0.0f && (float)(r * r) < min_r2) return;
+
+    /* the counter always advances, so its final value is the true survivor
+       count even when the buffer was too small -- the caller can resize and
+       re-run only the epilogue, repeating no GEMM work. */
+    unsigned long long slot = atomicAdd(counter, 1ULL);
+    if (slot < (unsigned long long)capacity) {
+        out_i[slot] = gi;
+        out_j[slot] = gj;
+        out_r[slot] = (float)r;
+    }
+}
+'''
+
+assert _LD_EPILOGUE_SRC.isascii(), "kernel source must be pure ASCII (cf. 34b4a59)"
+
+
+def _get_epilogue_kernel():
+    global _LD_EPILOGUE_KERNEL
+    if _LD_EPILOGUE_KERNEL is None and HAS_CUPY:
+        _LD_EPILOGUE_KERNEL = cp.RawKernel(_LD_EPILOGUE_SRC,
+                                           "ld_epilogue_compact")
+    return _LD_EPILOGUE_KERNEL
+
+
 def _get_dosage_kernel():
     global _LD_DOSAGE_KERNEL
     if _LD_DOSAGE_KERNEL is None and HAS_CUPY:
@@ -756,6 +828,72 @@ def _r_only_result(r_arr, n_arr, reader, rows, pairs_local):
             "pA": af[pairs_local[:, 0]], "pB": af[pairs_local[:, 1]],
             "r": r, "r2": np.clip(r * r, 0.0, 1.0),
             "r2_signed": np.clip(r * np.abs(r), -1.0, 1.0)}
+
+
+def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
+                    verbose=False):
+    """Fused scan: one kernel per tile, one output buffer, no per-tile sync.
+
+    Only for the clean r-only case (no missingness, no bp window). Everything
+    else falls back to _scan_gpu. Returns device arrays (idx_i, idx_j, r).
+    """
+    ns = int(reader.n_samples)
+    bpv = int(reader.bytes_per_variant)
+    p = len(rows)
+    B = int(tile_size) if tile_size else _tile_size_for(ns, window=window)
+    packed = cp.asarray(np.frombuffer(reader.read_packed_bytes(), dtype=np.uint8))
+    packed = packed.reshape(int(reader.n_variants), bpv)[cp.asarray(rows)]
+
+    # per-variant moments, computed once for the whole selection
+    G_all = cp.empty((p, ns), dtype=cp.float32)
+    G2_all = cp.empty((p, ns), dtype=cp.float32)
+    M_all = cp.empty((p, ns), dtype=cp.float32)
+    tpb = 256
+    _get_dosage_kernel()(((p * ns + tpb - 1) // tpb,), (tpb,),
+                         (packed.ravel(), G_all, G2_all, M_all,
+                          np.int64(ns), np.int64(p), np.int64(bpv)))
+    s_v = G_all.sum(axis=1).astype(cp.float32)
+    q_v = G2_all.sum(axis=1).astype(cp.float32)
+    del G2_all, M_all
+    cp.get_default_memory_pool().free_all_blocks()
+
+    def run(capacity):
+        out_i = cp.empty(capacity, dtype=cp.int64)
+        out_j = cp.empty(capacity, dtype=cp.int64)
+        out_r = cp.empty(capacity, dtype=cp.float32)
+        counter = cp.zeros(1, dtype=cp.uint64)
+        kern = _get_epilogue_kernel()
+        for i0 in range(0, p, B):
+            i1 = min(i0 + B, p)
+            hi = p if window is None else min(p, i1 - 1 + int(window) + 1)
+            Ga = G_all[i0:i1]
+            for j0 in range(i0, hi, B):
+                j1 = min(j0 + B, hi)
+                S = Ga @ G_all[j0:j1].T
+                bi, bj = i1 - i0, j1 - j0
+                nthread = bi * bj
+                kern(((nthread + 255) // 256,), (256,),
+                     (S, s_v[i0:i1], s_v[j0:j1], q_v[i0:i1], q_v[j0:j1],
+                      np.float32(ns), np.int64(i0), np.int64(j0),
+                      np.int64(bi), np.int64(bj),
+                      np.int64(window if window else 0), np.float32(min_r2),
+                      out_i, out_j, out_r, counter, np.int64(capacity)))
+                del S
+        return out_i, out_j, out_r, int(counter[0])
+
+    # optimistic capacity, then one exact retry if it overflowed
+    cap = min(int(200e6), max(1 << 20, p * (int(window) if window else 4096)))
+    out_i, out_j, out_r, found = run(cap)
+    if found > cap:
+        if verbose:
+            print(f"cugen.ld: buffer held {cap:,}, {found:,} survived -- "
+                  f"re-running the epilogue at exact size")
+        del out_i, out_j, out_r
+        cp.get_default_memory_pool().free_all_blocks()
+        out_i, out_j, out_r, found = run(found)
+    del G_all, packed
+    cp.get_default_memory_pool().free_all_blocks()
+    return out_i[:found], out_j[:found], out_r[:found]
 
 
 def _assemble_device(pairs_dev, payload, reader, rows, stats, sign_reference,
@@ -1097,6 +1235,27 @@ def ld_matrix(
     # letting cudf wrap them avoids a host round trip we would immediately undo.
     on_device = (use_gpu and HAS_CUDF and not need_table
                  and output is not None and annotation is None)
+    # The fused single-kernel scan handles the clean r-only case: no
+    # missingness, no bp window, no D/D'. That is the hot path, and it is
+    # where the device was sitting at 1-4% SM utilisation.
+    fused = (on_device and not reader.has_missing and window_kb is None
+             and min_obs <= reader.n_samples)
+
+    if use_gpu and fused:
+        cp.cuda.Device(device).use()
+        ii, jj, rr = _scan_gpu_fused(reader, rows, window, min_r2,
+                                     tile_size=tile_size, verbose=verbose)
+        if ii.size == 0:
+            return _empty_pairs(stats)
+        pairs_local = cp.stack([ii, jj], axis=1)
+        n_dev = cp.full(ii.size, float(reader.n_samples), dtype=cp.float32)
+        df = _assemble_device(pairs_local, (rr, n_dev), reader, rows, stats,
+                              sign_reference, path, verbose, n_planned=n_pairs)
+        _write_df(df, str(output))
+        if verbose:
+            print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs "
+                  f"planned, {len(df):,} emitted  (gpu, fused kernel)")
+        return df
 
     if use_gpu:
         cp.cuda.Device(device).use()

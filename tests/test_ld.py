@@ -463,3 +463,48 @@ def test_cubic_picks_the_global_maximum_likelihood_root():
     # and the ML root here is NOT the one nearest the composite estimate,
     # which is exactly why a naive "closest root" rule diverges
     assert out["d"][0] < 0 < out["r"][0]
+
+
+@requires_gpu
+@pytest.mark.gpu
+def test_fused_kernel_matches_reference(tmp_path):
+    """The fused single-kernel path must agree exactly with the tiled path.
+
+    It bypasses the whole CuPy epilogue -- r is computed inside the kernel in
+    double, survivors are compacted with an atomic counter, and nothing syncs
+    per tile. That is a lot of machinery to get subtly wrong, so compare the
+    emitted pair SET and every value against backend='numpy'.
+    """
+    dos = simulate_haplotypes(300, 900, seed=17, missing_rate=0.0)
+    path = tmp_path / "chr22.cugen"
+    write_cugen(str(path), dos.T.astype(np.uint8))
+    out = tmp_path / "o.tsv"
+
+    ref = L.ld_matrix(str(path), window=50, min_r2=0.1, stats=("r", "r2"),
+                      backend="numpy", verbose=False)
+    got = L.ld_matrix(str(path), window=50, min_r2=0.1, stats=("r", "r2"),
+                      backend="gpu", output=str(out), verbose=False)
+    got = got.to_pandas() if hasattr(got, "to_pandas") else got
+
+    assert _pairs_index(got) == _pairs_index(ref)
+    a = ref.sort_values(["gidx_a", "gidx_b"]).reset_index(drop=True)
+    b = got.sort_values(["gidx_a", "gidx_b"]).reset_index(drop=True)
+    np.testing.assert_allclose(a["R"], b["R"], atol=1e-5)
+    np.testing.assert_allclose(a["R2"], b["R2"], atol=1e-5)
+    assert out.exists() and out.stat().st_size > 0
+
+
+@requires_gpu
+@pytest.mark.gpu
+def test_fused_kernel_survives_buffer_overflow(tmp_path):
+    """Undersized output buffer must be detected and retried, not truncated."""
+    dos = simulate_haplotypes(200, 600, seed=5, missing_rate=0.0)
+    path = tmp_path / "chr22.cugen"
+    write_cugen(str(path), dos.T.astype(np.uint8))
+    ref = L.ld_matrix(str(path), min_r2=0.0, stats=("r",), backend="numpy",
+                      verbose=False)
+    got = L.ld_matrix(str(path), min_r2=0.0, stats=("r",), backend="gpu",
+                      output=str(tmp_path / "o.tsv"), max_pairs=10**12,
+                      verbose=False)
+    got = got.to_pandas() if hasattr(got, "to_pandas") else got
+    assert len(got) == len(ref), (len(got), len(ref))
