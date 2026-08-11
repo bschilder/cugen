@@ -3,15 +3,28 @@
     ld_matrix(...)    signed r, r^2, signed r^2, D, D'     (alias: cg.r2)
     ld_clump(...)     v0.2 roadmap, still a stub
 
-Counts, not correlations
-------------------------
-Every statistic here derives from the 3x3 genotype contingency table of each
-variant pair. Those counts are recoverable from products of per-variant
-indicator planes, so the O(p^2) work runs on tensor cores, and because the
-counts are integers the arithmetic is EXACT: fp32 accumulation is bit-exact
-while 4*n_samples < 2**24 (n < 4,194,304). There is therefore no float
-screen-then-refine pass in this module -- there is no float error to correct.
-Above that bound the code raises rather than returning quietly-wrong counts.
+Integer counts, not floating-point correlations
+-----------------------------------------------
+Every statistic is built from EXACT INTEGER counts over the co-observed
+samples, obtained as products of per-variant indicator planes. The plane
+values are {0,1,2}, so the O(p^2) work runs on tensor cores and fp32
+accumulation is bit-exact while 4*n_samples < 2**24 (n < 4,194,304). Above
+that bound the code raises rather than returning quietly-wrong counts. There
+is therefore no float screen-then-refine pass here: there is no float error
+to correct, and results are identical across GPU generations and precisions.
+
+How much gets counted depends on what you ask for:
+
+  * D and D' need the full 3x3 genotype contingency table, because the
+    likelihood is a function of all nine cells. 3 GEMMs per tile on a file
+    with no missing calls, 6 with.
+  * r, r^2 and signed r^2 need only the cross-product S = sum(g_i g_j) and
+    the per-variant moments -- NOT the table. That is 1 GEMM, and it skips
+    nine B x B arrays plus the ~8 elementwise passes that derive the outer
+    cells. Requesting stats=("r", "r2") therefore selects a materially
+    cheaper path, not merely a smaller output.
+
+Both routes consume the same integers, which is why they agree bit-for-bit.
 
 Cost per tile is 3 GEMMs for the full r + D/D' set on a file with no missing
 calls -- n21 comes free as n12 transposed, and the marginals collapse to
