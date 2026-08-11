@@ -985,6 +985,11 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
     p = len(rows)
     B = int(tile_size) if tile_size else _tile_size_for(
         ns, window=window, fused=True)
+    # Never size a tile larger than the problem. The planner bounds B by
+    # MEMORY, not by p, so at p=4,000 with n=100,000 it happily picked
+    # B=31,744 and then allocated a 31,744 x 100,000 plane buffer to hold
+    # 4,000 rows -- ~8x over-allocation, invisible whenever p >> B.
+    B = max(256, min(B, p))
     packed = cp.asarray(np.frombuffer(reader.read_packed_bytes(), dtype=np.uint8))
     packed = packed.reshape(int(reader.n_variants), bpv)[cp.asarray(rows)]
 
