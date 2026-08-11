@@ -37,9 +37,15 @@ class PeakSampler:
         return self
 
     def _run(self):
-        pool = cp.get_default_memory_pool()
+        # Sample total device usage (total - free), NOT cupy's pool: cuDF
+        # allocates through RMM, so a pool-only sampler reports 0.00 GiB for a
+        # cudf-backed run -- which reads as a spectacular result rather than an
+        # unmeasured one.
+        dev = cp.cuda.Device()
+        total = dev.mem_info[1]
+        base = total - dev.mem_info[0]
         while not self._stop:
-            used = pool.used_bytes()
+            used = (total - dev.mem_info[0]) - base
             if used > self.peak:
                 self.peak = used
             time.sleep(self.interval)
