@@ -93,3 +93,19 @@ mattered came from profiling:
 Two sweeps of identical code and data disagreed by 1.9x at n=200,000. Treat
 the direction as solid and the specific multipliers as approximate; the
 replicated sweep reports medians of three with the observed range.
+
+## Scaling sweeps (final, optimised code)
+
+| file | what it measures |
+|---|---|
+| `psweep.json` | variants axis, 1KG chr22, n=2,504 fixed, p to whole chromosome |
+| `nscale.json` | samples axis, p=4,000 fixed, n to 1,000,000 (medians of 3) |
+| `scaling_variants.png`, `scaling_samples.png` | the two line plots |
+
+Headline: whole chr22 all-pairs (170,949 variants, 1.46e10 pairs) in **1.51 s**
+against plink2's 771.78 s on 128 cores -- **513x**, with GPU memory flat at
+8.4 GiB while plink2's RSS grew to 109 GiB.
+
+Crossovers: p ~= 5,000 on the variant axis, n ~= 10,000 on the sample axis.
+Below those the GPU's fixed costs dominate and plink2 wins; the variant sweep
+also runs at n=2,504, which is cugen's worst regime.
