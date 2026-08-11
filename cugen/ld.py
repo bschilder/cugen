@@ -891,7 +891,7 @@ def _r_from_counts_gpu(c):
 
 
 def _tile_size_for(n_samples: int, budget_frac: float = 0.35,
-                   window: Optional[int] = None) -> int:
+                   window: Optional[int] = None, fused: bool = False) -> int:
     """Pick B so planes + counts fit free device memory.
 
     planes  = 2 * 3 * B * n_samples * 4
@@ -907,10 +907,19 @@ def _tile_size_for(n_samples: int, budget_frac: float = 0.35,
     """
     free, _total = cp.cuda.Device().mem_info
     budget = budget_frac * free
-    a = 36.0
-    b = 24.0 * n_samples
+    # Coefficients must match what the chosen path actually allocates.
+    #   fused r-only : 2 plane buffers (2*4) + the S tile (4)
+    #   table path   : 2 blocks x 3 planes (24) + 9 count arrays (36)
+    # Modelling the table path's footprint while running the fused path
+    # under-sizes B by ~3x, which costs both per-tile overhead and GEMM
+    # efficiency.
+    a, b = (4.0, 8.0 * n_samples) if fused else (36.0, 24.0 * n_samples)
     B = int((-b + (b * b + 4 * a * budget) ** 0.5) / (2 * a))
-    B = max(256, min(8192, (B // 256) * 256))
+    # The old 8192 ceiling was set when a tile cost 9 count arrays. With one
+    # plane and one S tile, larger blocks fit easily at small n -- which is
+    # exactly where the run is overhead-bound and wants fewer, bigger GEMMs.
+    ceiling = 32768 if fused else 8192
+    B = max(256, min(ceiling, (B // 256) * 256))
     if window is not None:
         # round the window up to a multiple of 256, and never grow B
         wb = max(256, ((int(window) + 255) // 256) * 256)
@@ -974,7 +983,8 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
     ns = int(reader.n_samples)
     bpv = int(reader.bytes_per_variant)
     p = len(rows)
-    B = int(tile_size) if tile_size else _tile_size_for(ns, window=window)
+    B = int(tile_size) if tile_size else _tile_size_for(
+        ns, window=window, fused=True)
     packed = cp.asarray(np.frombuffer(reader.read_packed_bytes(), dtype=np.uint8))
     packed = packed.reshape(int(reader.n_variants), bpv)[cp.asarray(rows)]
 
