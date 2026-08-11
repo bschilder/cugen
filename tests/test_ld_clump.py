@@ -11,10 +11,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from conftest import requires_gpu
 
 from cugen.ld import (_CLUMP_BINS, _bin_columns, _clump_bin_counts,
-                      _clumps_to_frame, _empty_clumps, _greedy_clump,
-                      _load_sumstats, ld_clump)
+                      _clumps_from_pairs, _clumps_to_frame, _empty_clumps,
+                      _greedy_clump, _load_sumstats, clump_core, ld_clump,
+                      membership_pairs)
 
 
 def order_by_p(pv):
@@ -135,6 +137,86 @@ def test_greedy_is_gpu_free():
     import inspect
     src = inspect.getsource(_greedy_clump)
     assert "cp." not in src and "cupy" not in src
+
+
+# ---------------------------------------------------------------------------
+# the array-parallel core, with the sequential greedy as its oracle
+# ---------------------------------------------------------------------------
+def _random_clump_case(rng):
+    """A windowed graph with p-value ties -- like a kb window on sorted rows."""
+    n = int(rng.integers(4, 80))
+    pv = 10.0 ** (-rng.uniform(0, 11, size=n))
+    if rng.random() < 0.35:                       # force ties deliberately
+        pv[rng.integers(0, n, size=max(2, n // 4))] = 1e-6
+    w = int(rng.integers(1, 9))
+    eu, ev = [], []
+    for i in range(n):
+        for j in range(i + 1, min(n, i + w + 1)):
+            if rng.random() < 0.5:
+                eu.append(i)
+                ev.append(j)
+    eu = np.array(eu, dtype=np.int32)
+    ev = np.array(ev, dtype=np.int32)
+    order = np.lexsort((np.arange(n), pv))
+    rank = np.empty(n, dtype=np.int32)
+    rank[order] = np.arange(n, dtype=np.int32)
+    nb = {}
+    for i, j in zip(eu.tolist(), ev.tolist()):
+        nb.setdefault(i, []).append(j)
+        nb.setdefault(j, []).append(i)
+    return n, pv, eu, ev, order, rank, nb
+
+
+def test_parallel_core_equals_sequential_greedy():
+    """The load-bearing claim: the parallel formulation is not an
+    approximation of greedy clumping, it computes the identical answer.
+
+    Index selection is the lexicographically-first maximal independent set
+    under p-priority; membership is an argmin rather than a sequence. 400
+    random windowed graphs x both overlap modes, with ties forced in a third
+    of them -- ties being exactly where a parallel tie-break could diverge.
+    """
+    rng = np.random.default_rng(1)
+    for _ in range(400):
+        n, pv, eu, ev, order, rank, nb = _random_clump_case(rng)
+        p1 = float(rng.choice([1e-4, 1e-2, 1.0]))
+        for ov in (False, True):
+            want = _greedy_clump(order, pv, nb, p1, ov)
+            is_idx, owner, _ = clump_core(eu, ev, rank, pv <= p1, ov, xp=np)
+            a, b = membership_pairs(is_idx, owner, rank, eu, ev, ov, xp=np)
+            assert _clumps_from_pairs(is_idx, rank, a, b) == want
+
+
+def test_mis_converges_in_a_handful_of_rounds():
+    """Round count is what makes the parallel form worth having: at O(p)
+    rounds it would be the sequential loop with extra steps."""
+    rng = np.random.default_rng(7)
+    rounds = []
+    for _ in range(120):
+        n, pv, eu, ev, order, rank, nb = _random_clump_case(rng)
+        _, _, r = clump_core(eu, ev, rank, pv <= 1.0, False, xp=np)
+        rounds.append(r)
+    assert max(rounds) <= 8, f"MIS needed {max(rounds)} rounds"
+    assert np.mean(rounds) < 4
+
+
+def test_no_overlap_membership_never_reads_the_edge_list():
+    """Under no-overlap the owner array alone determines membership, which is
+    why that path costs O(p) on the host instead of O(edges)."""
+    rng = np.random.default_rng(3)
+    n, pv, eu, ev, order, rank, nb = _random_clump_case(rng)
+    is_idx, owner, _ = clump_core(eu, ev, rank, pv <= 1.0, False, xp=np)
+    empty = np.empty(0, dtype=np.int32)
+    a1, b1 = membership_pairs(is_idx, owner, rank, eu, ev, False, xp=np)
+    a2, b2 = membership_pairs(is_idx, owner, rank, empty, empty, False, xp=np)
+    assert np.array_equal(a1, a2) and np.array_equal(b1, b2)
+
+
+def test_clump_kernel_source_is_pure_ascii():
+    """Regression guard for 34b4a59 -- an NVRTC crash from one non-ASCII
+    character, which cannot be reproduced without a GPU."""
+    from cugen.ld import _CLUMP_SRC
+    assert _CLUMP_SRC.isascii()
 
 
 # ---------------------------------------------------------------------------
@@ -369,3 +451,73 @@ def test_p2_screen_runs_before_any_io():
     ss = pd.DataFrame({"ID": ["a"], "P": [0.9]})
     assert len(ld_clump("nofile.cugen", ss, annotation=ann, p2=0.01,
                         verbose=False)) == 0
+
+
+# ---------------------------------------------------------------------------
+# GPU. These are the only tests here that need a device; everything above
+# validates the same algorithm through its NumPy path.
+# ---------------------------------------------------------------------------
+@requires_gpu
+def test_clump_core_gpu_matches_cpu():
+    """The kernels and np.minimum.at must agree exactly -- same algorithm,
+    two atomicMin implementations."""
+    import cupy as cp
+    rng = np.random.default_rng(11)
+    for _ in range(60):
+        n, pv, eu, ev, order, rank, nb = _random_clump_case(rng)
+        p1 = float(rng.choice([1e-4, 1e-2, 1.0]))
+        cand = pv <= p1
+        for ov in (False, True):
+            ic, oc, rc = clump_core(eu, ev, rank, cand, ov, xp=np)
+            ig, og, rg = clump_core(cp.asarray(eu), cp.asarray(ev),
+                                    cp.asarray(rank), cp.asarray(cand),
+                                    ov, xp=cp)
+            assert rc == rg, "different round counts"
+            assert np.array_equal(ic, cp.asnumpy(ig))
+            assert np.array_equal(oc, cp.asnumpy(og))
+
+
+@requires_gpu
+@pytest.mark.parametrize("overlap", [False, True])
+def test_gpu_clump_matches_plink2_golden(tmp_path, overlap):
+    """End to end on the device, against the same plink2 goldens the CPU path
+    is held to. This is the test that would have caught the fused path being
+    silently bypassed."""
+    gold = "clump_gold_overlap.clumps" if overlap else "clump_gold.clumps"
+    path, ann = _clump_fixture(tmp_path)
+    got = ld_clump(path, DATA / "clump_sumstats.tsv", annotation=ann,
+                   backend="gpu", allow_overlap=overlap, verbose=False)
+    want = pd.read_csv(DATA / gold, sep="\t").rename(
+        columns=lambda c: c.lstrip("#"))
+    a = want.sort_values("ID").reset_index(drop=True)[PARITY_COLS]
+    b = got.sort_values("ID").reset_index(drop=True)[PARITY_COLS]
+    assert len(a) == len(b)
+    np.testing.assert_allclose(a["P"].to_numpy(float), b["P"].to_numpy(float),
+                               rtol=1e-6)
+    for c in [x for x in PARITY_COLS if x != "P"]:
+        assert (a[c].astype(str).to_numpy() == b[c].astype(str).to_numpy()).all(), \
+            f"column {c} differs from plink2 on the GPU path"
+
+
+@requires_gpu
+@pytest.mark.parametrize("overlap", [False, True])
+def test_gpu_and_cpu_backends_agree(tmp_path, overlap):
+    path, ann = _clump_fixture(tmp_path)
+    kw = dict(annotation=ann, allow_overlap=overlap, verbose=False)
+    g = ld_clump(path, DATA / "clump_sumstats.tsv", backend="gpu", **kw)
+    c = ld_clump(path, DATA / "clump_sumstats.tsv", backend="numpy", **kw)
+    pd.testing.assert_frame_equal(g.reset_index(drop=True),
+                                  c.reset_index(drop=True))
+
+
+@requires_gpu
+def test_gpu_path_handles_p1_of_one(tmp_path):
+    """The C+T configuration: every variant an index candidate, low r2. This
+    is the regime the device path exists for."""
+    path, ann = _clump_fixture(tmp_path)
+    kw = dict(annotation=ann, p1=1.0, p2=0.01, r2=0.1, verbose=False)
+    g = ld_clump(path, DATA / "clump_sumstats.tsv", backend="gpu", **kw)
+    c = ld_clump(path, DATA / "clump_sumstats.tsv", backend="numpy", **kw)
+    pd.testing.assert_frame_equal(g.reset_index(drop=True),
+                                  c.reset_index(drop=True))
+    assert len(g) > 0

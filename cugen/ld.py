@@ -624,10 +624,17 @@ def _load_sumstats(obj, id_field: Sequence[str], p_field: Sequence[str],
 
 def _greedy_clump(order: np.ndarray, pvals: np.ndarray, neighbours: dict,
                   p1: float, allow_overlap: bool = False):
-    """The serial half of clumping: greedy assignment over a FIXED edge set.
+    """Sequential greedy clumping -- now the ORACLE, not the production path.
+
+    :func:`clump_core` replaced this: the same answer computed array-parallel,
+    on the device. This is kept because a second, independently written
+    implementation is the strongest correctness evidence available, and
+    `test_parallel_core_equals_sequential_greedy` checks the two agree on 400
+    random windowed graphs across both overlap modes. Same role the EM solver
+    plays for the D' cubic.
 
     Pure NumPy and GPU-free by construction, so the logic that decides the
-    answer is unit-testable anywhere; only the r^2 feeding it needs a device.
+    answer stays testable anywhere.
 
     ``order`` is row indices sorted by ascending p; ``neighbours[i]`` lists the
     rows whose r^2 with ``i`` cleared the threshold inside the kb window.
@@ -673,6 +680,223 @@ def _greedy_clump(order: np.ndarray, pvals: np.ndarray, neighbours: dict,
         if not allow_overlap:
             can_join[members] = False
     return clumps
+
+
+# ---------------------------------------------------------------------------
+# Array-parallel clumping. The greedy loop LOOKS irreducibly serial and is not.
+# Three facts make the whole thing data-parallel, each checked against the
+# sequential implementation before this was written (see test_ld_clump.py):
+#
+#   1. A candidate with no lower-p UNASSIGNED candidate neighbour can never be
+#      absorbed, so it is definitely an index. Selecting all such vertices at
+#      once and repeating computes the lexicographically-first maximal
+#      independent set -- exactly what sequential greedy computes. Measured at
+#      2.0 rounds on average and 4 at worst, against O(p) sequential steps.
+#   2. Membership is an ARGMIN, not a sequence: under no-overlap a variant
+#      joins the lowest-p index adjacent to it, because that is the first index
+#      the sequential loop would have reached.
+#   3. TOTAL and the bins are segmented counts.
+#
+# Every phase is a reduction over the edge set, so nothing here builds a
+# host-side adjacency structure and nothing is O(p^2).
+#
+# KERNEL SOURCE MUST STAY PURE ASCII (cf. 34b4a59).
+# ---------------------------------------------------------------------------
+_CLUMP_MODULE = None
+
+_CLUMP_SRC = r'''
+/* Each undirected edge is stored ONCE; every kernel handles both endpoints.
+   That halves memory against a symmetric CSR and needs no sort. */
+
+extern "C" __global__
+void clump_nbr_min(const int* eu, const int* ev, const int* rank,
+                   const unsigned char* alive, int* out, long long n_edges)
+{
+    long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_edges) return;
+    int a = eu[e], b = ev[e];
+    if (!alive[a] || !alive[b]) return;
+    atomicMin(&out[a], rank[b]);
+    atomicMin(&out[b], rank[a]);
+}
+
+extern "C" __global__
+void clump_claim(const int* eu, const int* ev,
+                 const unsigned char* picked, unsigned char* claimed,
+                 long long n_edges)
+{
+    long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_edges) return;
+    int a = eu[e], b = ev[e];
+    if (picked[a]) claimed[b] = 1;
+    if (picked[b]) claimed[a] = 1;
+}
+
+/* For every non-index vertex, the rank of the lowest-ranked adjacent INDEX.
+   That one atomicMin IS the whole no-overlap membership rule. */
+extern "C" __global__
+void clump_assign(const int* eu, const int* ev, const int* rank,
+                  const unsigned char* is_index, int* best, long long n_edges)
+{
+    long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_edges) return;
+    int a = eu[e], b = ev[e];
+    if (is_index[a] && !is_index[b]) atomicMin(&best[b], rank[a]);
+    if (is_index[b] && !is_index[a]) atomicMin(&best[a], rank[b]);
+}
+'''
+
+assert _CLUMP_SRC.isascii(), "kernel source must be pure ASCII (cf. 34b4a59)"
+
+_INT_MAX = int(np.iinfo(np.int32).max)
+
+
+def _get_clump_module():
+    global _CLUMP_MODULE
+    if _CLUMP_MODULE is None and HAS_CUPY:
+        _CLUMP_MODULE = cp.RawModule(code=_CLUMP_SRC)
+    return _CLUMP_MODULE
+
+
+def clump_core(eu, ev, rank, cand, allow_overlap=False, xp=np):
+    """Index selection and member assignment, array-parallel, CPU or GPU.
+
+    ``eu``/``ev`` hold the two endpoints of each undirected edge (each pair
+    once). ``rank`` is a UNIQUE per-vertex p-value rank (lower = more
+    significant), so ties are already broken by the caller. ``cand`` marks
+    index candidates (p <= p1).
+
+    Returns ``(is_index, owner, rounds)``; ``owner[v]`` is the rank of the
+    index claiming v, or ``_INT_MAX`` for none. Under ``allow_overlap`` the
+    owner array is not used -- membership then comes straight off the edges.
+
+    The identical code runs under NumPy and CuPy: ``np.minimum.at`` is the CPU
+    analogue of ``atomicMin``. So the CPU path is a genuine reference for the
+    GPU one rather than a second, differently-shaped algorithm.
+    """
+    n = int(len(rank))
+    gpu = xp is not np
+    nE = int(len(eu))
+    if gpu:
+        mod = _get_clump_module()
+        k_min = mod.get_function("clump_nbr_min")
+        k_claim = mod.get_function("clump_claim")
+        k_assign = mod.get_function("clump_assign")
+        grid = ((nE + 255) // 256 or 1,)
+
+    alive = xp.asarray(cand).astype(xp.bool_).copy()
+    is_index = xp.zeros(n, dtype=xp.bool_)
+    rounds = 0
+    while bool(alive.any()):
+        rounds += 1
+        nbr = xp.full(n, _INT_MAX, dtype=xp.int32)
+        if nE:
+            if gpu:
+                k_min(grid, (256,), (eu, ev, rank,
+                                     alive.view(xp.uint8), nbr, np.int64(nE)))
+            else:
+                m = alive[eu] & alive[ev]
+                np.minimum.at(nbr, eu[m], rank[ev[m]])
+                np.minimum.at(nbr, ev[m], rank[eu[m]])
+        picked = alive & (rank < nbr)
+        if not bool(picked.any()):
+            # Impossible: the globally lowest-ranked alive vertex always
+            # qualifies. Guard anyway -- spinning forever on a GPU is a worse
+            # failure than an exception.
+            raise RuntimeError("clump MIS made no progress; edge list corrupt")
+        is_index |= picked
+        alive &= ~picked
+        if nE:
+            claimed = xp.zeros(n, dtype=xp.uint8)
+            if gpu:
+                k_claim(grid, (256,), (eu, ev, picked.view(xp.uint8),
+                                       claimed, np.int64(nE)))
+            else:
+                claimed[ev[picked[eu]]] = 1
+                claimed[eu[picked[ev]]] = 1
+            alive &= ~claimed.astype(xp.bool_)
+
+    owner = xp.full(n, _INT_MAX, dtype=xp.int32)
+    if nE and not allow_overlap:
+        if gpu:
+            k_assign(grid, (256,), (eu, ev, rank, is_index.view(xp.uint8),
+                                    owner, np.int64(nE)))
+        else:
+            ia, ib = is_index[eu], is_index[ev]
+            m = ia & ~ib
+            np.minimum.at(owner, ev[m], rank[eu[m]])
+            m = ib & ~ia
+            np.minimum.at(owner, eu[m], rank[ev[m]])
+    return is_index, owner, rounds
+
+
+def membership_pairs(is_index, owner, rank, eu, ev, allow_overlap, xp=np):
+    """(index_row, member_row) pairs, computed wherever the arrays live.
+
+    Runs on the device under CuPy, so the only thing that ever crosses to the
+    host is the membership list itself -- which is the output, and is far
+    smaller than the edge list it was derived from. Under no-overlap it does
+    not touch the edges at all: ``owner`` already holds the answer in O(p).
+    """
+    if allow_overlap:
+        m1 = is_index[eu] & ~is_index[ev]
+        m2 = is_index[ev] & ~is_index[eu]
+        return (xp.concatenate([eu[m1], ev[m2]]),
+                xp.concatenate([ev[m1], eu[m2]]))
+    n = int(len(rank))
+    rank_to_row = xp.full(n + 1, -1, dtype=xp.int64)
+    idx_rows = xp.flatnonzero(is_index)
+    rank_to_row[rank[idx_rows]] = idx_rows
+    b = xp.flatnonzero((owner < _INT_MAX) & ~is_index)
+    return rank_to_row[owner[b]], b
+
+
+def _clumps_from_pairs(is_index, rank, a, b):
+    """Group host-side (index, member) pairs into plink's clump order."""
+    is_index = np.asarray(is_index)
+    rank = np.asarray(rank)
+    idx_rows = np.flatnonzero(is_index)
+    members = {int(i): [] for i in idx_rows}
+    if len(a):
+        o = np.argsort(np.asarray(a), kind="stable")
+        aa, bb = np.asarray(a)[o], np.asarray(b)[o]
+        edges = np.flatnonzero(np.r_[True, aa[1:] != aa[:-1]])
+        for s, e in zip(edges, np.r_[edges[1:], len(aa)]):
+            members[int(aa[s])] = sorted(int(x) for x in bb[s:e])
+    order = idx_rows[np.argsort(rank[idx_rows])]
+    return [(int(i), members[int(i)]) for i in order]
+
+
+def _clump_edges_gpu(reader, rows, positions, kb, r2_thresh, tile_size,
+                     tf32, verbose):
+    """Device-resident edge list for the clump graph. Never reaches the host.
+
+    The fused epilogue kernel takes an INDEX window, not a bp one, and
+    ld_matrix disables the fused path entirely when window_kb is set. Rather
+    than lose it, convert: on sorted positions the kb window is contained in an
+    index window of width ``max_i (hi(i) - i)``, so scan with that -- a
+    superset -- and drop the surplus with an exact bp test on the device. The
+    surplus is bounded by how uneven the local variant density is, which is
+    reported so a pathological file is visible rather than merely slow.
+    """
+    span = int(round(kb * 1000))
+    pos = np.asarray(positions, dtype=np.int64)
+    hi = np.searchsorted(pos, pos + span, side="right")
+    win = int(np.max(hi - np.arange(len(pos)) - 1)) if len(pos) else 1
+    win = max(1, win)
+    if verbose:
+        mean_span = float(np.mean(hi - np.arange(len(pos)) - 1)) if len(pos) else 0
+        print(f"[clump] {kb:g} kb -> index window {win:,} "
+              f"(mean {mean_span:,.0f}; superset factor "
+              f"{win / max(mean_span, 1):.1f}x)")
+    ii, jj, _rr = _scan_gpu_fused(reader, rows, win, r2_thresh,
+                                  tile_size=tile_size, verbose=verbose,
+                                  tf32=tf32)
+    if ii.size:
+        pos_d = cp.asarray(pos)
+        keep = cp.abs(pos_d[jj] - pos_d[ii]) <= span
+        ii, jj = ii[keep], jj[keep]
+    return ii.astype(cp.int32), jj.astype(cp.int32)
 
 
 def _bin_columns(bins: Sequence[float]):
@@ -899,32 +1123,72 @@ def ld_clump(
               f"candidates ({100 * len(rel) / max(n_all, 1):.1f}%); LD is "
               f"computed on those only")
 
-    # --- parallel half: every r^2 the greedy loop could ever consult -------
-    pairs = ld_matrix(
-        cugen, variants=rel["gidx"].to_numpy(), annotation=ann,
-        window_kb=kb, min_r2=r2, stats=("r2",), output_format="pairs",
-        backend=backend, precision=precision, tile_size=tile_size,
-        max_pairs=max_pairs, device=device, verbose=False)
-    pairs = pairs.to_pandas() if hasattr(pairs, "to_pandas") else pairs
-    if verbose:
-        print(f"[clump] {len(pairs):,} pairs at r2 >= {r2:g} within {kb:g} kb")
-
-    # --- serial half: cheap, and GPU-free ----------------------------------
-    row_of = pd.Series(np.arange(len(rel)), index=rel["gidx"].to_numpy())
-    neighbours: dict = {}
-    if len(pairs):
-        a = row_of.reindex(pairs["gidx_a"].to_numpy()).to_numpy()
-        b = row_of.reindex(pairs["gidx_b"].to_numpy()).to_numpy()
-        ok = np.isfinite(a) & np.isfinite(b)
-        for i, j in zip(a[ok].astype(int), b[ok].astype(int)):
-            neighbours.setdefault(i, []).append(j)
-            neighbours.setdefault(j, []).append(i)
-
     pv = rel["P"].to_numpy(dtype=float)
-    # gidx breaks p ties deterministically: without it the clump assignment
-    # depends on row order, and two runs on the same data could disagree.
-    order = np.lexsort((rel["gidx"].to_numpy(), pv))
-    clumps = _greedy_clump(order, pv, neighbours, p1, allow_overlap)
+    rel_gidx = rel["gidx"].to_numpy()
+    rel_pos = rel["POS"].to_numpy(dtype=np.int64)
+    # gidx breaks p ties deterministically: without it the assignment would
+    # depend on row order and two runs on the same data could disagree.
+    order = np.lexsort((rel_gidx, pv))
+    rank = np.empty(len(rel), dtype=np.int32)
+    rank[order] = np.arange(len(rel), dtype=np.int32)
+    cand = pv <= p1
+
+    want_gpu = backend == "gpu" or (backend == "auto" and HAS_CUPY)
+    reader = read_cugen(str(cugen))
+    on_device = want_gpu and HAS_CUPY and not reader.has_missing
+    if backend == "gpu" and not HAS_CUPY:
+        raise RuntimeError("backend='gpu' but CuPy is not available")
+
+    if on_device:
+        # --- everything below runs on the device -------------------------
+        cp.cuda.Device(device).use()
+        rows = np.searchsorted(reader.gidx, rel_gidx) \
+            if hasattr(reader, "gidx") else rel_gidx
+        rows = np.asarray(rows, dtype=np.int64)
+        tf32 = _resolve_precision(precision, int(reader.n_samples), False)
+        with _Tf32(tf32):
+            eu, ev = _clump_edges_gpu(reader, rows, rel_pos, kb, r2,
+                                      tile_size, tf32, verbose)
+        n_edges = int(eu.size)
+        rank_d, cand_d = cp.asarray(rank), cp.asarray(cand)
+        is_index_d, owner_d, rounds = clump_core(eu, ev, rank_d, cand_d,
+                                                 allow_overlap, xp=cp)
+        a_d, b_d = membership_pairs(is_index_d, owner_d, rank_d, eu, ev,
+                                    allow_overlap, xp=cp)
+        # Only the membership list crosses to the host -- the edges never do.
+        is_index = cp.asnumpy(is_index_d)
+        a, b = cp.asnumpy(a_d), cp.asnumpy(b_d)
+        del eu, ev, rank_d, cand_d, owner_d, a_d, b_d
+        cp.get_default_memory_pool().free_all_blocks()
+        if verbose:
+            print(f"[clump] {n_edges:,} edges at r2 >= {r2:g}; "
+                  f"index selection converged in {rounds} parallel round(s); "
+                  f"{len(a):,} memberships returned to host")
+        clumps = _clumps_from_pairs(is_index, rank, a, b)
+    else:
+        # --- CPU reference: same algorithm, NumPy in place of the kernels --
+        pairs = ld_matrix(
+            cugen, variants=rel_gidx, annotation=ann, window_kb=kb, min_r2=r2,
+            stats=("r2",), output_format="pairs", backend="numpy",
+            max_pairs=max_pairs, verbose=False)
+        pairs = pairs.to_pandas() if hasattr(pairs, "to_pandas") else pairs
+        row_of = pd.Series(np.arange(len(rel)), index=rel_gidx)
+        if len(pairs):
+            eu = row_of.reindex(pairs["gidx_a"].to_numpy()).to_numpy()
+            ev = row_of.reindex(pairs["gidx_b"].to_numpy()).to_numpy()
+            ok = np.isfinite(eu) & np.isfinite(ev)
+            eu = eu[ok].astype(np.int32)
+            ev = ev[ok].astype(np.int32)
+        else:
+            eu = ev = np.empty(0, dtype=np.int32)
+        if verbose:
+            print(f"[clump] {len(eu):,} edges at r2 >= {r2:g} within "
+                  f"{kb:g} kb (cpu reference path)")
+        is_index, owner, rounds = clump_core(eu, ev, rank, cand,
+                                             allow_overlap, xp=np)
+        a, b = membership_pairs(is_index, owner, rank, eu, ev,
+                                allow_overlap, xp=np)
+        clumps = _clumps_from_pairs(is_index, rank, a, b)
 
     out = _clumps_to_frame(clumps, rel, bins, p2)
     if verbose:
