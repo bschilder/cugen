@@ -50,41 +50,52 @@ probability, not the per-genotype dosage r2 usually quoted:
 | 1001–2000 | 53,250 | 0.982 |
 | 2001+ | 21,874 | 0.978 |
 
-## Speed: it depends entirely on what you count, and the honest answer is mixed
+## Speed
 
-**The headline "cugen 28.5s vs Beagle 32.6s, 1.14x" is not a like-for-like
-comparison and should not be quoted on its own.** The two timers wrap different
-scopes and, worse, different input formats.
+There is **one** comparison here where both tools do the same job, and it is not
+a wall-clock comparison of the two runs.
 
-| | scope actually timed |
-|---|---|
-| cugen 28.5 s | `impute()` on **pre-converted `.cugen`** inputs, writing `.cugen` |
-| Beagle 32.6 s | full `java -jar`: JVM startup + reading **`reference.vcf.gz`** + impute + writing `.vcf.gz` |
+### The comparable number: imputation
 
-cugen's number excludes converting the panel, which took about ten minutes for
-this chromosome. Beagle's includes reading a VCF — and **bref3, Beagle's own
-prepared binary format, was not used**, though it is exactly the analogue of
-handing cugen a `.cugen`. The 2018 paper attributes Beagle's sublinear scaling
-in panel size to bref3. Comparing cugen-on-its-fast-format against
-Beagle-on-its-slow-format flatters cugen, and that is what the 1.14x is.
+Beagle reports its own imputation time per window (5 + 4 + 2 s), separately from
+its I/O. cugen's corresponding phases are `forward_backward` 12.12 +
+`carriers` 1.73 + `aggregate` 0.61 + `dose` 0.11.
 
-### Like-for-like: the imputation itself
-
-Beagle reports its own imputation time separately (5 + 4 + 2 s across three
-windows), which excludes its I/O:
-
-| | imputation only |
+| | imputation |
 |---|---|
 | Beagle 5.5 | **11.0 s** |
 | cugen | 14.6 s |
 
-cugen's figure is `forward_backward` 12.12 + `carriers` 1.73 + `aggregate` 0.61
-+ `dose` 0.11.
+**Beagle is about 1.3x faster**, consistent with it running
+`imp-states=1600` PBWT-selected states where this runs all 4,904 reference
+haplotypes: roughly 3x the state space, most but not all of it absorbed by the
+GPU.
 
-**Beagle is about 1.3x faster at the algorithm.** That is the number to beat,
-and it is consistent with what each is doing: Beagle runs 1,600 PBWT-selected
-states where this runs all 4,904 reference haplotypes as states. Brute force
-costs roughly 3x the state space and closes most but not all of it on a GPU.
+Caveat on this number too: Beagle's documentation does not say what its
+per-window imputation counter starts and stops on, in particular whether it
+includes reading that window's reference markers -- the work cugen is charged
+1.73 + 0.93 s for above. So this is approximately like-for-like, not exactly.
+
+### The two wall-clock numbers are NOT a comparison
+
+cugen's run took 28.5 s and Beagle's 32.6 s, but these measure two different
+pipelines with no shared start or finish:
+
+| | cugen 28.5 s | Beagle 32.6 s |
+|---|---|---|
+| reads | `reference.cugen`, 1.1 GB uncompressed binary, mmap | `reference.vcf.gz`, 108 MB bgzipped text |
+| writes | `cugen_out.cugen`, ~205 MB float16 dosages | `beagle_out.vcf.gz`, bgzipped text with GT, DS, INFO |
+| process | warm Python, CuPy context already initialised | cold JVM, `-Xmx60g` |
+| excluded before the timer | VCF to `.cugen` conversion: **598 s** reference, 3.8 s target | nothing |
+
+One decompresses text and recompresses text; the other mmaps a binary blob and
+writes raw float16. And **bref3 -- Beagle's own prepared binary format, the
+direct analogue of a `.cugen` -- was not used**, though the 2018 paper credits
+it for Beagle's sublinear scaling in panel size.
+
+Quoting 28.5 against 32.6 as though it were a ratio, which an earlier version of
+this file did, compares cugen's fast format against Beagle's slow one and
+charges only Beagle for its I/O.
 
 ### Full cugen profile at 28.31 s
 
@@ -98,26 +109,27 @@ costs roughly 3x the state space and closes most but not all of it on a GPU.
 | aggregate | 0.61 | target markers |
 | dose (GPU) | 0.11 | targets x carriers |
 
-This began at 76.7 s. The two phases responsible were both reference-panel work
-that no target sample touches:
+This began at 76.7 s. The two phases responsible were reference-panel work no
+target sample touches:
 
 | phase | was | now | |
 |---|---|---|---|
 | carriers | 30.7 s | 1.73 s | 17.7x |
 | read | 18.5 s | 0.93 s | 20x |
 
-Neither was made cleverer. Carrier lists are now built on the GPU straight from
-the packed bytes, so the host never expands a window to a `(K, M)` byte matrix
-— 2.4 GiB per window, read and written and scanned to feed a step that has
-since moved off the host. Only the genotyped columns are unpacked.
+Those are cugen measured against its own prior state on identical inputs, so
+they are unaffected by everything above. Carrier lists are now built on the GPU
+straight from the packed bytes; the host never expands a window to a `(K, M)`
+byte matrix, 2.4 GiB per window read and written and scanned to feed a step that
+has since moved off the host.
 
-### What has NOT been measured
+### Not measured
 
-- **Beagle with a bref3 panel.** Until that is run, no end-to-end comparison
-  here is fair, and the fair guess is that Beagle gets faster.
-- **The crossover on the target axis.** cugen's per-target cost falls steeply
-  (below) while Beagle's should be closer to linear, but that is an argument,
-  not a measurement.
+- **Beagle with a bref3 panel.** Required before any two-pipeline wall-clock
+  number here is worth stating. Expect Beagle to get faster.
+- **A pipeline comparison from a common starting artifact** (say, both from
+  `.vcf.gz`, or both from their own prepared format, with conversion counted).
+- **The crossover on the target axis.**
 
 ## Scaling: the fixed cost is the whole story
 
