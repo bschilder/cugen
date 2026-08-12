@@ -73,6 +73,7 @@ __all__ = [
     "aggregate_markers", "allele_sequence_codes", "transition_tau",
     "forward_backward_ref", "forward_backward_blocked",
     "dose_dense", "dose_sparse", "build_carriers", "interpolation_weights",
+    "aggregate_mismatch",
     "default_err", "impute_haplotypes",
 ]
 
@@ -173,6 +174,27 @@ def allele_sequence_codes(ref_bits, tgt_bits, starts, stops):
     return ref_codes, tgt_codes
 
 
+def aggregate_mismatch(starts, stops, err):
+    """Mismatch probability per aggregate marker: l * err for l constituents.
+
+    From the paper: "the probability that a HMM state emits a different
+    haplotype is l*eps since the emission of a different allele at any of the l
+    constituent markers will cause a different haplotype to be emitted".
+
+    A union bound, so it is capped at 0.5 -- past that the "mismatch" outcome
+    would be more likely than the match and the emission stops being a
+    likelihood. Dense marker panels with a generous `cluster` reach l > 1/eps
+    more easily than one expects.
+
+    Extracted from impute_haplotypes because it was inline and therefore
+    untested: a mutation replacing l*err with err left the whole suite green.
+    """
+    l = (np.asarray(stops) - np.asarray(starts)).astype(np.float64)
+    if np.any(l < 1):
+        raise ValueError("every aggregate marker needs at least one constituent")
+    return np.minimum(l * float(err), 0.5)
+
+
 def transition_tau(agg_morgans, ne, n_ref_hap):
     """tau_m = 1 - exp(-4 * Ne * d_m / |H|), with d_m in MORGANS.
 
@@ -186,8 +208,8 @@ def transition_tau(agg_morgans, ne, n_ref_hap):
     if np.any(d < 0):
         raise ValueError("aggregate marker positions must be non-decreasing")
     tau = 1.0 - np.exp(-4.0 * float(ne) * d / float(n_ref_hap))
-    tau[0] = 0.0
-    return tau
+    tau[0] = 0.0        # redundant (d[0] is 0, so tau[0] already is) but kept
+    return tau          # as an explicit statement of the boundary condition
 
 
 def _emission(ref_codes_c, tgt_code_t, mism_c):
@@ -476,7 +498,7 @@ def impute_haplotypes(ref_bits, tgt_bits, tgt_idx, marker_cm, *, ne=100_000,
         ref_bits[:, tgt_idx], tgt_bits, starts, stops)
     C = starts.size
     tau = transition_tau(agg_cm / 100.0, ne, K)          # cM -> Morgans
-    mism = np.minimum((stops - starts).astype(np.float64) * err, 0.5)
+    mism = aggregate_mismatch(starts, stops, err)
     tick("aggregate", t0)
 
     t0 = time.perf_counter()
