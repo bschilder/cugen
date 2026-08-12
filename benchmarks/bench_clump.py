@@ -120,8 +120,29 @@ def main():
               f"{int((pv <= 5e-8).sum()):,} genome-wide significant "
               f"({100 * (pv <= 5e-8).mean():.3f}%)")
         ss_path = "/tmp/bench_ss.tsv"
-        pd.DataFrame({"ID": ann["ID"], "P": pv}).to_csv(
-            ss_path, sep="\t", index=False)
+        # SIX significant figures, not full precision. plink echoes P from the
+        # input rounded to 6 sig figs; writing more here makes the two sides
+        # disagree by up to 5e-07 relative on the P column alone and reports
+        # 8,356 "differing" rows that are pure formatting. Everything
+        # substantive -- clumps, TOTAL, bins, SP2 -- already matched.
+        with open(ss_path, "w") as fh:
+            fh.write("ID\tP\n")
+            for i, q in zip(ann["ID"].astype(str), pv):
+                fh.write(f"{i}\t{q:.6g}\n")
+
+    # Warm up the device before ANY timing: CUDA context creation, NVRTC
+    # compilation of the epilogue kernels and the cuDF import are one-time
+    # costs that otherwise land entirely on whichever config runs first. The
+    # first run measured 4.60 s against 0.49 s for a later config doing 10x
+    # more work, which is the signature of exactly that.
+    try:
+        t0 = time.perf_counter()
+        ld_clump(a.cugen, ss_path, annotation=ann.head(2000), p1=1e-4,
+                 backend="gpu", verbose=False)
+        print(f"warm-up (context + kernel compile): "
+              f"{time.perf_counter() - t0:.2f} s, not counted", flush=True)
+    except Exception as e:                                    # noqa: BLE001
+        print(f"warm-up skipped: {type(e).__name__}: {e}", flush=True)
 
     results = []
     # (p1, p2, r2, kb, label)
