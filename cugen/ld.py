@@ -1266,7 +1266,8 @@ def _contiguous_runs(rows):
     return [(int(rows[s]), int(rows[e - 1]) + 1) for s, e in zip(starts, ends)]
 
 
-def _load_packed_rows(reader, rows, bpv, verbose=False):
+def _load_packed_rows(reader, rows, bpv, verbose=False,
+                      chunk_bytes=(192 << 20)):
     """Device array of just the packed rows needed, in ``rows`` order.
 
     Profiling put 96% of standard-GWAS clumping here -- 5.37 s of a 5.62 s run
@@ -1294,7 +1295,7 @@ def _load_packed_rows(reader, rows, bpv, verbose=False):
     # chromosome in one call raises MemoryError on the host while the card sits
     # empty. Each run is therefore fetched in bounded pieces and pushed to the
     # device as it goes, so peak host use is one chunk regardless of file size.
-    chunk_rows = max(1, min(p, (192 << 20) // max(bpv, 1)))
+    chunk_rows = max(1, min(p, chunk_bytes // max(bpv, 1)))
     out = cp.empty((p, bpv), dtype=cp.uint8)
     at = 0
     for lo, hi in runs:

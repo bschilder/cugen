@@ -830,27 +830,35 @@ def test_ranged_read_matches_a_whole_file_read(tmp_path):
 def test_read_is_chunked_so_host_memory_does_not_track_file_size(tmp_path):
     """Host RAM is the binding constraint on GPU pods, not device memory.
 
-    A RunPod A100 came with 2 GB of host RAM against 80 GB of GPU. Since
-    read_packed_bytes copies into host memory, an unchunked whole-file read
-    raises MemoryError on the host while the card sits empty. This checks the
-    chunk bound is actually applied by reading a file whose rows exceed one
-    chunk, and that the result is still exact.
+    Observed RunPod A100s: 2 GB and 944 MB of host RAM against 80 GB of GPU.
+    read_packed_bytes copies into HOST memory, so an unchunked whole-file read
+    raises MemoryError on the host while the card sits empty -- and it presents
+    as unrelated tests dying, because host OOM strikes wherever the next
+    allocation lands rather than where the big one was.
+
+    The chunk bound is injected rather than inferred: forcing the 192 MiB
+    default to bite would need a multi-gigabyte fixture, and a test that cannot
+    afford its own premise is worse than no test.
     """
     import cupy as cp
     from cugen.ld import _load_packed_rows
     from cugen.io import read_cugen
     from cugen.write import write_cugen
     rng = np.random.default_rng(31)
-    # bpv is large enough that (192 MiB / bpv) is a handful of rows, so the
-    # chunk loop genuinely iterates rather than being a single pass.
-    G = rng.integers(0, 3, size=(64, 400_000)).astype(np.uint8)
-    path = str(tmp_path / "big.cugen")
+    G = rng.integers(0, 3, size=(64, 4000)).astype(np.uint8)
+    path = str(tmp_path / "chunked.cugen")
     write_cugen(path, G.T)
     rd = read_cugen(path)
     bpv = int(rd.bytes_per_variant)
-    chunk_rows = max(1, min(64, (192 << 20) // max(bpv, 1)))
-    assert chunk_rows < 64, (
-        f"fixture too small to exercise chunking (chunk_rows={chunk_rows})")
-    got = cp.asnumpy(_load_packed_rows(rd, np.arange(64), bpv))
     want = np.frombuffer(rd.read_packed_bytes(), dtype=np.uint8).reshape(64, bpv)
-    assert np.array_equal(got, want)
+
+    # A chunk of 2 rows forces ~32 iterations over the identity selection.
+    tiny = 2 * bpv
+    assert (tiny // bpv) < 64, "chunk must be smaller than the row count"
+    for rows in (np.arange(64), np.r_[0:10, 40:64], np.array([5])):
+        got = cp.asnumpy(_load_packed_rows(rd, rows, bpv, chunk_bytes=tiny))
+        assert np.array_equal(got, want[rows]), (
+            f"chunked read wrong for {len(rows)} rows")
+        # and the unchunked default must agree with it
+        big = cp.asnumpy(_load_packed_rows(rd, rows, bpv))
+        assert np.array_equal(got, big), "chunking changed the result"
