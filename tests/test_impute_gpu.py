@@ -255,9 +255,15 @@ def test_gpu_tiling_is_transparent():
     cm = np.linspace(0, 3, M)
     kw = dict(ne=scaled_ne(K), cluster=0.005)
     whole = impute_haplotypes_gpu(ref, tgt, tgt_idx, cm, **kw)
+    # The budget must be expressed per AGGREGATE marker (C), not per reference
+    # marker (M). Sizing it with M made the budget ~7x too generous and no
+    # tiling happened -- caught only because the precondition below is asserted
+    # rather than assumed.
+    from cugen._impute_core import aggregate_markers
+    C = aggregate_markers(cm[tgt_idx], 0.005)[0].size
     t = {}
     tiled = impute_haplotypes_gpu(ref, tgt, tgt_idx, cm, timers=t,
-                                  budget_bytes=int(4 * (M * K * 4 + K * 4)),
+                                  budget_bytes=int(4 * (C * K * 4 + K * 4)),
                                   **kw)
-    assert t["t_tile"] < 24, "budget did not actually force tiling"
+    assert t["t_tile"] < 24, f"budget did not force tiling (tile={t['t_tile']})"
     assert np.abs(whole - tiled).max() < 1e-6
