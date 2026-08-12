@@ -224,9 +224,17 @@ def main():
     sh(f"bcftools view -S {W}/reference.txt --force-samples --no-update -Ou "
        f"{panel} "
        f"| bcftools view -m2 -M2 -v snps -Ou "
-       f"| bcftools view -c 1:minor -Oz -o {W}/ref.sites.vcf.gz")
-    sh(f"bcftools index -f -t {W}/ref.sites.vcf.gz")
-    n_ref = int(subprocess.run(f"bcftools index -n {W}/ref.sites.vcf.gz",
+       f"| bcftools view -c 1:minor -Oz -o {W}/reference.vcf.gz")
+    sh(f"bcftools index -f -t {W}/reference.vcf.gz")
+    # The surviving marker POSITIONS, kept separately from the reference panel.
+    # An earlier version cut the target samples out of the reference file
+    # itself, which of course contains only reference samples -- bcftools said
+    # "subsetting has removed all samples" and the script carried on to write an
+    # empty truth file. Marker selection and sample selection have to be two
+    # steps over the FULL panel, not one chained over a subset.
+    sh(f"bcftools query -f '%CHROM\\t%POS\\n' {W}/reference.vcf.gz "
+       f"> {W}/sites.txt")
+    n_ref = int(subprocess.run(f"bcftools index -n {W}/reference.vcf.gz",
                                shell=True, capture_output=True, text=True
                                ).stdout.strip())
     exp = EXPECTED.get(c, {})
@@ -237,10 +245,10 @@ def main():
     sh(f"bcftools query -f '%CHROM\\t%POS\\n' {omni} "
        f"| awk -v c={c} '$1==c || $1==\"chr\"c' | sort -k2,2n -u "
        f"> {W}/omni.chr{c}.pos")
-    sh(f"bcftools view -T {W}/omni.chr{c}.pos -Oz "
-       f"-o {W}/target.sites.vcf.gz {W}/ref.sites.vcf.gz")
-    sh(f"bcftools index -f -t {W}/target.sites.vcf.gz")
-    n_tgt = int(subprocess.run(f"bcftools index -n {W}/target.sites.vcf.gz",
+    # target markers = surviving markers that are also Omni2.5 sites
+    sh(f"awk 'NR==FNR{{a[$1\"_\"$2]=1; next}} ($1\"_\"$2) in a' "
+       f"{W}/omni.chr{c}.pos {W}/sites.txt > {W}/target_sites.txt")
+    n_tgt = int(subprocess.run(f"wc -l < {W}/target_sites.txt",
                                shell=True, capture_output=True, text=True
                                ).stdout.strip())
     print(f"  target markers   : {n_tgt:,}"
@@ -258,17 +266,23 @@ def main():
               "Illumina manifest. A LARGE gap means the filter is wrong.")
 
     # --- build the actual reference / target files --------------------------
-    print("\n=== writing reference and target VCFs ===", flush=True)
-    sh(f"bcftools view -S {W}/reference.txt --force-samples --no-update -Oz "
-       f"-o {W}/reference.vcf.gz {W}/ref.sites.vcf.gz")
-    sh(f"bcftools index -f -t {W}/reference.vcf.gz")
-    sh(f"bcftools view -S {W}/targets.txt --force-samples --no-update -Oz "
-       f"-o {W}/target.masked.vcf.gz {W}/target.sites.vcf.gz")
-    sh(f"bcftools index -f -t {W}/target.masked.vcf.gz")
-    # truth: the target samples at ALL reference markers, for scoring
-    sh(f"bcftools view -S {W}/targets.txt --force-samples --no-update -Oz "
-       f"-o {W}/target.truth.vcf.gz {W}/ref.sites.vcf.gz")
+    print("\n=== writing target VCFs (from the FULL panel) ===", flush=True)
+    # truth: target samples at every surviving marker, for scoring
+    sh(f"bcftools view -S {W}/targets.txt --force-samples --no-update -Ou "
+       f"{panel} | bcftools view -T {W}/sites.txt -Oz "
+       f"-o {W}/target.truth.vcf.gz")
     sh(f"bcftools index -f -t {W}/target.truth.vcf.gz")
+    # masked: the same samples restricted to the Omni2.5 sites
+    sh(f"bcftools view -T {W}/target_sites.txt -Oz "
+       f"-o {W}/target.masked.vcf.gz {W}/target.truth.vcf.gz")
+    sh(f"bcftools index -f -t {W}/target.masked.vcf.gz")
+    for f_, want in ((f"{W}/target.truth.vcf.gz", 52),
+                     (f"{W}/target.masked.vcf.gz", 52),
+                     (f"{W}/reference.vcf.gz", 2452)):
+        got = int(subprocess.run(f"bcftools query -l {f_} | wc -l", shell=True,
+                                 capture_output=True, text=True).stdout)
+        assert got == want, f"{f_} has {got} samples, expected {want}"
+    print(f"  sample counts verified: 52 target, 2,452 reference")
 
     print("\n=== converting to .cugen ===", flush=True)
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
