@@ -394,8 +394,9 @@ def impute(target, *, ref, annotation=None, map=None, out=None,
         if verbose:
             total = time.perf_counter() - t_all
             print(f"[impute] phases: " + "  ".join(
-                f"{k} {v:.2f}s" for k, v in sorted(
-                    timers.items(), key=lambda kv: -kv[1])))
+                f"{k} {v:.2f}s" for k, v in sorted(((k, v) for k, v in timers.items()
+                         if not k.startswith("_")),
+                        key=lambda kv: -kv[1])))
             print(f"[impute] {int((~is_typed).sum()):,} markers imputed, "
                   f"{int(is_typed.sum()):,} genotyped, {total:.2f}s total")
         return frame

@@ -171,13 +171,32 @@ def allele_sequence_codes(ref_bits, tgt_bits, starts, stops):
         cols = np.asarray(starts)[single]
         ref_codes[single] = ref_bits[:, cols].T
         tgt_codes[single] = tgt_bits[:, cols].T
+    # Multi-marker aggregates are NOT rare: at Beagle's cluster=0.005 cM on real
+    # 1000 Genomes data the mean aggregate spans 3.3 markers, so this branch
+    # carries most of the work and measured 17.7s per window through
+    # np.unique(axis=0), which sorts rows via a void view.
+    #
+    # Only EQUALITY of allele sequences matters -- the HMM's emission compares
+    # codes and never orders them -- so any injective encoding will do, and the
+    # sequence of l bits packed into an integer is one. That removes the sort
+    # entirely. Above 31 markers the packed value no longer fits int32, so those
+    # are packed into int64 and then ranked with a 1-D unique, which sorts
+    # scalars rather than rows.
     for c in np.flatnonzero(~single):
         a, b = int(starts[c]), int(stops[c])
-        block = np.concatenate([ref_bits[:, a:b], tgt_bits[:, a:b]], axis=0)
-        _, inv = np.unique(block, axis=0, return_inverse=True)
-        inv = inv.reshape(-1).astype(np.int32)
-        ref_codes[c] = inv[:K]
-        tgt_codes[c] = inv[K:]
+        l = b - a
+        w = (np.int64(1) << np.arange(l, dtype=np.int64))
+        r_pack = (ref_bits[:, a:b].astype(np.int64) * w).sum(axis=1)
+        t_pack = (tgt_bits[:, a:b].astype(np.int64) * w).sum(axis=1)
+        if l <= 31:
+            ref_codes[c] = r_pack.astype(np.int32)
+            tgt_codes[c] = t_pack.astype(np.int32)
+        else:
+            _, inv = np.unique(np.concatenate([r_pack, t_pack]),
+                               return_inverse=True)
+            inv = inv.reshape(-1).astype(np.int32)
+            ref_codes[c] = inv[:K]
+            tgt_codes[c] = inv[K:]
     return ref_codes, tgt_codes
 
 
@@ -352,7 +371,7 @@ def forward_backward_blocked(ref_codes, tgt_codes, tau, mism, block=None,
     return out
 
 
-def build_carriers(ref_bits):
+def build_carriers(ref_bits, chunk=32768):
     """Sparse minor-allele representation of an allele matrix.
 
     ref_bits : (K, M) uint8 0/1
@@ -378,10 +397,16 @@ def build_carriers(ref_bits):
     indptr = np.zeros(M + 1, dtype=np.int64)
     np.cumsum(counts, out=indptr[1:])
     indices = np.empty(int(indptr[-1]), dtype=np.int32)
-    for m in range(M):
-        want = 0 if major[m] == 1 else 1
-        idx = np.flatnonzero(ref_bits[:, m] == want).astype(np.int32)
-        indices[indptr[m]:indptr[m + 1]] = idx
+    # Chunked over markers rather than one Python iteration each: the loop cost
+    # 10.7s per window at chr20 scale. Comparing a (B, K) transposed block
+    # against the per-marker major allele yields a boolean whose nonzero() comes
+    # out ordered by marker, which is exactly CSC order -- no sort needed. The
+    # chunk bounds the temporary; a whole window at once would be 2.4 GiB.
+    for lo in range(0, M, chunk):
+        hi = min(lo + chunk, M)
+        sel = ref_bits[:, lo:hi].T != major[lo:hi][:, None]
+        _, k_idx = np.nonzero(sel)
+        indices[indptr[lo]:indptr[hi]] = k_idx.astype(np.int32)
     return indptr, indices, major
 
 
