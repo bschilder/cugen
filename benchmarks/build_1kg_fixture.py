@@ -143,7 +143,22 @@ def fetch_panel(c, W):
                               text=True)
         if head.returncode == 0:
             print(f"  chromosome {c} release is {v}")
-            return fetch(url, f"{W}/chr{c}.1kg.phase3.{v}.vcf.gz",
+            # Filename records the SOURCE, not just the version. The earlier
+            # name matched the file Beagle's site serves, so a workdir that had
+            # already fetched the filtered copy cache-hit on it and the release
+            # was never downloaded -- the run then reported the filtered
+            # marker counts as though they came from the release.
+            dest = f"{W}/chr{c}.1kg.release.{v}.vcf.gz"
+            expect = int(head.stdout.lower().split("content-length:")[1]
+                         .split()[0]) if "content-length:" in \
+                head.stdout.lower() else None
+            if expect and os.path.exists(dest) and \
+                    os.path.getsize(dest) != expect:
+                print(f"  {os.path.basename(dest)} is "
+                      f"{os.path.getsize(dest):,}B, server says {expect:,}B "
+                      f"-- refetching")
+                os.remove(dest)
+            return fetch(url, dest,
                          fallback=_1KG_EBI + rel.format(c=c, v=v))
         last = url
     raise RuntimeError(f"neither v5a nor v5b exists for chr{c} (tried {last})")
