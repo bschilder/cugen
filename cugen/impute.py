@@ -213,7 +213,7 @@ def impute(target, *, ref, annotation=None, map=None, out=None,
            ne=_DEFAULT_NE, err=None, window=_DEFAULT_WINDOW_CM,
            overlap=_DEFAULT_OVERLAP_CM, cluster=_DEFAULT_CLUSTER_CM,
            chrom=None, block=None, sparse=True, backend="auto", device=0,
-           verbose=True):
+           verbose=True, _timers_out=None):
     """Impute ungenotyped markers into `target` from the phased panel `ref`.
 
     target, ref : paths to PHASED .cugen files (encoding hap2bit)
@@ -228,7 +228,9 @@ def impute(target, *, ref, annotation=None, map=None, out=None,
     DR2 and IMP, matching the INFO fields Beagle writes.
     """
     t_all = time.perf_counter()
-    timers = {}
+    # `_timers_out` lets a caller read the per-phase seconds without parsing
+    # stdout; benchmarks need the phase split, not just the total.
+    timers = {} if _timers_out is None else _timers_out
 
     if backend not in ("auto", "gpu", "numpy"):
         raise ValueError(f"backend must be auto|gpu|numpy, got {backend!r}")
