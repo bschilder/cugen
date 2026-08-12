@@ -397,16 +397,22 @@ def build_carriers(ref_bits, chunk=32768):
     indptr = np.zeros(M + 1, dtype=np.int64)
     np.cumsum(counts, out=indptr[1:])
     indices = np.empty(int(indptr[-1]), dtype=np.int32)
-    # Chunked over markers rather than one Python iteration each: the loop cost
-    # 10.7s per window at chr20 scale. Comparing a (B, K) transposed block
-    # against the per-marker major allele yields a boolean whose nonzero() comes
-    # out ordered by marker, which is exactly CSC order -- no sort needed. The
-    # chunk bounds the temporary; a whole window at once would be 2.4 GiB.
-    for lo in range(0, M, chunk):
-        hi = min(lo + chunk, M)
-        sel = ref_bits[:, lo:hi].T != major[lo:hi][:, None]
-        _, k_idx = np.nonzero(sel)
-        indices[indptr[lo]:indptr[hi]] = k_idx.astype(np.int32)
+    # Transpose once, then walk rows. ref_bits is (K, M) and C-contiguous, so
+    # ref_bits[:, m] strides by M bytes per element and every marker touches K
+    # different cache lines; the transposed copy makes each marker a contiguous
+    # run. Measured on real chr20 data: 22.5s strided against 18.4s transposed
+    # (including the 0.5s transpose).
+    #
+    # A chunked nonzero() over transposed blocks looked like the obvious
+    # vectorisation and is 4.7x SLOWER here -- 106s. It was tried, measured on
+    # synthetic data at ~50% density, correctly rejected, then adopted anyway on
+    # the assumption that real data at 2.6% density would behave differently.
+    # It did not. The synthetic measurement was right both times.
+    refT = np.ascontiguousarray(ref_bits.T)
+    for m in range(M):
+        want = 0 if major[m] == 1 else 1
+        indices[indptr[m]:indptr[m + 1]] = \
+            np.flatnonzero(refT[m] == want).astype(np.int32)
     return indptr, indices, major
 
 
