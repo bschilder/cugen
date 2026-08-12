@@ -160,3 +160,83 @@ allocated a 31,744 x 100,000 plane buffer to hold 4,000 rows. Fixed by
 
 `concordance.parquet` holds 854,850 matched cugen/plink2 pairs behind
 `concordance.png` and `concordance_dprime.png`.
+
+## Clumping (`ld_clump`)
+
+| file | what it is |
+|---|---|
+| `clump_chr22.json` | real 1000 Genomes chr22 (170,949 variants, n=2,504), four configurations vs plink2 |
+| `clump_nscale.json` | sample-axis sweep, p=20,000 held fixed, n = 2,504 → 500,000, on an **A100 SXM 80GB** (the same part as `nscale.json`, so the two curves are comparable) |
+
+Both produced by `../bench_clump.py` and `../clump_nscaling.py`. plink2 is
+v2.0.0-a.7.1 with `--clump-unphased`, which is the only form we can match:
+plink2's default `--clump` uses PHASED r^2 and .cugen discards phase.
+
+### chr22, all four configurations byte-identical to plink2
+
+Identical clump counts, identical index-variant sets, no differing column.
+
+| configuration | candidates | scan | cugen | plink2 |
+|---|---|---|---|---|
+| standard GWAS (p1=1e-4, r2=0.5) | 192 | rectangular | 0.94 s | 0.37 s |
+| loose p1 (p1=0.01) | 1,863 | rectangular | 0.69 s | 2.26 s |
+| C+T, r2=0.2 (p1=1) | 170,949 | banded | 1.12 s | 18.49 s |
+| C+T for PRS (p1=1, r2=0.1) | 170,949 | banded | 0.79 s | 12.60 s |
+
+### Sample axis: where the verdict actually comes from
+
+The prediction going in was that the standard-GWAS loss at n=2,504 was an
+artifact of tiny n and would cross over at biobank scale. **It does not.**
+plink2's clump time is nearly FLAT in n (2.80 -> 6.26 s across a 200x sample
+increase) because `--clump` computes LD only around index variants; cugen's
+grows. That is the opposite of `ld_matrix`, where plink2 must compute all
+pairs and went 0.19 -> 62.6 s over the same range, and it is why the LD result
+does not transfer to clumping.
+
+| samples | standard cugen / plink2 | C+T cugen / plink2 | peak GPU |
+|---|---|---|---|
+| 10,000 | 0.11 / 0.05 s | 0.10 / 3.24 s (31x) | 0.33 GiB |
+| 50,000 | 0.39 / 0.16 s | 0.29 / 3.26 s (11x) | 1.11 GiB |
+| 100,000 | 0.55 / 0.33 s | 0.55 / 3.58 s (6.5x) | 1.22 GiB |
+| 200,000 | 1.11 / 0.45 s | 0.73 / 4.16 s (5.7x) | 1.44 GiB |
+| 500,000 | 3.14 / 1.48 s | 1.96 / 6.26 s (3.2x) | 3.50 GiB |
+
+**Use plink2 for standard clumping; use cugen for C+T.** That is the honest
+recommendation and it does not change with cohort size.
+
+### What the two optimisation passes were worth
+
+Measured on the same A100, same fixtures, so the deltas are real:
+
+| | standard @ 500k | C+T @ 500k | peak @ 500k |
+|---|---|---|---|
+| first working version | 5.83 s | 4.63 s | 16.47 GiB |
+| + moments from packed bytes | 3.40 s | 2.16 s | 16.47 GiB |
+| + data-sized tiles | **3.14 s** | **1.96 s** | **3.50 GiB** |
+
+1. **Moments straight from packed bytes.** Both scans called `_build_dosage`,
+   which materialises three fp32 planes (G, G2, M) to produce two per-variant
+   sums -- ~120 GB of plane writes at p=20,000, n=500,000, for 160 KB of
+   output. Chunking bounded the peak but not the total. Integer accumulation
+   keeps it bit-exact.
+2. **Tiles sized from the data.** `nbr_tile` was 8,192 rows regardless of n,
+   and `_build_g` materialises a tile x n fp32 plane -- a 16.4 GB allocation
+   at n=500,000, which was the whole peak. Candidate tiles were grouped by
+   count alone, so ~20 scattered candidates landed in one tile whose window
+   union was the entire chromosome.
+
+Both are the same underlying mistake -- **a tile constant that ignores a
+dimension it multiplies** -- and it is the third instance of it in this
+module's history, after `_tile_size_for` bounded by memory but not by p.
+
+### Caveats
+
+1. The n=2,504 standard row in `clump_nscale.json` (4.28 s) is warm-up
+   leakage: the warm-up call uses a 500-variant slice, too small to trigger
+   NVRTC compilation of the rectangular kernel, so the first timed
+   configuration still pays it. n=10,000 is the true small-n figure.
+2. plink2's own times drift up to ~2x between runs on identical data and
+   hardware (shared cloud host). Treat individual ratios as approximate and
+   the trend as solid.
+3. Fixture generation dominates the sweep's wall time (280 s at n=500,000)
+   and is excluded from all reported timings.
