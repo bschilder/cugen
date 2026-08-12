@@ -824,3 +824,33 @@ def test_ranged_read_matches_a_whole_file_read(tmp_path):
         got = _load_packed_rows(rd, rows, bpv)
         want = whole[cp.asarray(rows)]
         assert cp.array_equal(got, want), f"mismatch for {len(rows)} rows"
+
+
+@requires_gpu
+def test_read_is_chunked_so_host_memory_does_not_track_file_size(tmp_path):
+    """Host RAM is the binding constraint on GPU pods, not device memory.
+
+    A RunPod A100 came with 2 GB of host RAM against 80 GB of GPU. Since
+    read_packed_bytes copies into host memory, an unchunked whole-file read
+    raises MemoryError on the host while the card sits empty. This checks the
+    chunk bound is actually applied by reading a file whose rows exceed one
+    chunk, and that the result is still exact.
+    """
+    import cupy as cp
+    from cugen.ld import _load_packed_rows
+    from cugen.io import read_cugen
+    from cugen.write import write_cugen
+    rng = np.random.default_rng(31)
+    # bpv is large enough that (192 MiB / bpv) is a handful of rows, so the
+    # chunk loop genuinely iterates rather than being a single pass.
+    G = rng.integers(0, 3, size=(64, 400_000)).astype(np.uint8)
+    path = str(tmp_path / "big.cugen")
+    write_cugen(path, G.T)
+    rd = read_cugen(path)
+    bpv = int(rd.bytes_per_variant)
+    chunk_rows = max(1, min(64, (192 << 20) // max(bpv, 1)))
+    assert chunk_rows < 64, (
+        f"fixture too small to exercise chunking (chunk_rows={chunk_rows})")
+    got = cp.asnumpy(_load_packed_rows(rd, np.arange(64), bpv))
+    want = np.frombuffer(rd.read_packed_bytes(), dtype=np.uint8).reshape(64, bpv)
+    assert np.array_equal(got, want)

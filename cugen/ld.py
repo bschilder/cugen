@@ -1288,18 +1288,24 @@ def _load_packed_rows(reader, rows, bpv, verbose=False):
               f"{total * bpv / 2**30:.2f} GiB (whole file is "
               f"{nv * bpv / 2**30:.2f} GiB)")
 
-    if len(runs) == 1 and runs[0] == (0, nv) and p == nv:
-        # Whole file wanted: one read, no gather, no second buffer.
-        buf = np.frombuffer(reader.read_packed_bytes(), dtype=np.uint8)
-        return cp.asarray(buf).reshape(nv, bpv)
-
+    # HOST memory is the binding constraint here, not device memory. A RunPod
+    # A100 pod was observed with 2 GB of host RAM against 80 GB of GPU:
+    # read_packed_bytes copies into host memory, so pulling a 2.33 GiB
+    # chromosome in one call raises MemoryError on the host while the card sits
+    # empty. Each run is therefore fetched in bounded pieces and pushed to the
+    # device as it goes, so peak host use is one chunk regardless of file size.
+    chunk_rows = max(1, min(p, (192 << 20) // max(bpv, 1)))
     out = cp.empty((p, bpv), dtype=cp.uint8)
     at = 0
     for lo, hi in runs:
-        buf = np.frombuffer(reader.read_packed_bytes(lo, hi), dtype=np.uint8)
-        k = hi - lo
-        out[at:at + k] = cp.asarray(buf).reshape(k, bpv)
-        at += k
+        for c0 in range(lo, hi, chunk_rows):
+            c1 = min(c0 + chunk_rows, hi)
+            buf = np.frombuffer(reader.read_packed_bytes(c0, c1),
+                                dtype=np.uint8)
+            k = c1 - c0
+            out[at:at + k] = cp.asarray(buf).reshape(k, bpv)
+            at += k
+            del buf
     return out
 
 
