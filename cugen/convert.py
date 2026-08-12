@@ -229,7 +229,7 @@ if __name__ == "__main__":
 
 
 def vcf2cugenh(vcf, out, region=None, keep=None, gidx_start=0,
-               require_phased=True, verbose=True):
+               gidx=None, require_phased=True, verbose=True):
     """PHASED VCF/BCF -> phased .cugen (ENCODING_HAP2BIT).
 
     The counterpart of vcf2cugen for haplotype data. Every genotype must be
@@ -246,6 +246,13 @@ def vcf2cugenh(vcf, out, region=None, keep=None, gidx_start=0,
     Multi-allelic records are skipped: hap2bit stores one bit per haplotype and
     so is biallelic by construction. Split them first with
     `bcftools norm -m -any` if you need them.
+
+    `gidx` gives an explicit global index per written record, which matters
+    whenever this file will be matched against another: cugen.impute pairs a
+    target with its reference THROUGH gidx, so numbering each file 0..n-1
+    independently silently aligns target marker 0 with reference marker 0 and
+    shifts every marker after it. Nothing fails; the imputation simply uses the
+    wrong reference markers.
     """
     try:
         from cyvcf2 import VCF
@@ -296,6 +303,12 @@ def vcf2cugenh(vcf, out, region=None, keep=None, gidx_start=0,
         raise ValueError(f"{vcf}: no biallelic records"
                          f"{f' in {region}' if region else ''}")
 
+    if gidx is not None:
+        gidx = np.asarray(gidx, dtype=np.int64)
+        if gidx.size != n_var:
+            raise ValueError(
+                f"gidx has {gidx.size} entries but {n_var} biallelic records "
+                f"will be written")
     v = _open()
     k = 0
     with CugenWriter(out, n_samples, n_var, ENCODING_HAP2BIT) as w:
@@ -345,7 +358,8 @@ def vcf2cugenh(vcf, out, region=None, keep=None, gidx_start=0,
                         f"observed, and the panel would still impute and still "
                         f"look correct. Phase first, or pass "
                         f"require_phased=False if you know what you are doing.")
-            w.add_variant_phased(gidx_start + k, a.astype(np.uint8))
+            g = gidx_start + k if gidx is None else int(gidx[k])
+            w.add_variant_phased(g, a.astype(np.uint8))
             k += 1
             if verbose:
                 _progress(k, n_var)

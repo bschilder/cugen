@@ -265,5 +265,5 @@ def test_gpu_tiling_is_transparent():
     tiled = impute_haplotypes_gpu(ref, tgt, tgt_idx, cm, timers=t,
                                   budget_bytes=int(4 * (C * K * 4 + K * 4)),
                                   **kw)
-    assert t["t_tile"] < 24, f"budget did not force tiling (tile={t['t_tile']})"
+    assert t["_t_tile_count"] < 24, f"budget did not force tiling (tile={t['t_tile']})"
     assert np.abs(whole - tiled).max() < 1e-6

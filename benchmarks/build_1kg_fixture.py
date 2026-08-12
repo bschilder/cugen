@@ -283,9 +283,14 @@ def main():
     # --- build the actual reference / target files --------------------------
     print("\n=== writing target VCFs (from the FULL panel) ===", flush=True)
     # truth: target samples at every surviving marker, for scoring
+    # -T matches on POSITION, and a multi-allelic site contributes several rows
+    # at the same position in the full panel, so the same biallelic-SNV filter
+    # has to be reapplied here. Without it the truth file came out with 1,326
+    # more records than the reference and every downstream position join was
+    # off. The assertion below is what caught it.
     sh(f"bcftools view -S {W}/targets.txt --force-samples --no-update -Ou "
-       f"{panel} | bcftools view -T {W}/sites.txt -Oz "
-       f"-o {W}/target.truth.vcf.gz")
+       f"{panel} | bcftools view -m2 -M2 -v snps -Ou "
+       f"| bcftools view -T {W}/sites.txt -Oz -o {W}/target.truth.vcf.gz")
     sh(f"bcftools index -f -t {W}/target.truth.vcf.gz")
     # masked: the same samples restricted to the Omni2.5 sites
     sh(f"bcftools view -T {W}/target_sites.txt -Oz "
@@ -299,31 +304,44 @@ def main():
         assert got == want, f"{f_} has {got} samples, expected {want}"
     print(f"  sample counts verified: 52 target, 2,452 reference")
 
-    print("\n=== converting to .cugen ===", flush=True)
+    print("\n=== marker index alignment ===", flush=True)
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from cugen.convert import vcf2cugenh
-    vcf2cugenh(f"{W}/reference.vcf.gz", f"{W}/reference.cugen", verbose=True)
-    vcf2cugenh(f"{W}/target.masked.vcf.gz", f"{W}/target.cugen", verbose=True)
-
-    # gidx must be the REFERENCE marker index for both files, since impute()
-    # matches target to reference through gidx. Writing 0..n-1 into each
-    # independently would silently align target marker 0 with reference marker
-    # 0 and shift everything after it.
     import numpy as np
-    ref_pos = subprocess.run(
-        f"bcftools query -f '%POS\\n' {W}/reference.vcf.gz", shell=True,
-        capture_output=True, text=True).stdout.split()
-    tgt_pos = subprocess.run(
-        f"bcftools query -f '%POS\\n' {W}/target.masked.vcf.gz", shell=True,
-        capture_output=True, text=True).stdout.split()
-    ref_pos = np.asarray(ref_pos, dtype=np.int64)
-    tgt_pos = np.asarray(tgt_pos, dtype=np.int64)
-    gidx = np.searchsorted(ref_pos, tgt_pos)
-    assert np.array_equal(ref_pos[gidx], tgt_pos), \
+    from cugen.convert import vcf2cugenh
+
+    def positions(f_):
+        return np.asarray(subprocess.run(
+            ["bcftools", "query", "-f", "%POS\n", f_], capture_output=True,
+            text=True, check=True).stdout.split(), dtype=np.int64)
+
+    ref_pos = positions(f"{W}/reference.vcf.gz")
+    tgt_pos = positions(f"{W}/target.masked.vcf.gz")
+    truth_pos = positions(f"{W}/target.truth.vcf.gz")
+    assert np.array_equal(truth_pos, ref_pos), (
+        f"truth has {truth_pos.size:,} markers, reference {ref_pos.size:,}; "
+        f"they must be the same marker set for scoring")
+    tgt_gidx = np.searchsorted(ref_pos, tgt_pos)
+    assert np.array_equal(ref_pos[tgt_gidx], tgt_pos), \
         "target positions are not a subset of reference positions"
+    print(f"  ref {ref_pos.size:,}  target {tgt_pos.size:,}  "
+          f"gidx {tgt_gidx[:3].tolist()}...{tgt_gidx[-1]}")
+
+    print("\n=== converting to .cugen ===", flush=True)
+    # gidx MUST be the reference marker index in the target file too.
+    # cugen.impute pairs the two files through gidx, so numbering the target
+    # 0..n-1 aligns its first marker with the reference's first marker and
+    # shifts everything after. Nothing fails: the run completes, every target
+    # marker lands in the first window, and the imputation is nonsense.
+    vcf2cugenh(f"{W}/reference.vcf.gz", f"{W}/reference.cugen", verbose=True)
+    vcf2cugenh(f"{W}/target.masked.vcf.gz", f"{W}/target.cugen",
+               gidx=tgt_gidx, verbose=True)
+    from cugen.io import CugenReader
+    with CugenReader(f"{W}/target.cugen") as _r:
+        assert np.array_equal(_r.gidx, tgt_gidx), "gidx did not reach the file"
+    print("  target gidx verified against the reference index")
+
     np.save(f"{W}/ref_pos.npy", ref_pos)
-    np.save(f"{W}/tgt_gidx.npy", gidx)
-    print(f"  ref_pos {ref_pos.size:,}  tgt_gidx {gidx.size:,}  -> {W}")
+    np.save(f"{W}/tgt_gidx.npy", tgt_gidx)
 
     import json
     # Pin the sample draw. Browning et al. state only that two individuals per

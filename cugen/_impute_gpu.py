@@ -416,5 +416,8 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
         out[lo:hi] = cp.asnumpy(d)
         del post, d
         cp.get_default_memory_pool().free_all_blocks()
-    t["t_tile"] = tile
+    # NOT in the seconds dict: it is a count, and it printed as
+    # "t_tile 104.00s" at the top of the phase table, which reads
+    # exactly like the dominant cost.
+    t["_t_tile_count"] = tile
     return out
