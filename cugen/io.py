@@ -49,6 +49,18 @@ FLAG_HAS_MISSING = 1
 FLAG_HAS_GIDX_MAP = 2
 FLAG_PHASED = 4
 
+# Indexed by the header's encoding field. A dict rather than a list because an
+# unfamiliar encoding should read back as "unknown(7)" from a forward-written
+# file, not raise IndexError from inside a header reader.
+_ENCODING_NAMES = {ENCODING_2BIT: "2bit", ENCODING_UINT8: "uint8",
+                   ENCODING_FLOAT16: "float16", ENCODING_FLOAT32: "float32",
+                   ENCODING_HAP2BIT: "hap2bit"}
+
+
+def encoding_name(enc):
+    return _ENCODING_NAMES.get(int(enc), f"unknown({int(enc)})")
+
+
 # These constants are duplicated in write.py rather than imported, to keep io.py
 # free of an import from a module that __init__ loads after it. Drift between
 # the two copies would misread files rather than fail, so
@@ -484,7 +496,8 @@ class CugenReader:
         return {
             'path': self.path,
             'version': self.version,
-            'encoding': ['2bit', 'uint8', 'float16', 'float32'][self.encoding],
+            'encoding': encoding_name(self.encoding),
+            'phased': self.phased,
             'n_samples': self.n_samples,
             'n_variants': self.n_variants,
             'bytes_per_variant': self.bytes_per_variant,
@@ -642,9 +655,9 @@ def read_cugen_header(path: str) -> dict:
     return {
         'path': path,
         'version': struct.unpack_from('<I', header, 8)[0],
-        'encoding': ['2bit', 'uint8', 'float16', 'float32'][
-            struct.unpack_from('<I', header, 12)[0]
-        ],
+        'encoding': encoding_name(struct.unpack_from('<I', header, 12)[0]),
+        'flags': struct.unpack_from('<I', header, 64)[0],
+        'phased': bool(struct.unpack_from('<I', header, 64)[0] & FLAG_PHASED),
         'n_samples': struct.unpack_from('<Q', header, 16)[0],
         'n_variants': struct.unpack_from('<Q', header, 24)[0],
         'bytes_per_variant': struct.unpack_from('<Q', header, 32)[0],
