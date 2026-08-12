@@ -699,3 +699,55 @@ def test_variant_moments_kernel_is_exact():
             f"sum(g) wrong at n={n}"
         assert np.array_equal(cp.asnumpy(q).astype(np.int64), want_q), \
             f"sum(g*g) wrong at n={n}"
+
+
+# ---------------------------------------------------------------------------
+# candidate tiling. Pure position arithmetic, so it is testable without a GPU,
+# and it is what stops scattered candidates dragging one tile across a
+# chromosome.
+# ---------------------------------------------------------------------------
+def test_scattered_candidates_do_not_share_one_tile():
+    """The regression that made the rectangular scan slow.
+
+    Candidates 20 Mb apart have disjoint windows; grouping them into one tile
+    makes its union span everything between them, so the scan evaluates the
+    whole range for every candidate in the tile.
+    """
+    from cugen.ld import _plan_cand_tiles
+    pos = np.arange(20000, dtype=np.int64) * 1000        # 1 variant per kb
+    cand = np.array([100, 5000, 10000, 15000, 19000])    # far apart
+    tiles = _plan_cand_tiles(cand, pos, span=250_000, max_cands=256,
+                             row_budget=4096)
+    assert len(tiles) == len(cand), (
+        f"{len(cand)} scattered candidates collapsed into {len(tiles)} tile(s)")
+
+
+def test_clustered_candidates_do_share_a_tile():
+    """The other half: candidates inside one window SHOULD batch, or the scan
+    rebuilds the same neighbour plane once per candidate."""
+    from cugen.ld import _plan_cand_tiles
+    pos = np.arange(20000, dtype=np.int64) * 1000
+    cand = np.array([5000, 5010, 5020, 5030])            # within 250 kb
+    tiles = _plan_cand_tiles(cand, pos, span=250_000, max_cands=256,
+                             row_budget=4096)
+    assert len(tiles) == 1, f"clustered candidates split into {len(tiles)} tiles"
+
+
+def test_tiles_partition_the_candidates_in_order():
+    from cugen.ld import _plan_cand_tiles
+    rng = np.random.default_rng(2)
+    pos = np.sort(rng.choice(np.arange(1, 30_000_000), size=8000,
+                             replace=False))
+    cand = np.sort(rng.choice(8000, size=200, replace=False))
+    tiles = _plan_cand_tiles(cand, pos, 250_000, 256, 4096)
+    assert np.array_equal(np.concatenate(tiles), cand)
+    assert all(len(t) for t in tiles)
+
+
+def test_tile_count_is_bounded_by_max_cands():
+    from cugen.ld import _plan_cand_tiles
+    pos = np.arange(50000, dtype=np.int64) * 10          # very dense
+    cand = np.arange(0, 1000)                            # all in one window
+    tiles = _plan_cand_tiles(cand, pos, 250_000, max_cands=64,
+                             row_budget=10**9)
+    assert max(len(t) for t in tiles) <= 64

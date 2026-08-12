@@ -1248,8 +1248,35 @@ def _variant_moments(packed, p, ns, bpv):
     return s_v, q_v
 
 
+def _plan_cand_tiles(cand, pos, span, max_cands, row_budget):
+    """Group candidates into tiles whose window UNION stays bounded.
+
+    Tiling by count alone is pessimal exactly where the rectangular scan is
+    meant to win. Standard-GWAS candidates are scattered, so ~20 of them
+    across 20 Mb land in a single tile whose union window is the whole
+    chromosome -- scanning ~400,000 pairs to answer a question needing
+    ~10,000, and building fp32 planes over every row on the way. Breaking a
+    tile once its union exceeds ``row_budget`` keeps the scanned area
+    proportional to the work rather than to how far apart the hits happen to
+    be.
+    """
+    tiles = []
+    i = 0
+    while i < len(cand):
+        lo = int(np.searchsorted(pos, pos[cand[i]] - span, "left"))
+        j = i + 1
+        while j < len(cand) and (j - i) < max_cands:
+            hi_try = int(np.searchsorted(pos, pos[cand[j]] + span, "right"))
+            if hi_try - lo > row_budget:
+                break
+            j += 1
+        tiles.append(cand[i:j])
+        i = j
+    return tiles
+
+
 def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
-                          tf32, verbose, cand_tile=256, nbr_tile=8192):
+                          tf32, verbose, cand_tile=256, nbr_tile=None):
     """Edges between index CANDIDATES and their kb windows. Device-resident.
 
     Complexity is O(n_candidates * window) rather than O(p * window), which is
@@ -1257,9 +1284,14 @@ def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
     band. On real chr22 at standard thresholds that is 168 candidates instead
     of 170,949 variants.
 
-    Candidates are processed in position order, so each tile's windows union
-    into ONE contiguous row range -- searchsorted gives its bounds, and the
-    neighbour side is then a plain contiguous block build, no gather.
+    Two quantities are sized from the data rather than fixed, both of which
+    were constants that misbehaved at biobank sample counts:
+
+    * ``nbr_tile`` comes from a memory budget. It was 8,192 rows regardless of
+      n, and _build_g materialises a tile x n_samples fp32 plane -- 16.4 GB at
+      n = 500,000, which accounted for the entire observed peak.
+    * candidate tiles are bounded by their window UNION rather than by count
+      alone; see :func:`_plan_cand_tiles`.
     """
     ns = int(reader.n_samples)
     bpv = int(reader.bytes_per_variant)
@@ -1288,10 +1320,25 @@ def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
     lo_all = np.searchsorted(pos, pos[cand] - span, side="left")
     hi_all = np.searchsorted(pos, pos[cand] + span, side="right")
     planned = int((hi_all - lo_all).sum())
+
+    # Size the neighbour tile from a MEMORY budget: _build_g materialises a
+    # tile x n_samples fp32 plane, so a constant row count silently becomes
+    # 16.4 GB at n = 500,000. Cap the plane near 1 GiB.
+    if nbr_tile is None:
+        nbr_tile = int(max(256, min(8192, (1 << 30) // max(ns * 4, 1))))
+    # Bound a candidate tile's window union too, so scattered candidates do
+    # not drag one tile across the whole chromosome.
+    row_budget = max(int(4 * np.median(hi_all - lo_all)), 4 * nbr_tile, 4096)
+    tiles = _plan_cand_tiles(cand, pos, span, cand_tile, row_budget)
+    scanned = sum(len(t) * (int(np.searchsorted(pos, pos[t[-1]] + span, "right"))
+                            - int(np.searchsorted(pos, pos[t[0]] - span, "left")))
+                  for t in tiles)
     if verbose:
-        print(f"[clump] rectangular scan: {len(cand):,} candidates x "
-              f"~{planned / max(len(cand), 1):,.0f} window = {planned:,} pair "
-              f"evaluations (banded would be ~{p * (hi_all - lo_all).max():,})")
+        print(f"[clump] rectangular scan: {len(cand):,} candidates in "
+              f"{len(tiles):,} tile(s), nbr_tile={nbr_tile:,} rows "
+              f"({nbr_tile * ns * 4 / 2**30:.2f} GiB plane); "
+              f"{scanned:,} pair evaluations "
+              f"(ideal {planned:,}, banded ~{p * (hi_all - lo_all).max():,})")
 
     def run(capacity):
         out_i = cp.empty(capacity, dtype=cp.int64)
@@ -1299,8 +1346,12 @@ def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
         out_r = cp.empty(capacity, dtype=cp.float32)
         counter = cp.zeros(1, dtype=cp.uint64)
         with _Tf32(tf32):
-            for c0 in range(0, len(cand), cand_tile):
-                cs = cand[c0:c0 + cand_tile]
+            # One reusable neighbour plane for the whole scan. A fresh
+            # tile x n allocation per neighbour block costs about as much as
+            # the unpack kernel itself -- the same finding that put buffer
+            # reuse into the banded scan.
+            bufB = cp.empty((nbr_tile, ns), dtype=cp.float32)
+            for cs in tiles:
                 rows_d = cp.asarray(cs.astype(np.int64))
                 # gather is tiny: |tile| x bytes_per_variant
                 Ga = _build_g(packed[cp.asarray(cs)], 0, len(cs), ns, bpv)
@@ -1309,7 +1360,8 @@ def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
                 hi = int(np.searchsorted(pos, pos[cs[-1]] + span, "right"))
                 for j0 in range(lo, hi, nbr_tile):
                     j1 = min(j0 + nbr_tile, hi)
-                    Gb = _build_g(packed, j0, j1, ns, bpv)
+                    Gb = _build_g(packed, j0, j1, ns, bpv,
+                                  out=bufB[:j1 - j0])
                     S = Ga @ Gb.T
                     bi, bj = len(cs), j1 - j0
                     nthread = bi * bj
@@ -1319,8 +1371,9 @@ def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
                           pos_d, np.int64(span), is_cand_d,
                           np.float32(r2_thresh), out_i, out_j, out_r,
                           counter, np.int64(capacity)))
-                    del S, Gb
+                    del S
                 del Ga
+        del bufB
         return out_i, out_j, out_r, int(counter[0])
 
     cap = max(1 << 16, min(int(50e6), planned // 4 + 1024))
