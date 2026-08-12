@@ -914,6 +914,60 @@ void clump_assign(const int* eu, const int* ev, const int* rank,
     if (is_index[b] && !is_index[a]) atomicMin(&best[a], rank[b]);
 }
 
+/* Per-variant sums read straight from the 2-bit packed bytes.
+
+   The moments pre-pass called _build_dosage, which materialises THREE fp32
+   planes (G, G2, M) of chunk x n_samples purely to produce two per-variant
+   sums. At n = 500,000 with p = 20,000 that is ~120 GB of plane writes to
+   compute 160 KB of output, and it dominated standard-GWAS clumping.
+
+   Accumulation is in INTEGERS, so this stays bit-exact rather than merely
+   close: sum(g) <= 2n and sum(g*g) <= 4n, both exactly representable in fp32
+   while 4n < 2^24 -- the bound the rest of the module already relies on. The
+   header's mu_x/sxx would be cheaper still, but sxx is stored as float32 and
+   reconstructing sum(g*g) from it would inject rounding into quantities this
+   module guarantees are exact.
+
+   One block per variant; threads stride over samples and reduce in shared
+   memory. */
+extern "C" __global__
+void variant_moments(const unsigned char* __restrict__ packed,
+                     float* __restrict__ s_out, float* __restrict__ q_out,
+                     const long long n_samples, const long long n_variants,
+                     const long long bytes_per_variant)
+{
+    long long v = (long long)blockIdx.x;
+    if (v >= n_variants) return;
+    const unsigned char* row = packed + v * bytes_per_variant;
+
+    long long s = 0, q = 0;
+    for (long long i = (long long)threadIdx.x; i < n_samples;
+         i += (long long)blockDim.x) {
+        unsigned char byte = row[i >> 2];
+        int code = (byte >> (6 - 2 * (i & 3))) & 3;   /* big-endian in byte */
+        int g = (code == 3) ? 0 : code;               /* missing -> 0       */
+        s += g;
+        q += g * g;
+    }
+
+    __shared__ long long sh_s[256];
+    __shared__ long long sh_q[256];
+    sh_s[threadIdx.x] = s;
+    sh_q[threadIdx.x] = q;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride) {
+            sh_s[threadIdx.x] += sh_s[threadIdx.x + stride];
+            sh_q[threadIdx.x] += sh_q[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        s_out[v] = (float)sh_s[0];
+        q_out[v] = (float)sh_q[0];
+    }
+}
+
 /* RECTANGULAR epilogue: index CANDIDATES against their windows, instead of
    every relevant variant against every other.
 
@@ -1178,6 +1232,22 @@ def _clumps_from_pairs(is_index, rank, a, b):
     return [(int(i), members[int(i)]) for i in order]
 
 
+def _variant_moments(packed, p, ns, bpv):
+    """Per-variant sum(g) and sum(g*g), straight from packed bytes.
+
+    Replaces a pre-pass that built three fp32 planes per chunk to produce two
+    per-variant sums. Integer accumulation keeps it bit-exact; the caller must
+    already have established the file has no missing calls (both fused paths
+    require that), since missing is folded to dosage 0 here.
+    """
+    s_v = cp.empty(p, dtype=cp.float32)
+    q_v = cp.empty(p, dtype=cp.float32)
+    _get_clump_module().get_function("variant_moments")(
+        (int(p),), (256,),
+        (packed, s_v, q_v, np.int64(ns), np.int64(p), np.int64(bpv)))
+    return s_v, q_v
+
+
 def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
                           tf32, verbose, cand_tile=256, nbr_tile=8192):
     """Edges between index CANDIDATES and their kb windows. Device-resident.
@@ -1206,16 +1276,7 @@ def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
     packed = packed.reshape(int(reader.n_variants), bpv)[cp.asarray(rows)]
 
     # Per-variant moments once, streamed -- identical to the banded scan.
-    s_v = cp.empty(p, dtype=cp.float32)
-    q_v = cp.empty(p, dtype=cp.float32)
-    chunk = max(1, min(p, int(2e8 // max(ns, 1))))
-    for c0 in range(0, p, chunk):
-        c1 = min(c0 + chunk, p)
-        Gc, G2c, _M = _build_dosage(packed, cp.arange(c0, c1), ns, bpv)
-        s_v[c0:c1] = Gc.sum(axis=1, dtype=cp.float32)
-        q_v[c0:c1] = G2c.sum(axis=1, dtype=cp.float32)
-        del Gc, G2c, _M
-    cp.get_default_memory_pool().free_all_blocks()
+    s_v, q_v = _variant_moments(packed, p, ns, bpv)
 
     pos_d = cp.asarray(pos)
     is_cand_d = cp.zeros(p, dtype=cp.uint8)
@@ -2096,20 +2157,14 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
     packed = cp.asarray(np.frombuffer(reader.read_packed_bytes(), dtype=np.uint8))
     packed = packed.reshape(int(reader.n_variants), bpv)[cp.asarray(rows)]
 
-    # Per-variant moments in one streamed pass. Materialising G/G2/M for all
-    # p variants would be 3 * p * n * 4 bytes -- 48 GB at p=4000, n=1e6 --
-    # before a single tile runs. s_v and q_v are only p floats each, and the
-    # GEMM only ever needs G for the two blocks in play.
-    s_v = cp.empty(p, dtype=cp.float32)
-    q_v = cp.empty(p, dtype=cp.float32)
-    chunk = max(1, min(p, int(2e8 // max(ns, 1))))
-    for c0 in range(0, p, chunk):
-        c1 = min(c0 + chunk, p)
-        Gc, G2c, _Mc = _build_dosage(packed, cp.arange(c0, c1), ns, bpv)
-        s_v[c0:c1] = Gc.sum(axis=1, dtype=cp.float32)
-        q_v[c0:c1] = G2c.sum(axis=1, dtype=cp.float32)
-        del Gc, G2c, _Mc
-    cp.get_default_memory_pool().free_all_blocks()
+    # Per-variant moments straight from the packed bytes. This previously
+    # streamed chunks through _build_dosage, which materialises G, G2 and M --
+    # three fp32 planes -- to produce two per-variant sums. Chunking bounded
+    # the PEAK but not the total work: ~120 GB of plane writes at p=20,000,
+    # n=500,000 to compute 160 KB of output, and it dominated the run at large
+    # n. The kernel reads the 2-bit data once, writes only the sums, and stays
+    # bit-exact by accumulating in integers.
+    s_v, q_v = _variant_moments(packed, p, ns, bpv)
 
     def run(capacity):
         # Set the cuBLAS math mode ONCE for the whole scan. Doing it per GEMM

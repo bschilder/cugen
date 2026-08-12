@@ -667,3 +667,35 @@ def test_rectangular_scan_matches_plink2_golden(tmp_path, monkeypatch):
     for c in [x for x in PARITY_COLS if x != "P"]:
         assert (a[c].astype(str).to_numpy() == b[c].astype(str).to_numpy()).all(), \
             f"column {c} differs from plink2 on the rectangular path"
+
+
+@requires_gpu
+def test_variant_moments_kernel_is_exact():
+    """The moments kernel replaced a pre-pass that built three fp32 planes to
+    produce two per-variant sums. It must be EXACT, not merely close: the
+    whole module rests on the contingency data being exact integers, and these
+    sums feed the r denominator.
+    """
+    import cupy as cp
+    from cugen.ld import _variant_moments
+    from cugen.io import read_cugen
+    from cugen.write import write_cugen
+    import tempfile, os
+    rng = np.random.default_rng(21)
+    for n, p in ((200, 30), (1000, 64), (4001, 40)):     # 4001: ragged tail
+        G = rng.integers(0, 3, size=(p, n)).astype(np.uint8)
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "m.cugen")
+        write_cugen(path, G.T)
+        rd = read_cugen(path)
+        packed = cp.asarray(np.frombuffer(rd.read_packed_bytes(),
+                                          dtype=np.uint8))
+        packed = packed.reshape(int(rd.n_variants), int(rd.bytes_per_variant))
+        s, q = _variant_moments(packed, p, int(rd.n_samples),
+                                int(rd.bytes_per_variant))
+        want_s = G.sum(axis=1, dtype=np.int64)
+        want_q = (G.astype(np.int64) ** 2).sum(axis=1)
+        assert np.array_equal(cp.asnumpy(s).astype(np.int64), want_s), \
+            f"sum(g) wrong at n={n}"
+        assert np.array_equal(cp.asnumpy(q).astype(np.int64), want_q), \
+            f"sum(g*g) wrong at n={n}"
