@@ -107,6 +107,28 @@ only honest statement today is that cugen loses at 52 targets and that its cost
 per target falls 82x between 32 and 8,192 haplotypes. Measuring Beagle across
 the same target axis is the next thing to do.
 
+## Two parameters, settled by running Beagle rather than reading about it
+
+Both disagreed between the 2018 paper and the 5.5 manual.
+
+**`overlap`** — paper 4 cM, manual 2.0. Beagle's own chr20 windows convert to
+[-0.00, 39.99], [37.99, 77.99] and [75.99, 108.29] cM: **overlap 2.00 cM,
+window 40.00**, so the manual is right. cugen produced [-0.0, 40.0],
+[38.0, 78.0], [76.0, 116.0] on the same map — an independent check on the
+windowing as well as on the default.
+
+**`err`** — paper a flat 1e-4, manual `theta/(2(theta+H))` with
+`theta = 1/(0.5 + ln H)`, which is 1.133e-05 at H = 4,904. Imputing under both
+and comparing against Beagle's output over 1,733,484 shared markers:
+
+| err | corr with Beagle | mean abs diff |
+|---|---|---|
+| 1.133e-05 (manual formula) | **0.999014** | **0.000596** |
+| 1.0e-04 (paper constant) | 0.998637 | 0.000739 |
+
+The manual's formula agrees more closely on both metrics and is the default.
+The margin is small, so this is evidence rather than proof.
+
 ## What optimisation actually achieved, and what it cost
 
 | | seconds | note |
