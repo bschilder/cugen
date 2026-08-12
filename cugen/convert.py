@@ -303,10 +303,18 @@ def vcf2cugenh(vcf, out, region=None, keep=None, gidx_start=0,
             if not _biallelic(rec):
                 continue
             if backend == "cyvcf2":
-                g = rec.genotypes                    # [a1, a2, phased] per sample
-                arr = np.asarray(g, dtype=np.int64)
-                a = arr[:, :2]
-                phased = arr[:, 2].astype(bool)
+                # rec.genotype.array() hands back a numpy array directly;
+                # rec.genotypes builds a Python list-of-lists per record, and
+                # np.asarray on it dominates the whole conversion at
+                # chromosome scale. Same layout either way: allele columns
+                # then a phase flag, with -1 for missing.
+                ga = getattr(rec, "genotype", None)
+                if ga is not None and hasattr(ga, "array"):
+                    arr = ga.array()
+                else:
+                    arr = np.asarray(rec.genotypes, dtype=np.int16)
+                a = arr[:, :2].astype(np.int64, copy=False)
+                phased = arr[:, -1].astype(bool)
             else:
                 a = np.empty((len(rec.samples), 2), dtype=np.int64)
                 phased = np.empty(len(rec.samples), dtype=bool)
