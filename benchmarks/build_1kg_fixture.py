@@ -18,9 +18,14 @@ silently did not exercise what they were meant to.
      Omni2.5 array, resulting in 72,973 target markers on chromosome 14 and
      54,885 target markers on chromosome 20."
 
-Everything is pulled from Browning's own host so there is no build ambiguity.
-The LD work lost time to exactly that: an S3 mirror carried 1000 Genomes v5a
-while EBI carried v5b, and the URL in use pointed at the wrong one.
+Data sources are chosen deliberately, and the obvious choice is wrong. Beagle's
+own site hosts a 1000 Genomes panel that looks like the right input and is
+already filtered: on chr20 it carries 679,241 markers against the release's
+much larger set, and running the paper's filters over it lands 64% short. Use
+the 1000 Genomes RELEASE for genotypes and Beagle's site only for the genetic
+map. Chromosome files are versioned v5a or v5b and which one exists varies by
+chromosome, so both are probed rather than assumed -- a previous project here
+shipped a URL naming the version its mirror did not carry.
 
     python benchmarks/build_1kg_fixture.py --chrom 20 --workdir /root/fix
 """
