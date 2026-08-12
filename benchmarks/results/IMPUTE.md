@@ -127,6 +127,22 @@ has since moved off the host.
 
 - **Beagle with a bref3 panel.** Required before any two-pipeline wall-clock
   number here is worth stating. Expect Beagle to get faster.
+- **A pipeline comparison from a common starting artifact.**
+- **Either scaling axis, for Beagle.** `benchmarks/target_axis.py` and
+  `benchmarks/panel_axis.py` exist to fix this by running Beagle 5.5 directly.
+  Until they have, nothing here says how Beagle scales.
+
+  Note on what is NOT usable as a substitute: Browning et al. (2018) publish
+  Beagle scaling sublinearly in panel size (1,000x the reference samples for 11x
+  the time), and an earlier version of this file leaned on it. That figure is
+  **Beagle 5.0**, seven years and several releases before the 5.5 benchmarked
+  here, including the 2021 phasing rewrite. It is a claim about a different
+  program and is not cited as evidence about this one.
+
+## Not measured
+
+- **Beagle with a bref3 panel.** Required before any two-pipeline wall-clock
+  number here is worth stating. Expect Beagle to get faster.
 - **A pipeline comparison from a common starting artifact** (say, both from
   `.vcf.gz`, or both from their own prepared format, with conversion counted).
 - **The crossover on the target axis.**
