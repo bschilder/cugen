@@ -326,7 +326,23 @@ def main():
     print(f"  ref_pos {ref_pos.size:,}  tgt_gidx {gidx.size:,}  -> {W}")
 
     import json
+    # Pin the sample draw. Browning et al. state only that two individuals per
+    # population were "randomly selected"; the supplement is 1 figure, 16 tables
+    # and msprime code for the SIMULATED panels, and carries no seed or sample
+    # list for the 1000 Genomes draw. Their exact 52 are therefore not
+    # recoverable. Recording ours makes this fixture reproducible even though
+    # the paper's is not.
+    #
+    # Two other terms contribute to the residual against their marker counts,
+    # and the sample draw is probably the smallest of the three: they ran
+    # bcftools 1.5 against this pipeline's 1.19, and the Omni2.5 site list here
+    # is derived from the 1000 Genomes chip VCF because the Illumina manifest
+    # requires registration -- a proxy for their source, not the same list.
     json.dump({"chrom": c, "n_reference_markers": int(n_ref),
+               "target_samples": sorted(targets),
+               "bcftools_version": subprocess.run(
+                   "bcftools --version | head -1", shell=True,
+                   capture_output=True, text=True).stdout.strip(),
                "n_target_markers": int(n_tgt),
                "paper_reference_markers": exp.get("reference_markers"),
                "paper_target_markers": exp.get("target_markers"),
