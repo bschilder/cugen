@@ -226,3 +226,121 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def vcf2cugenh(vcf, out, region=None, keep=None, gidx_start=0,
+               require_phased=True, verbose=True):
+    """PHASED VCF/BCF -> phased .cugen (ENCODING_HAP2BIT).
+
+    The counterpart of vcf2cugen for haplotype data. Every genotype must be
+    diploid, phased and non-missing -- the requirement Beagle places on a
+    reference panel, and the one cugen.impute inherits.
+
+    require_phased=True rejects a record carrying an unphased genotype. That
+    check matters more than it looks: an unphased het written as if it were
+    phased silently invents a haplotype assignment, and the resulting panel
+    still imputes, still returns probabilities in [0, 1], and is simply wrong in
+    a way no downstream check can detect. Stock 1000 Genomes VCFs are phased;
+    many other sources are not, and some are phased for homozygotes only.
+
+    Multi-allelic records are skipped: hap2bit stores one bit per haplotype and
+    so is biallelic by construction. Split them first with
+    `bcftools norm -m -any` if you need them.
+    """
+    try:
+        from cyvcf2 import VCF
+        backend = "cyvcf2"
+    except ImportError:
+        try:
+            import pysam
+            backend = "pysam"
+        except ImportError:
+            raise ImportError("vcf2cugenh needs cyvcf2 or pysam")
+
+    from .write import ENCODING_HAP2BIT
+
+    def _open():
+        return VCF(vcf) if backend == "cyvcf2" else pysam.VariantFile(vcf)
+
+    def _iter(v):
+        if backend == "cyvcf2":
+            return v(region) if region else v
+        return v.fetch(region=region) if region else v
+
+    def _biallelic(rec):
+        alts = rec.ALT if backend == "cyvcf2" else list(rec.alts or ())
+        return len(alts) == 1
+
+    v = _open()
+    samples = list(v.samples if backend == "cyvcf2" else v.header.samples)
+    keep_idx = None
+    if keep:
+        want = set(keep if isinstance(keep, (list, set, tuple))
+                   else open(keep).read().split())
+        keep_idx = [i for i, s in enumerate(samples) if s in want]
+        samples = [samples[i] for i in keep_idx]
+    n_samples = len(samples)
+
+    n_var = n_skip = 0
+    for rec in _iter(v):
+        if _biallelic(rec):
+            n_var += 1
+        else:
+            n_skip += 1
+    v.close()
+    if verbose:
+        print(f"vcf2cugenh [{backend}]: {n_samples:,} samples x {n_var:,} "
+              f"biallelic variants{f' in {region}' if region else ''} -> {out}"
+              + (f"  ({n_skip:,} multi-allelic skipped)" if n_skip else ""))
+    if n_var == 0:
+        raise ValueError(f"{vcf}: no biallelic records"
+                         f"{f' in {region}' if region else ''}")
+
+    v = _open()
+    k = 0
+    with CugenWriter(out, n_samples, n_var, ENCODING_HAP2BIT) as w:
+        for rec in _iter(v):
+            if not _biallelic(rec):
+                continue
+            if backend == "cyvcf2":
+                g = rec.genotypes                    # [a1, a2, phased] per sample
+                arr = np.asarray(g, dtype=np.int64)
+                a = arr[:, :2]
+                phased = arr[:, 2].astype(bool)
+            else:
+                a = np.empty((len(rec.samples), 2), dtype=np.int64)
+                phased = np.empty(len(rec.samples), dtype=bool)
+                for i, s in enumerate(rec.samples.values()):
+                    al = s.get("GT")
+                    a[i] = (-1, -1) if al is None or len(al) != 2 else al
+                    phased[i] = bool(s.phased)
+            if keep_idx is not None:
+                a = a[keep_idx]
+                phased = phased[keep_idx]
+            if (a < 0).any():
+                bad = int(np.flatnonzero((a < 0).any(axis=1))[0])
+                raise ValueError(
+                    f"{vcf}: missing genotype for sample {samples[bad]!r} at "
+                    f"record {k} ({rec.CHROM if backend == 'cyvcf2' else rec.chrom}"
+                    f":{rec.POS if backend == 'cyvcf2' else rec.pos}). A phased "
+                    f".cugen has no code for missing; impute or drop first.")
+            # Homozygotes are unambiguous whether or not the record marks them
+            # phased, so only heterozygotes need the flag.
+            if require_phased:
+                het = a[:, 0] != a[:, 1]
+                if np.any(het & ~phased):
+                    bad = int(np.flatnonzero(het & ~phased)[0])
+                    raise ValueError(
+                        f"{vcf}: UNPHASED heterozygote for sample "
+                        f"{samples[bad]!r} at record {k}. Writing it as phased "
+                        f"would invent a haplotype assignment that was never "
+                        f"observed, and the panel would still impute and still "
+                        f"look correct. Phase first, or pass "
+                        f"require_phased=False if you know what you are doing.")
+            w.add_variant_phased(gidx_start + k, a.astype(np.uint8))
+            k += 1
+            if verbose:
+                _progress(k, n_var)
+    v.close()
+    _write_samples(out, samples)
+    return out

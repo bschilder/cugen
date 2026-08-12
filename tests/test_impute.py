@@ -450,7 +450,11 @@ def test_target_markers_absent_from_reference_are_reported(phased_cugen):
 def test_high_tau_warns(phased_cugen, capsys, monkeypatch):
     """The warning must be reachable; the threshold is injectable so a test
     does not have to build a panel large enough to cross it naturally."""
-    import cugen.impute as ci
+    # `cugen.impute` is the FUNCTION at package level -- the house convention,
+    # matching cg.score and cg.freq -- so reach the module through sys.modules
+    # rather than `import cugen.impute as ci`, which resolves to the function.
+    import sys
+    ci = sys.modules["cugen.impute"]
     ref_p, tgt_p, meta = phased_cugen
     monkeypatch.setattr(ci, "_TAU_WARN", 1e-9)
     impute(tgt_p, ref=ref_p, annotation=meta["ann"], ne=meta["ne"],
