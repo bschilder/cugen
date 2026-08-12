@@ -136,6 +136,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, Union
 
+import time as _time
+
 import numpy as np
 import pandas as pd
 
@@ -1303,12 +1305,18 @@ def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
         z = cp.empty(0, dtype=cp.int32)
         return z, z
 
+    _t0_read = _time.perf_counter()
     packed = cp.asarray(np.frombuffer(reader.read_packed_bytes(),
                                       dtype=np.uint8))
     packed = packed.reshape(int(reader.n_variants), bpv)[cp.asarray(rows)]
+    cp.cuda.Stream.null.synchronize()
+    _t_read = _time.perf_counter() - _t0_read
 
     # Per-variant moments once, streamed -- identical to the banded scan.
+    _t0 = _time.perf_counter()
     s_v, q_v = _variant_moments(packed, p, ns, bpv)
+    cp.cuda.Stream.null.synchronize()
+    _t_mom = _time.perf_counter() - _t0
 
     pos_d = cp.asarray(pos)
     is_cand_d = cp.zeros(p, dtype=cp.uint8)
@@ -1377,7 +1385,14 @@ def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
         return out_i, out_j, out_r, int(counter[0])
 
     cap = max(1 << 16, min(int(50e6), planned // 4 + 1024))
+    _t0 = _time.perf_counter()
     oi, oj, _orr, found = run(cap)
+    cp.cuda.Stream.null.synchronize()
+    if verbose:
+        print(f"[clump] rect timing: read+gather {_t_read:.2f}s  "
+              f"moments {_t_mom:.2f}s  scan "
+              f"{_time.perf_counter() - _t0:.2f}s  "
+              f"(packed {packed.nbytes / 2**30:.2f} GiB)")
     if found > cap:
         if verbose:
             print(f"[clump] buffer held {cap:,}, {found:,} survived -- "
