@@ -1,0 +1,79 @@
+[
+  {
+    "n": 2504,
+    "plink_s": 0.19,
+    "cugen_fp32_s": 0.18,
+    "cugen_s": 0.16,
+    "cugen_gpu_gib": 1.06,
+    "tf32_gain": 1.12,
+    "speedup": 1.19,
+    "speedup_lo": 0.9,
+    "speedup_hi": 1.6
+  },
+  {
+    "n": 10000,
+    "plink_s": 0.42,
+    "cugen_fp32_s": 0.16,
+    "cugen_s": 0.22,
+    "cugen_gpu_gib": 1.08,
+    "tf32_gain": 0.71,
+    "speedup": 1.9,
+    "speedup_lo": 1.9,
+    "speedup_hi": 3.8
+  },
+  {
+    "n": 50000,
+    "plink_s": 4.06,
+    "cugen_fp32_s": 0.34,
+    "cugen_s": 0.29,
+    "cugen_gpu_gib": 2.33,
+    "tf32_gain": 1.18,
+    "speedup": 13.95,
+    "speedup_lo": 12.7,
+    "speedup_hi": 19.4
+  },
+  {
+    "n": 100000,
+    "plink_s": 10.36,
+    "cugen_fp32_s": 0.55,
+    "cugen_s": 0.35,
+    "cugen_gpu_gib": 3.44,
+    "tf32_gain": 1.58,
+    "speedup": 29.52,
+    "speedup_lo": 27.0,
+    "speedup_hi": 31.0
+  },
+  {
+    "n": 200000,
+    "plink_s": 27.99,
+    "cugen_fp32_s": 0.85,
+    "cugen_s": 0.45,
+    "cugen_gpu_gib": 6.52,
+    "tf32_gain": 1.87,
+    "speedup": 61.85,
+    "speedup_lo": 49.4,
+    "speedup_hi": 67.0
+  },
+  {
+    "n": 500000,
+    "plink_s": 62.64,
+    "cugen_fp32_s": 1.82,
+    "cugen_s": 0.9,
+    "cugen_gpu_gib": 15.74,
+    "tf32_gain": 2.02,
+    "speedup": 69.77,
+    "speedup_lo": 47.3,
+    "speedup_hi": 74.6
+  },
+  {
+    "n": 1000000,
+    "plink_s": 102.45,
+    "cugen_fp32_s": 3.27,
+    "cugen_s": 2.29,
+    "cugen_gpu_gib": 27.99,
+    "tf32_gain": 1.43,
+    "speedup": 44.79,
+    "speedup_lo": 43.5,
+    "speedup_hi": 53.8
+  }
+]

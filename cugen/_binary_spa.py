@@ -29,7 +29,12 @@ from __future__ import annotations
 import math
 from typing import Dict
 
-import cupy as cp
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:                                            # noqa: BLE001
+    cp = None
+    HAS_CUPY = False
 from cupyx.scipy.special import erf as _gpu_erf, erfc as _gpu_erfc
 
 

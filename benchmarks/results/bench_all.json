@@ -1,0 +1,32 @@
+{
+  "file": "/root/data/chr22_all.cugen",
+  "header": {
+    "path": "/root/data/chr22_all.cugen",
+    "version": "1",
+    "encoding": "2bit",
+    "n_samples": "2504",
+    "n_variants": "1055454",
+    "bytes_per_variant": "626",
+    "file_size_gb": "0.68182354"
+  },
+  "results": [
+    {
+      "p": 1055454,
+      "wall_s": 1287.2379,
+      "peak_pool_bytes": 6858220032,
+      "peak_pool_gib": 6.387,
+      "free_before_gib": 78.821,
+      "pairs_considered": 556991045331,
+      "pairs_emitted": 187252868,
+      "pairs_per_s": 432702500.8,
+      "stats": [
+        "r",
+        "r2"
+      ],
+      "min_r2": 0.2,
+      "window": null,
+      "tile_size": null,
+      "backend": "auto"
+    }
+  ]
+}

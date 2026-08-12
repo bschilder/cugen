@@ -1,0 +1,57 @@
+{
+  "label": "A100 SXM 80GB",
+  "ok": true,
+  "stage": "done",
+  "n_samples": 2504,
+  "runs": [
+    {
+      "p": 2000,
+      "wall_s": 0.1361,
+      "peak_pool_gib": 0.2956,
+      "pairs": 1999000,
+      "pairs_per_s": 14692643.1,
+      "emitted": 96261
+    },
+    {
+      "p": 5000,
+      "wall_s": 0.8743,
+      "peak_pool_gib": 2.0288,
+      "pairs": 12497500,
+      "pairs_per_s": 14294743.1,
+      "emitted": 554951
+    },
+    {
+      "p": 10000,
+      "wall_s": 2.8492,
+      "peak_pool_gib": 5.2976,
+      "pairs": 49995000,
+      "pairs_per_s": 17546856.3,
+      "emitted": 2144957
+    },
+    {
+      "p": 20000,
+      "wall_s": 11.4003,
+      "peak_pool_gib": 5.0947,
+      "pairs": 199990000,
+      "pairs_per_s": 17542592.7,
+      "emitted": 8587693
+    }
+  ],
+  "errors": [],
+  "gpu_name": "NVIDIA A100-SXM4-80GB",
+  "compute_capability": "8.0",
+  "total_mem_gib": 79.25,
+  "free_mem_gib": 78.83,
+  "driver": "580.126.16",
+  "cupy": "14.1.1",
+  "cuda_runtime": 12090,
+  "python": "3.12.3",
+  "kernel_compile_s": 0.236,
+  "correctness": {
+    "pairs": 276,
+    "pair_sets_equal": true,
+    "max_abs_err_R": 0.0,
+    "max_abs_err_D": 0.0,
+    "max_abs_err_DP": 0.0
+  }
+}

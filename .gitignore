@@ -21,3 +21,4 @@ venv/
 *.log
 *.pid
 test_smoke/
+benchmarks/results/*.parquet

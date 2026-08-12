@@ -23,10 +23,18 @@ from glob import glob
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
-import cupy as cp
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:                                            # noqa: BLE001
+    cp = None
+    HAS_CUPY = False
 import numpy as np
 import pandas as pd
-import polars as pl
+try:
+    import polars as pl
+except ImportError:                                            # noqa: BLE001
+    pl = None
 
 from .io import CugenReader, CugenReaderPinned
 

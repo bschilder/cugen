@@ -1,0 +1,158 @@
+{
+  "file": "/root/data/chr22_maf01.cugen",
+  "header": {
+    "path": "/root/data/chr22_maf01.cugen",
+    "version": "1",
+    "encoding": "2bit",
+    "n_samples": "2504",
+    "n_variants": "170949",
+    "bytes_per_variant": "626",
+    "file_size_gb": "0.11043331"
+  },
+  "results": [
+    {
+      "p": 1000,
+      "wall_s": 0.107,
+      "peak_pool_bytes": 107014144,
+      "peak_pool_gib": 0.1,
+      "free_before_gib": 78.823,
+      "pairs_considered": 499500,
+      "pairs_emitted": 31359,
+      "pairs_per_s": 4668855.4,
+      "stats": [
+        "r",
+        "r2"
+      ],
+      "min_r2": 0.2,
+      "window": null,
+      "tile_size": null,
+      "backend": "auto"
+    },
+    {
+      "p": 2000,
+      "wall_s": 0.1541,
+      "peak_pool_bytes": 349348352,
+      "peak_pool_gib": 0.325,
+      "free_before_gib": 78.823,
+      "pairs_considered": 1999000,
+      "pairs_emitted": 75894,
+      "pairs_per_s": 12967907.4,
+      "stats": [
+        "r",
+        "r2"
+      ],
+      "min_r2": 0.2,
+      "window": null,
+      "tile_size": null,
+      "backend": "auto"
+    },
+    {
+      "p": 5000,
+      "wall_s": 0.3366,
+      "peak_pool_bytes": 1286192128,
+      "peak_pool_gib": 1.198,
+      "free_before_gib": 78.823,
+      "pairs_considered": 12497500,
+      "pairs_emitted": 148809,
+      "pairs_per_s": 37133108.2,
+      "stats": [
+        "r",
+        "r2"
+      ],
+      "min_r2": 0.2,
+      "window": null,
+      "tile_size": null,
+      "backend": "auto"
+    },
+    {
+      "p": 10000,
+      "wall_s": 0.6826,
+      "peak_pool_bytes": 4547380736,
+      "peak_pool_gib": 4.235,
+      "free_before_gib": 78.823,
+      "pairs_considered": 49995000,
+      "pairs_emitted": 263180,
+      "pairs_per_s": 73243884.1,
+      "stats": [
+        "r",
+        "r2"
+      ],
+      "min_r2": 0.2,
+      "window": null,
+      "tile_size": null,
+      "backend": "auto"
+    },
+    {
+      "p": 20000,
+      "wall_s": 1.3499,
+      "peak_pool_bytes": 5948051968,
+      "peak_pool_gib": 5.54,
+      "free_before_gib": 78.823,
+      "pairs_considered": 199990000,
+      "pairs_emitted": 562853,
+      "pairs_per_s": 148153549.5,
+      "stats": [
+        "r",
+        "r2"
+      ],
+      "min_r2": 0.2,
+      "window": null,
+      "tile_size": null,
+      "backend": "auto"
+    },
+    {
+      "p": 50000,
+      "wall_s": 5.4478,
+      "peak_pool_bytes": 6228085248,
+      "peak_pool_gib": 5.8,
+      "free_before_gib": 78.823,
+      "pairs_considered": 1249975000,
+      "pairs_emitted": 1834577,
+      "pairs_per_s": 229445184.3,
+      "stats": [
+        "r",
+        "r2"
+      ],
+      "min_r2": 0.2,
+      "window": null,
+      "tile_size": null,
+      "backend": "auto"
+    },
+    {
+      "p": 100000,
+      "wall_s": 17.0881,
+      "peak_pool_bytes": 6008547840,
+      "peak_pool_gib": 5.596,
+      "free_before_gib": 78.823,
+      "pairs_considered": 4999950000,
+      "pairs_emitted": 5064557,
+      "pairs_per_s": 292598958.2,
+      "stats": [
+        "r",
+        "r2"
+      ],
+      "min_r2": 0.2,
+      "window": null,
+      "tile_size": null,
+      "backend": "auto"
+    },
+    {
+      "p": 170949,
+      "wall_s": 42.3178,
+      "peak_pool_bytes": 6061791232,
+      "peak_pool_gib": 5.645,
+      "free_before_gib": 78.823,
+      "pairs_considered": 14611694826,
+      "pairs_emitted": 10517617,
+      "pairs_per_s": 345284931.1,
+      "stats": [
+        "r",
+        "r2"
+      ],
+      "min_r2": 0.2,
+      "window": null,
+      "tile_size": null,
+      "backend": "auto"
+    }
+  ]
+}

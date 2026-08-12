@@ -1,0 +1,94 @@
+[
+  {
+    "label": "standard GWAS clumping",
+    "p1": 0.0001,
+    "p2": 0.01,
+    "r2": 0.5,
+    "kb": 250,
+    "gpu_s": 0.942,
+    "gpu_peak_gib": 2.377,
+    "gpu_clumps": 188,
+    "plink_s": 0.374,
+    "cpu_subset_s": 137.799,
+    "cpu_subset_n": 5000,
+    "cpu_subset_peak_gib": 0.0,
+    "cpu_subset_clumps": 3,
+    "speedup_vs_plink": 0.4,
+    "parity": {
+      "plink_clumps": 188,
+      "cugen_clumps": 188,
+      "index_sets_equal": true,
+      "columns_differing": {},
+      "identical": true
+    }
+  },
+  {
+    "label": "loose p1",
+    "p1": 0.01,
+    "p2": 0.01,
+    "r2": 0.5,
+    "kb": 250,
+    "gpu_s": 0.69,
+    "gpu_peak_gib": 2.3887,
+    "gpu_clumps": 1638,
+    "plink_s": 2.255,
+    "cpu_subset_s": 113.176,
+    "cpu_subset_n": 5000,
+    "cpu_subset_peak_gib": 0.0,
+    "cpu_subset_clumps": 51,
+    "speedup_vs_plink": 3.3,
+    "parity": {
+      "plink_clumps": 1638,
+      "cugen_clumps": 1638,
+      "index_sets_equal": true,
+      "columns_differing": {},
+      "identical": true
+    }
+  },
+  {
+    "label": "C+T, r2=0.2",
+    "p1": 1.0,
+    "p2": 0.01,
+    "r2": 0.2,
+    "kb": 250,
+    "gpu_s": 1.117,
+    "gpu_peak_gib": 3.9141,
+    "gpu_clumps": 18704,
+    "plink_s": 18.495,
+    "cpu_subset_s": 96.525,
+    "cpu_subset_n": 5000,
+    "cpu_subset_peak_gib": 0.4935,
+    "cpu_subset_clumps": 702,
+    "speedup_vs_plink": 16.6,
+    "parity": {
+      "plink_clumps": 18704,
+      "cugen_clumps": 18704,
+      "index_sets_equal": true,
+      "columns_differing": {},
+      "identical": true
+    }
+  },
+  {
+    "label": "C+T for PRS (p1=1, r2=0.1)",
+    "p1": 1.0,
+    "p2": 0.01,
+    "r2": 0.1,
+    "kb": 250,
+    "gpu_s": 0.79,
+    "gpu_peak_gib": 3.9609,
+    "gpu_clumps": 12435,
+    "plink_s": 12.599,
+    "cpu_subset_s": 77.261,
+    "cpu_subset_n": 5000,
+    "cpu_subset_peak_gib": 0.0,
+    "cpu_subset_clumps": 520,
+    "speedup_vs_plink": 15.9,
+    "parity": {
+      "plink_clumps": 12435,
+      "cugen_clumps": 12435,
+      "index_sets_equal": true,
+      "columns_differing": {},
+      "identical": true
+    }
+  }
+]

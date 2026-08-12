@@ -1,0 +1,47 @@
+[
+  {
+    "p": 20000,
+    "pairs": 9874750,
+    "plink_s": 0.25682918541133404,
+    "plink_rss_gib": 0.48468780517578125,
+    "plink_rows": 499225,
+    "cugen_s": 2.742791660130024,
+    "cugen_gpu_gib": 0.0,
+    "cugen_rss_gib": 1.1732559204101562,
+    "cugen_rows": 499222,
+    "speedup": 0.09363787601686045,
+    "threads": 128,
+    "window": 500,
+    "min_r2": 0.2
+  },
+  {
+    "p": 50000,
+    "pairs": 24874750,
+    "plink_s": 0.5810755435377359,
+    "plink_rss_gib": 1.1732559204101562,
+    "plink_rows": 1412206,
+    "cugen_s": 1.3237978350371122,
+    "cugen_gpu_gib": 0.0,
+    "cugen_rss_gib": 1.2739105224609375,
+    "cugen_rows": 1412201,
+    "speedup": 0.43894583308594526,
+    "threads": 128,
+    "window": 500,
+    "min_r2": 0.2
+  },
+  {
+    "p": 170949,
+    "pairs": 85349250,
+    "plink_s": 1.9512490257620811,
+    "plink_rss_gib": 1.2739105224609375,
+    "plink_rows": 5217146,
+    "cugen_s": 4.62177748978138,
+    "cugen_gpu_gib": 0.0,
+    "cugen_rss_gib": 1.276885986328125,
+    "cugen_rows": 5217140,
+    "speedup": 0.42218584301737544,
+    "threads": 128,
+    "window": 500,
+    "min_r2": 0.2
+  }
+]

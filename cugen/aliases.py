@@ -8,7 +8,7 @@ or cugen-canonical (`cg.filter_cols`, `cg.gwas`, `cg.frequency`).
 from .assoc import gwas
 from .freq import frequency
 from .io import read_cugen, read_cugen_header
-from .ld import ld_clump, ld_matrix
+from .ld import ld_clump, ld_matrix, ld_prune
 from .popstruct import grm, king, pca, pc_project
 from .qc import sample_qc, variant_qc
 from .score import score
@@ -30,6 +30,7 @@ def exclude(mt, **kw):
 freq = frequency
 glm = gwas
 clump = ld_clump
+prune = ld_prune
 r2 = ld_matrix
 make_king = king
 make_grm = grm

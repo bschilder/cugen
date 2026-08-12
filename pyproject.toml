@@ -37,6 +37,7 @@ dependencies = [
 [project.optional-dependencies]
 gpu = ["cupy-cuda12x>=12.0"]
 plot = ["matplotlib>=3.7"]
+dev = ["pytest>=7"]
 
 [project.scripts]
 cugen = "cugen.cli:main"
@@ -47,3 +48,7 @@ Issues = "https://github.com/yuj1r0/cugen/issues"
 
 [tool.setuptools.packages.find]
 include = ["cugen*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: requires a CUDA device and CuPy"]

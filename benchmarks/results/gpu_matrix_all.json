@@ -1,0 +1,1685 @@
+[
+  {
+    "label": "RTX A2000 (6 GB, entry)",
+    "stage": "create_failed",
+    "probe": null,
+    "arch": "Ampere",
+    "vram_advertised": 6,
+    "source": "first-pass",
+    "cost_usd": null,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 1
+  },
+  {
+    "label": "V100 (Volta, 2017)",
+    "stage": "done",
+    "probe": {
+      "label": "V100 (Volta, 2017)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0728,
+          "peak_pool_gib": 0.2109,
+          "pairs": 1999000,
+          "pairs_per_s": 27476608.6,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.1257,
+          "peak_pool_gib": 0.6328,
+          "pairs": 12497500,
+          "pairs_per_s": 99391449.3,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.2223,
+          "peak_pool_gib": 1.668,
+          "pairs": 49995000,
+          "pairs_per_s": 224903605.4,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.57,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 350864469.1,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "Tesla V100-PCIE-16GB",
+      "compute_capability": "7.0",
+      "total_mem_gib": 15.77,
+      "free_mem_gib": 15.46,
+      "driver": "560.35.03",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 3.312,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": false
+    },
+    "arch": "Volta",
+    "vram_advertised": 16,
+    "source": "first-pass",
+    "cost_usd": null,
+    "cost_hr": 0.19,
+    "scaling": null,
+    "draws": 1
+  },
+  {
+    "label": "RTX 2000 Ada (entry)",
+    "stage": "create_failed",
+    "probe": null,
+    "arch": "Ada",
+    "vram_advertised": 16,
+    "source": "first-pass",
+    "cost_usd": null,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 1
+  },
+  {
+    "label": "RTX A4000 (Ampere)",
+    "stage": "create_failed",
+    "probe": null,
+    "arch": "Ampere",
+    "vram_advertised": 16,
+    "source": "first-pass",
+    "cost_usd": null,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 1
+  },
+  {
+    "label": "RTX A5000 (Ampere)",
+    "stage": "create_failed",
+    "probe": null,
+    "arch": "Ampere",
+    "vram_advertised": 24,
+    "source": "first-pass",
+    "cost_usd": null,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 1
+  },
+  {
+    "label": "RTX 3090 (consumer Ampere)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX 3090 (consumer Ampere)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.057,
+          "peak_pool_gib": 0.2109,
+          "pairs": 1999000,
+          "pairs_per_s": 35043391.9,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0878,
+          "peak_pool_gib": 0.627,
+          "pairs": 12497500,
+          "pairs_per_s": 142349720.6,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.1637,
+          "peak_pool_gib": 1.668,
+          "pairs": 49995000,
+          "pairs_per_s": 305354126.6,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.4332,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 461671920.7,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA GeForce RTX 3090",
+      "compute_capability": "8.6",
+      "total_mem_gib": 23.56,
+      "free_mem_gib": 23.3,
+      "driver": "580.65.06",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.536,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Ampere",
+    "vram_advertised": 24,
+    "source": "first-pass",
+    "cost_usd": null,
+    "cost_hr": 0.22,
+    "scaling": null,
+    "draws": 1
+  },
+  {
+    "label": "RTX 4090 (Ada)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX 4090 (Ada)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0327,
+          "peak_pool_gib": 0.1914,
+          "pairs": 1999000,
+          "pairs_per_s": 61136206.1,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0561,
+          "peak_pool_gib": 0.627,
+          "pairs": 12497500,
+          "pairs_per_s": 222787622.5,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.1045,
+          "peak_pool_gib": 1.5527,
+          "pairs": 49995000,
+          "pairs_per_s": 478247203.4,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.3733,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 535747517.8,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA GeForce RTX 4090",
+      "compute_capability": "8.9",
+      "total_mem_gib": 23.53,
+      "free_mem_gib": 23.14,
+      "driver": "570.195.03",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 1.677,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Ada",
+    "vram_advertised": 24,
+    "source": "first-pass",
+    "cost_usd": null,
+    "cost_hr": 0.74,
+    "scaling": null,
+    "draws": 1
+  },
+  {
+    "label": "RTX 5090 (Blackwell)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX 5090 (Blackwell)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0361,
+          "peak_pool_gib": 0.1953,
+          "pairs": 1999000,
+          "pairs_per_s": 55408068.9,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0714,
+          "peak_pool_gib": 0.6582,
+          "pairs": 12497500,
+          "pairs_per_s": 175021091.0,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.1301,
+          "peak_pool_gib": 1.5527,
+          "pairs": 49995000,
+          "pairs_per_s": 384269102.5,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.4912,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 407133078.2,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA GeForce RTX 5090",
+      "compute_capability": "12.0",
+      "total_mem_gib": 31.36,
+      "free_mem_gib": 30.86,
+      "driver": "580.126.09",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.34,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Blackwell",
+    "vram_advertised": 32,
+    "source": "first-pass",
+    "cost_usd": null,
+    "cost_hr": 0.99,
+    "scaling": null,
+    "draws": 1
+  },
+  {
+    "label": "L40S (Ada datacenter)",
+    "stage": "done",
+    "probe": {
+      "label": "L40S (Ada datacenter)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0542,
+          "peak_pool_gib": 0.1914,
+          "pairs": 1999000,
+          "pairs_per_s": 36913326.6,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0834,
+          "peak_pool_gib": 0.627,
+          "pairs": 12497500,
+          "pairs_per_s": 149780996.8,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.1916,
+          "peak_pool_gib": 1.5703,
+          "pairs": 49995000,
+          "pairs_per_s": 260941015.5,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.7181,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 278506707.1,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA L40S",
+      "compute_capability": "8.9",
+      "total_mem_gib": 44.39,
+      "free_mem_gib": 43.97,
+      "driver": "580.159.03",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.134,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Ada",
+    "vram_advertised": 48,
+    "source": "first-pass",
+    "cost_usd": null,
+    "cost_hr": 0.99,
+    "scaling": null,
+    "draws": 1
+  },
+  {
+    "label": "A100 SXM 80GB (Ampere)",
+    "stage": "done",
+    "probe": {
+      "label": "A100 SXM 80GB (Ampere)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0458,
+          "peak_pool_gib": 0.1914,
+          "pairs": 1999000,
+          "pairs_per_s": 43634010.6,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0713,
+          "peak_pool_gib": 0.627,
+          "pairs": 12497500,
+          "pairs_per_s": 175208816.6,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.2142,
+          "peak_pool_gib": 1.668,
+          "pairs": 49995000,
+          "pairs_per_s": 233375458.8,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.3898,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 512999071.6,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA A100-SXM4-80GB",
+      "compute_capability": "8.0",
+      "total_mem_gib": 79.25,
+      "free_mem_gib": 78.83,
+      "driver": "580.126.16",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.804,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Ampere",
+    "vram_advertised": 80,
+    "source": "first-pass",
+    "cost_usd": null,
+    "cost_hr": 1.59,
+    "scaling": null,
+    "draws": 1
+  },
+  {
+    "label": "H100 SXM (Hopper)",
+    "stage": "done",
+    "probe": {
+      "label": "H100 SXM (Hopper)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0501,
+          "peak_pool_gib": 0.2109,
+          "pairs": 1999000,
+          "pairs_per_s": 39865729.0,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0623,
+          "peak_pool_gib": 0.627,
+          "pairs": 12497500,
+          "pairs_per_s": 200742291.2,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.128,
+          "peak_pool_gib": 1.5527,
+          "pairs": 49995000,
+          "pairs_per_s": 390661704.0,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.4574,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 437186896.5,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA H100 80GB HBM3",
+      "compute_capability": "9.0",
+      "total_mem_gib": 79.18,
+      "free_mem_gib": 78.66,
+      "driver": "580.126.09",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 1.876,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Hopper",
+    "vram_advertised": 80,
+    "source": "first-pass",
+    "cost_usd": null,
+    "cost_hr": 3.29,
+    "scaling": null,
+    "draws": 1
+  },
+  {
+    "label": "RTX 3070 (8 GB)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX 3070 (8 GB)",
+      "ok": false,
+      "stage": "import",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [],
+      "errors": [
+        "cupy import/device: CUDARuntimeError: cudaErrorUnknown: unknown error"
+      ]
+    },
+    "arch": "Ampere",
+    "vram_advertised": 8,
+    "source": "fan-out",
+    "cost_usd": 0.0089,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 2,
+    "host_fault_first_draw": true,
+    "low_scaling_persisted": false,
+    "cloud": null,
+    "dc_restricted_us_ca": null,
+    "rationale": "smallest VRAM obtainable"
+  },
+  {
+    "label": "RTX 3080 (10 GB)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX 3080 (10 GB)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0527,
+          "peak_pool_gib": 0.2109,
+          "pairs": 1999000,
+          "pairs_per_s": 37930869.8,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0989,
+          "peak_pool_gib": 0.6328,
+          "pairs": 12497500,
+          "pairs_per_s": 126327483.7,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.2201,
+          "peak_pool_gib": 1.668,
+          "pairs": 49995000,
+          "pairs_per_s": 227123074.8,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.7194,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 278012918.3,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA GeForce RTX 3080",
+      "compute_capability": "8.6",
+      "total_mem_gib": 9.64,
+      "free_mem_gib": 9.42,
+      "driver": "580.95.05",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.26,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Ampere",
+    "vram_advertised": 10,
+    "source": "fan-out",
+    "cost_usd": 0.0084,
+    "cost_hr": 0.17,
+    "scaling": 7.33,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": "COMMUNITY",
+    "dc_restricted_us_ca": false,
+    "rationale": "small VRAM"
+  },
+  {
+    "label": "RTX 3080 Ti (12 GB)",
+    "stage": "no_public_ip",
+    "probe": null,
+    "arch": "Ampere",
+    "vram_advertised": 12,
+    "source": "fan-out",
+    "cost_usd": 0.0091,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 2,
+    "host_fault_first_draw": true,
+    "low_scaling_persisted": false,
+    "cloud": null,
+    "dc_restricted_us_ca": null,
+    "rationale": "small VRAM"
+  },
+  {
+    "label": "RTX 4070 Ti (12 GB)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX 4070 Ti (12 GB)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0679,
+          "peak_pool_gib": 0.2109,
+          "pairs": 1999000,
+          "pairs_per_s": 29460762.2,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.104,
+          "peak_pool_gib": 0.6582,
+          "pairs": 12497500,
+          "pairs_per_s": 120225089.6,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.1631,
+          "peak_pool_gib": 1.5703,
+          "pairs": 49995000,
+          "pairs_per_s": 306579874.7,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.5036,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 397100868.6,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA GeForce RTX 4070 Ti",
+      "compute_capability": "8.9",
+      "total_mem_gib": 11.6,
+      "free_mem_gib": 11.4,
+      "driver": "580.105.08",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.878,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Ada",
+    "vram_advertised": 12,
+    "source": "fan-out",
+    "cost_usd": 0.0061,
+    "cost_hr": 0.19,
+    "scaling": 13.48,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": "COMMUNITY",
+    "dc_restricted_us_ca": false,
+    "rationale": "small VRAM, Ada"
+  },
+  {
+    "label": "RTX 5080 (16 GB)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX 5080 (16 GB)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0447,
+          "peak_pool_gib": 0.1973,
+          "pairs": 1999000,
+          "pairs_per_s": 44752918.4,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0574,
+          "peak_pool_gib": 0.6328,
+          "pairs": 12497500,
+          "pairs_per_s": 217889829.9,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.0816,
+          "peak_pool_gib": 1.5527,
+          "pairs": 49995000,
+          "pairs_per_s": 612328620.4,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.2283,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 876124284.1,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA GeForce RTX 5080",
+      "compute_capability": "12.0",
+      "total_mem_gib": 15.47,
+      "free_mem_gib": 15.21,
+      "driver": "580.173.02",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.514,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Blackwell",
+    "vram_advertised": 16,
+    "source": "fan-out",
+    "cost_usd": 0.0112,
+    "cost_hr": 0.39,
+    "scaling": 19.58,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": "COMMUNITY",
+    "dc_restricted_us_ca": false,
+    "rationale": "small VRAM, Blackwell"
+  },
+  {
+    "label": "RTX A4500 (20 GB)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX A4500 (20 GB)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.041,
+          "peak_pool_gib": 0.2109,
+          "pairs": 1999000,
+          "pairs_per_s": 48790120.3,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0711,
+          "peak_pool_gib": 0.6582,
+          "pairs": 12497500,
+          "pairs_per_s": 175657845.3,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.1509,
+          "peak_pool_gib": 1.668,
+          "pairs": 49995000,
+          "pairs_per_s": 331413422.7,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.4207,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 475349429.5,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA RTX A4500",
+      "compute_capability": "8.6",
+      "total_mem_gib": 19.57,
+      "free_mem_gib": 19.39,
+      "driver": "580.126.18",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 1.539,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Ampere",
+    "vram_advertised": 20,
+    "source": "fan-out",
+    "cost_usd": 0.0054,
+    "cost_hr": 0.19,
+    "scaling": 9.74,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": "COMMUNITY",
+    "dc_restricted_us_ca": false,
+    "rationale": "pro workstation"
+  },
+  {
+    "label": "RTX 4000 Ada (20 GB)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX 4000 Ada (20 GB)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0769,
+          "peak_pool_gib": 0.1953,
+          "pairs": 1999000,
+          "pairs_per_s": 26001502.0,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.1189,
+          "peak_pool_gib": 0.627,
+          "pairs": 12497500,
+          "pairs_per_s": 105124431.5,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.2196,
+          "peak_pool_gib": 1.5703,
+          "pairs": 49995000,
+          "pairs_per_s": 227620607.7,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.5654,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 353706964.8,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA RTX 4000 Ada Generation",
+      "compute_capability": "8.9",
+      "total_mem_gib": 19.55,
+      "free_mem_gib": 19.38,
+      "driver": "580.173.02",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 3.088,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Ada",
+    "vram_advertised": 20,
+    "source": "fan-out",
+    "cost_usd": 0.0112,
+    "cost_hr": 0.28,
+    "scaling": 13.6,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": "SECURE",
+    "dc_restricted_us_ca": false,
+    "rationale": "pro workstation"
+  },
+  {
+    "label": "RTX A6000 (48 GB)",
+    "stage": "unavailable",
+    "probe": null,
+    "arch": "Ampere",
+    "vram_advertised": 48,
+    "source": "fan-out",
+    "cost_usd": 0.0,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": null,
+    "dc_restricted_us_ca": null,
+    "rationale": "pro workstation"
+  },
+  {
+    "label": "RTX 6000 Ada (48 GB)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX 6000 Ada (48 GB)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.1427,
+          "peak_pool_gib": 0.2109,
+          "pairs": 1999000,
+          "pairs_per_s": 14011719.5,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0925,
+          "peak_pool_gib": 0.6582,
+          "pairs": 12497500,
+          "pairs_per_s": 135071763.1,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.1415,
+          "peak_pool_gib": 1.5703,
+          "pairs": 49995000,
+          "pairs_per_s": 353431184.5,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.374,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 534780292.5,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA RTX 6000 Ada Generation",
+      "compute_capability": "8.9",
+      "total_mem_gib": 47.38,
+      "free_mem_gib": 46.96,
+      "driver": "570.124.06",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.245,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Ada",
+    "vram_advertised": 48,
+    "source": "fan-out",
+    "cost_usd": 0.0202,
+    "cost_hr": 0.84,
+    "scaling": 38.17,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": "SECURE",
+    "dc_restricted_us_ca": false,
+    "rationale": "pro workstation"
+  },
+  {
+    "label": "L4 (24 GB, 72 W)",
+    "stage": "exception",
+    "probe": null,
+    "arch": "Ada",
+    "vram_advertised": 24,
+    "source": "fan-out",
+    "cost_usd": 0.3287,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": null,
+    "dc_restricted_us_ca": null,
+    "rationale": "low-power inference part"
+  },
+  {
+    "label": "A40 (48 GB)",
+    "stage": "done",
+    "probe": {
+      "label": "A40 (48 GB)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0518,
+          "peak_pool_gib": 0.2109,
+          "pairs": 1999000,
+          "pairs_per_s": 38598641.1,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0903,
+          "peak_pool_gib": 0.6328,
+          "pairs": 12497500,
+          "pairs_per_s": 138423100.5,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.1759,
+          "peak_pool_gib": 1.668,
+          "pairs": 49995000,
+          "pairs_per_s": 284277108.3,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.5545,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 360640711.1,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA A40",
+      "compute_capability": "8.6",
+      "total_mem_gib": 44.43,
+      "free_mem_gib": 44.17,
+      "driver": "570.211.01",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.395,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Ampere",
+    "vram_advertised": 48,
+    "source": "fan-out",
+    "cost_usd": 0.0181,
+    "cost_hr": 0.44,
+    "scaling": 9.34,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": "SECURE",
+    "dc_restricted_us_ca": false,
+    "rationale": "datacenter Ampere"
+  },
+  {
+    "label": "V100 SXM2 (16 GB)",
+    "stage": "no_public_ip",
+    "probe": null,
+    "arch": "Volta",
+    "vram_advertised": 16,
+    "source": "fan-out",
+    "cost_usd": 0.0112,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 2,
+    "host_fault_first_draw": true,
+    "low_scaling_persisted": false,
+    "cloud": null,
+    "dc_restricted_us_ca": null,
+    "rationale": "SXM2 vs the PCIe V100"
+  },
+  {
+    "label": "A100 PCIe (80 GB)",
+    "stage": "no_public_ip",
+    "probe": null,
+    "arch": "Ampere",
+    "vram_advertised": 80,
+    "source": "fan-out",
+    "cost_usd": 0.0667,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 2,
+    "host_fault_first_draw": true,
+    "low_scaling_persisted": false,
+    "cloud": null,
+    "dc_restricted_us_ca": null,
+    "rationale": "PCIe vs the SXM A100"
+  },
+  {
+    "label": "H200 SXM (141 GB)",
+    "stage": "done",
+    "probe": {
+      "label": "H200 SXM (141 GB)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0451,
+          "peak_pool_gib": 0.2109,
+          "pairs": 1999000,
+          "pairs_per_s": 44355592.1,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0497,
+          "peak_pool_gib": 0.627,
+          "pairs": 12497500,
+          "pairs_per_s": 251225762.6,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.0757,
+          "peak_pool_gib": 1.668,
+          "pairs": 49995000,
+          "pairs_per_s": 660387192.4,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.2188,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 914077313.0,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA H200",
+      "compute_capability": "9.0",
+      "total_mem_gib": 139.8,
+      "free_mem_gib": 139.29,
+      "driver": "580.159.04",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.121,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Hopper",
+    "vram_advertised": 141,
+    "source": "fan-out",
+    "cost_usd": 0.907,
+    "cost_hr": 4.59,
+    "scaling": 20.61,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": "SECURE",
+    "dc_restricted_us_ca": false,
+    "rationale": "Hopper, 141 GB"
+  },
+  {
+    "label": "RTX PRO 6000 (96 GB)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX PRO 6000 (96 GB)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0289,
+          "peak_pool_gib": 0.1934,
+          "pairs": 1999000,
+          "pairs_per_s": 69141690.1,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0515,
+          "peak_pool_gib": 0.627,
+          "pairs": 12497500,
+          "pairs_per_s": 242889408.8,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.1139,
+          "peak_pool_gib": 1.668,
+          "pairs": 49995000,
+          "pairs_per_s": 438870227.4,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.3953,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 505864283.4,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "compute_capability": "12.0",
+      "total_mem_gib": 94.97,
+      "free_mem_gib": 94.43,
+      "driver": "580.65.06",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 1.64,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Blackwell",
+    "vram_advertised": 96,
+    "source": "fan-out",
+    "cost_usd": 0.2026,
+    "cost_hr": 2.09,
+    "scaling": 7.32,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": "SECURE",
+    "dc_restricted_us_ca": false,
+    "rationale": "Blackwell workstation"
+  },
+  {
+    "label": "B200 (180 GB)",
+    "stage": "unavailable",
+    "probe": null,
+    "arch": "Blackwell",
+    "vram_advertised": 180,
+    "source": "fan-out",
+    "cost_usd": 0.0,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": null,
+    "dc_restricted_us_ca": null,
+    "rationale": "datacenter Blackwell"
+  },
+  {
+    "label": "A100 SXM 40GB",
+    "stage": "no_public_ip",
+    "probe": null,
+    "arch": "Ampere",
+    "vram_advertised": 40,
+    "source": "fan-out",
+    "cost_usd": 0.1041,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 2,
+    "host_fault_first_draw": true,
+    "low_scaling_persisted": false,
+    "cloud": null,
+    "dc_restricted_us_ca": null,
+    "rationale": "40 GB A100 variant"
+  },
+  {
+    "label": "RTX 3090 Ti (24 GB)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX 3090 Ti (24 GB)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0575,
+          "peak_pool_gib": 0.2109,
+          "pairs": 1999000,
+          "pairs_per_s": 34776880.7,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0932,
+          "peak_pool_gib": 0.6328,
+          "pairs": 12497500,
+          "pairs_per_s": 134089933.5,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.1659,
+          "peak_pool_gib": 1.5703,
+          "pairs": 49995000,
+          "pairs_per_s": 301289717.1,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.4718,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 423925707.3,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA GeForce RTX 3090 Ti",
+      "compute_capability": "8.6",
+      "total_mem_gib": 23.55,
+      "free_mem_gib": 23.28,
+      "driver": "580.65.06",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.358,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Ampere",
+    "vram_advertised": 24,
+    "source": "fan-out",
+    "cost_usd": 0.0167,
+    "cost_hr": 0.27,
+    "scaling": 12.19,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": "COMMUNITY",
+    "dc_restricted_us_ca": false,
+    "rationale": "consumer Ampere, top SKU"
+  },
+  {
+    "label": "RTX 4080 SUPER (16 GB)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX 4080 SUPER (16 GB)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0493,
+          "peak_pool_gib": 0.1914,
+          "pairs": 1999000,
+          "pairs_per_s": 40526462.2,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0857,
+          "peak_pool_gib": 0.627,
+          "pairs": 12497500,
+          "pairs_per_s": 145800952.3,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.1289,
+          "peak_pool_gib": 1.668,
+          "pairs": 49995000,
+          "pairs_per_s": 387788623.9,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.3775,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 529750693.4,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA GeForce RTX 4080 SUPER",
+      "compute_capability": "8.9",
+      "total_mem_gib": 15.58,
+      "free_mem_gib": 15.33,
+      "driver": "570.211.01",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.04,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Ada",
+    "vram_advertised": 16,
+    "source": "fan-out",
+    "cost_usd": 0.0085,
+    "cost_hr": 0.28,
+    "scaling": 13.07,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": "COMMUNITY",
+    "dc_restricted_us_ca": false,
+    "rationale": "consumer Ada, 16 GB"
+  },
+  {
+    "label": "RTX 5000 Ada (32 GB)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX 5000 Ada (32 GB)",
+      "ok": false,
+      "stage": "import",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [],
+      "errors": [
+        "cupy import/device: CUDARuntimeError: cudaErrorDevicesUnavailable: CUDA-capable device(s) is/are busy or unavailable"
+      ]
+    },
+    "arch": "Ada",
+    "vram_advertised": 32,
+    "source": "fan-out",
+    "cost_usd": 0.034,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": null,
+    "dc_restricted_us_ca": null,
+    "rationale": "pro Ada"
+  },
+  {
+    "label": "L40 (48 GB)",
+    "stage": "no_public_ip",
+    "probe": null,
+    "arch": "Ada",
+    "vram_advertised": 48,
+    "source": "fan-out",
+    "cost_usd": 0.0707,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 2,
+    "host_fault_first_draw": true,
+    "low_scaling_persisted": false,
+    "cloud": null,
+    "dc_restricted_us_ca": null,
+    "rationale": "datacenter Ada"
+  },
+  {
+    "label": "H100 NVL (94 GB)",
+    "stage": "unavailable",
+    "probe": null,
+    "arch": "Hopper",
+    "vram_advertised": 94,
+    "source": "fan-out",
+    "cost_usd": 0.0,
+    "cost_hr": null,
+    "scaling": null,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": null,
+    "dc_restricted_us_ca": null,
+    "rationale": "Hopper NVL variant"
+  },
+  {
+    "label": "RTX PRO 4500 (32 GB)",
+    "stage": "done",
+    "probe": {
+      "label": "RTX PRO 4500 (32 GB)",
+      "ok": true,
+      "stage": "done",
+      "precision_requested": "auto",
+      "n_samples": 2504,
+      "runs": [
+        {
+          "p": 2000,
+          "wall_s": 0.0486,
+          "peak_pool_gib": 0.1914,
+          "pairs": 1999000,
+          "pairs_per_s": 41097038.0,
+          "emitted": 96261
+        },
+        {
+          "p": 5000,
+          "wall_s": 0.0724,
+          "peak_pool_gib": 0.627,
+          "pairs": 12497500,
+          "pairs_per_s": 172725032.0,
+          "emitted": 554952
+        },
+        {
+          "p": 10000,
+          "wall_s": 0.0907,
+          "peak_pool_gib": 1.668,
+          "pairs": 49995000,
+          "pairs_per_s": 551241032.2,
+          "emitted": 2144958
+        },
+        {
+          "p": 20000,
+          "wall_s": 0.2783,
+          "peak_pool_gib": 4.9004,
+          "pairs": 199990000,
+          "pairs_per_s": 718600522.8,
+          "emitted": 8587700
+        }
+      ],
+      "errors": [],
+      "gpu_name": "NVIDIA RTX PRO 4500 Blackwell",
+      "compute_capability": "12.0",
+      "total_mem_gib": 31.37,
+      "free_mem_gib": 31.11,
+      "driver": "580.173.02",
+      "cupy": "14.1.1",
+      "cuda_runtime": 12090,
+      "python": "3.12.3",
+      "kernel_compile_s": 2.403,
+      "correctness": {
+        "pairs": 276,
+        "pair_sets_equal": true,
+        "max_abs_err_R": 0.0,
+        "max_abs_err_D": 0.0,
+        "max_abs_err_DP": 0.0
+      },
+      "fused_path": true,
+      "has_cudf": true,
+      "tf32_active": true
+    },
+    "arch": "Blackwell",
+    "vram_advertised": 32,
+    "source": "fan-out",
+    "cost_usd": 0.0183,
+    "cost_hr": 0.72,
+    "scaling": 17.49,
+    "draws": 1,
+    "host_fault_first_draw": false,
+    "low_scaling_persisted": false,
+    "cloud": "SECURE",
+    "dc_restricted_us_ca": false,
+    "rationale": "Blackwell workstation"
+  }
+]
