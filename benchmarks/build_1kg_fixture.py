@@ -31,8 +31,19 @@ import subprocess
 import sys
 
 BEAGLE_HOST = "https://bochet.gcc.biostat.washington.edu/beagle"
-PANEL_URL = f"{BEAGLE_HOST}/1000_Genomes_phase3_v5a/b37.vcf/chr{{c}}.1kg.phase3.v5a.vcf.gz"
 MAP_URL = f"{BEAGLE_HOST}/genetic_maps/plink.GRCh37.map.zip"
+
+# The panel comes from the 1000 Genomes RELEASE, not from the convenience copy
+# Beagle's own site hosts. Measured on chr20: the beagle-site file carries
+# 679,241 markers, and filtering it the paper's way yields 618,570 against the
+# paper's 1,718,742 -- a 64% shortfall, because that copy is already filtered.
+# The shortfall was caught only because the paper's counts are asserted; a
+# fixture built on it would have looked entirely reasonable and scored a
+# different marker set from every published number.
+#
+# Chromosome-level files are versioned v5a or v5b and which one exists VARIES BY
+# CHROMOSOME, so both are tried. Guessing wrong silently changes the marker set:
+# a previous project shipped a URL naming the version the mirror did not carry.
 # The 1000 Genomes release is mirrored on S3 and served from EBI's FTP. Measured
 # from a CA-MTL RunPod pod on 2026-08-12: S3 77 MB/s, EBI 0.2 MB/s -- a 370x
 # gap, which is 17 seconds against two hours for the 1.33 GB chip file. Prefer
@@ -117,6 +128,22 @@ def fetch(url, dest, verify_gzip=True, fallback=None):
     raise RuntimeError(f"could not obtain a valid copy from any of {urls}")
 
 
+def fetch_panel(c, W):
+    """The 1000 Genomes phase 3 release for one chromosome, v5a or v5b."""
+    rel = "/release/20130502/ALL.chr{c}.phase3_shapeit2_mvncall_integrated_{v}.20130502.genotypes.vcf.gz"
+    last = None
+    for v in ("v5a", "v5b"):
+        url = _1KG_S3 + rel.format(c=c, v=v)
+        head = subprocess.run(["curl", "-fsSI", url], capture_output=True,
+                              text=True)
+        if head.returncode == 0:
+            print(f"  chromosome {c} release is {v}")
+            return fetch(url, f"{W}/chr{c}.1kg.phase3.{v}.vcf.gz",
+                         fallback=_1KG_EBI + rel.format(c=c, v=v))
+        last = url
+    raise RuntimeError(f"neither v5a nor v5b exists for chr{c} (tried {last})")
+
+
 def _gzip_ok(path):
     if not path.endswith(".gz"):
         return True
@@ -140,7 +167,7 @@ def main():
     os.makedirs(W, exist_ok=True)
 
     print(f"=== 1000 Genomes phase3 v5a, chromosome {c} ===", flush=True)
-    panel = fetch(PANEL_URL.format(c=c), f"{W}/chr{c}.1kg.phase3.v5a.vcf.gz")
+    panel = fetch_panel(c, W)
     omni = fetch(OMNI_URL, f"{W}/omni.vcf.gz",
                  fallback=OMNI_URL_FALLBACK)
     pan = fetch(SAMPLE_PANEL, f"{W}/samples.panel", verify_gzip=False,
