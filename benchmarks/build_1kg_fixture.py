@@ -33,13 +33,26 @@ import sys
 BEAGLE_HOST = "https://bochet.gcc.biostat.washington.edu/beagle"
 PANEL_URL = f"{BEAGLE_HOST}/1000_Genomes_phase3_v5a/b37.vcf/chr{{c}}.1kg.phase3.v5a.vcf.gz"
 MAP_URL = f"{BEAGLE_HOST}/genetic_maps/plink.GRCh37.map.zip"
+# The 1000 Genomes release is mirrored on S3 and served from EBI's FTP. Measured
+# from a CA-MTL RunPod pod on 2026-08-12: S3 77 MB/s, EBI 0.2 MB/s -- a 370x
+# gap, which is 17 seconds against two hours for the 1.33 GB chip file. Prefer
+# S3 and keep EBI only as a fallback.
+#
+# The main phase3 panel deliberately comes from Browning's own host instead of
+# either, because the S3 and EBI copies have carried DIFFERENT VERSIONS (v5a vs
+# v5b) of that file, and picking the wrong one silently changes the marker set.
+_1KG_S3 = "https://1000genomes.s3.amazonaws.com"
+_1KG_EBI = "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp"
+_OMNI_REL = ("/release/20130502/supporting/hd_genotype_chip/"
+             "ALL.chip.omni_broad_sanger_combined.20140818.snps.genotypes.vcf.gz")
+_PANEL_REL = "/release/20130502/integrated_call_samples_v3.20130502.ALL.panel"
+
 # Omni2.5 site list, taken from the 1000 Genomes chip genotypes rather than the
 # Illumina manifest, which needs registration.
-OMNI_URL = ("https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/"
-            "supporting/hd_genotype_chip/"
-            "ALL.chip.omni_broad_sanger_combined.20140818.snps.genotypes.vcf.gz")
-SAMPLE_PANEL = ("https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/"
-                "integrated_call_samples_v3.20130502.ALL.panel")
+OMNI_URL = _1KG_S3 + _OMNI_REL
+OMNI_URL_FALLBACK = _1KG_EBI + _OMNI_REL
+SAMPLE_PANEL = _1KG_S3 + _PANEL_REL
+SAMPLE_PANEL_FALLBACK = _1KG_EBI + _PANEL_REL
 
 # From Table 2 and the Data section. Reproducing these is the gate.
 EXPECTED = {
@@ -69,7 +82,7 @@ def _safe_workdir(p):
     return os.path.abspath(p)
 
 
-def fetch(url, dest, verify_gzip=True):
+def fetch(url, dest, verify_gzip=True, fallback=None):
     """Download with resume, then prove the file decompresses.
 
     A truncated or corrupt gzip is the failure mode that cost this project a
@@ -85,13 +98,23 @@ def fetch(url, dest, verify_gzip=True):
             pass
         print(f"  {os.path.basename(dest)} is corrupt, refetching")
         os.remove(dest)
-    for attempt in range(3):
-        sh(f"curl -fsSL --retry 5 --retry-delay 5 -C - -o {dest!r} {url!r}")
-        if not verify_gzip or _gzip_ok(dest):
-            return dest
-        print(f"  attempt {attempt + 1}: downloaded file does not decompress")
-        os.remove(dest)
-    raise RuntimeError(f"could not obtain a valid {url}")
+    urls = [url] + ([fallback] if fallback else [])
+    for u in urls:
+        for attempt in range(2):
+            try:
+                sh(f"curl -fsSL --retry 3 --retry-delay 5 --speed-time 60 "
+                   f"--speed-limit 100000 -C - -o {dest!r} {u!r}")
+            except subprocess.CalledProcessError as e:
+                # --speed-limit aborts a transfer stuck below 100 KB/s for a
+                # minute, so a slow mirror fails over instead of hanging for
+                # hours. EBI was measured at 0.2 MB/s against S3's 77.
+                print(f"  {u.split('/')[2]}: transfer failed ({e.returncode})")
+                break
+            if not verify_gzip or _gzip_ok(dest):
+                return dest
+            print(f"  attempt {attempt + 1}: downloaded file does not decompress")
+            os.remove(dest)
+    raise RuntimeError(f"could not obtain a valid copy from any of {urls}")
 
 
 def _gzip_ok(path):
@@ -118,8 +141,10 @@ def main():
 
     print(f"=== 1000 Genomes phase3 v5a, chromosome {c} ===", flush=True)
     panel = fetch(PANEL_URL.format(c=c), f"{W}/chr{c}.1kg.phase3.v5a.vcf.gz")
-    omni = fetch(OMNI_URL, f"{W}/omni.vcf.gz")
-    pan = fetch(SAMPLE_PANEL, f"{W}/samples.panel", verify_gzip=False)
+    omni = fetch(OMNI_URL, f"{W}/omni.vcf.gz",
+                 fallback=OMNI_URL_FALLBACK)
+    pan = fetch(SAMPLE_PANEL, f"{W}/samples.panel", verify_gzip=False,
+                fallback=SAMPLE_PANEL_FALLBACK)
     fetch(MAP_URL, f"{W}/plink.GRCh37.map.zip", verify_gzip=False)
     if not os.path.exists(f"{W}/plink.chr{c}.GRCh37.map"):
         sh(f"cd {W} && unzip -o -q plink.GRCh37.map.zip")
