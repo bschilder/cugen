@@ -45,35 +45,51 @@ from _peak import PeakSampler
 
 
 def make_fixture(n, p, seed, workdir):
-    """Matched .bed + .cugen + annotation + sumstats at one sample size."""
+    """Matched .bed + .cugen + annotation + sumstats at one sample size.
+
+    Writes the PLINK1 .bed BINARY directly, streaming one LD block at a time.
+    The first version wrote a VCF and shelled out to --make-bed, which is
+    p * n genotype STRINGS in Python -- 1e10 of them at p=20,000 and
+    n=500,000. It never finished, and looked from outside exactly like a hung
+    pod. nscaling.py already had the right approach; this borrows it.
+
+    Streaming also bounds peak host memory at O(block * n) rather than
+    O(p * n), which would be 10 GB at the top of the grid.
+    """
     from cugen.convert import bed2cugen
     rng = np.random.default_rng(seed)
-    G = np.zeros((p, n), dtype=np.uint8)
-    k = 0
-    while k < p:                       # LD blocks, so clumping has structure
-        blk = int(min(rng.integers(5, 40), p - k))
-        base = rng.integers(0, 2, size=(n, 2)).sum(1)
-        for j in range(blk):
-            noise = rng.random(n) < rng.uniform(0.0, 0.5)
-            G[k + j] = np.where(noise, rng.integers(0, 3, n), base)
-        k += blk
     pos = np.sort(rng.choice(np.arange(1, 20_000_000), size=p, replace=False))
     ids = [f"v{i}" for i in range(p)]
-
-    vcf = os.path.join(workdir, f"n{n}.vcf")
-    with open(vcf, "w") as f:
-        f.write("##fileformat=VCFv4.2\n##contig=<ID=1>\n")
-        f.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
-                + "\t".join(f"S{i}" for i in range(n)) + "\n")
-        for v in range(p):
-            gt = ["0/0" if x == 0 else "0/1" if x == 1 else "1/1" for x in G[v]]
-            f.write(f"1\t{pos[v]}\t{ids[v]}\tA\tG\t.\t.\t.\tGT\t"
-                    + "\t".join(gt) + "\n")
     base = os.path.join(workdir, f"n{n}")
-    subprocess.run(["plink2", "--vcf", vcf, "--make-bed", "--out", base,
-                    "--silent"], capture_output=True, text=True)
+
+    # PLINK codes: 00 hom A1, 10 het, 11 hom A2, packed little-endian within
+    # the byte (sample 0 in the LOW bits) -- the opposite order from .cugen,
+    # which is why bed2cugen remaps rather than copying.
+    lut = np.array([0b00, 0b10, 0b11], dtype=np.uint8)
+    pad = (-n) % 4
+    written = 0
+    with open(base + ".bed", "wb") as f:
+        f.write(bytes([0x6C, 0x1B, 0x01]))
+        while written < p:
+            blk = int(min(rng.integers(5, 40), p - written))
+            bas = rng.integers(0, 2, size=(n, 2)).sum(1)      # the LD block
+            for _ in range(blk):
+                noise = rng.random(n) < rng.uniform(0.0, 0.5)
+                g = np.where(noise, rng.integers(0, 3, n), bas).astype(np.uint8)
+                codes = lut[g]
+                if pad:
+                    codes = np.concatenate([codes, np.zeros(pad, np.uint8)])
+                c = codes.reshape(-1, 4)
+                f.write((c[:, 0] | (c[:, 1] << 2) | (c[:, 2] << 4)
+                         | (c[:, 3] << 6)).astype(np.uint8).tobytes())
+            written += blk
+    with open(base + ".bim", "w") as f:
+        for v in range(p):
+            f.write(f"1\t{ids[v]}\t0\t{pos[v]}\tA\tG\n")
+    with open(base + ".fam", "w") as f:
+        for s in range(n):
+            f.write(f"S{s} S{s} 0 0 0 -9\n")
     bed2cugen(base + ".bed", base + ".cugen", verbose=False)
-    os.remove(vcf)
 
     ann = pd.DataFrame({"gidx": np.arange(p), "ID": ids, "POS": pos,
                         "CHR": "1"})
@@ -106,7 +122,11 @@ def main():
         rec = {"n": n, "p": a.p}
         print(f"\n=== n = {n:,} samples, p = {a.p:,} variants ===", flush=True)
         try:
+            t0 = time.perf_counter()
+            print(f"  building matched .bed/.cugen ...", flush=True)
             base, ann, ss = make_fixture(n, a.p, 20260812, a.workdir)
+            print(f"  fixture ready in {time.perf_counter() - t0:.1f} s",
+                  flush=True)
         except Exception as e:                                # noqa: BLE001
             rec["error"] = f"fixture: {type(e).__name__}: {e}"
             print(f"  fixture FAILED: {e}", flush=True)
