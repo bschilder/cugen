@@ -315,7 +315,11 @@ def impute(target, *, ref, annotation=None, map=None, out=None,
             print(f"[impute] path: {path}")
 
         t0 = time.perf_counter()
-        ref_bits_all = rref.read_haplotypes()
+        # The target is small (an array marker set), so it is read whole. The
+        # reference is not: at chr20 scale the full haplotype matrix is 8.5 GiB,
+        # and slicing a window out of it costs another copy on top. Windows are
+        # contiguous in position, so each one is a ranged read instead, and peak
+        # memory becomes a function of WINDOW size rather than chromosome size.
         tgt_bits_all = rtgt.read_haplotypes()
         timers["read"] = time.perf_counter() - t0
 
@@ -331,10 +335,18 @@ def impute(target, *, ref, annotation=None, map=None, out=None,
             keep = np.flatnonzero(owner[mk] == w)
             if keep.size == 0:
                 continue
-            sub_ref = ref_bits_all[:, mk]
+            # mk is contiguous because markers are position-sorted and a
+            # window is a cM interval; assert it rather than assume, since a
+            # non-contiguous mk would make the ranged read silently return the
+            # wrong markers instead of failing.
+            m0, m1 = int(mk[0]), int(mk[-1]) + 1
+            assert mk.size == m1 - m0, "window markers are not contiguous"
+            t_read = time.perf_counter()
+            sub_ref = rref.read_haplotypes(m0, m1)
+            timers["read"] = timers.get("read", 0.0) + (time.perf_counter() - t_read)
             sub_tgt = tgt_bits_all[:, tk]
             # tgt_idx points into the full reference; re-index into this window
-            loc = np.searchsorted(mk, tgt_idx[tk])
+            loc = tgt_idx[tk] - m0
             kw = dict(ne=ne, err=err, cluster=cluster, timers=timers)
             if not use_gpu:
                 kw.update(block=block, sparse=sparse)

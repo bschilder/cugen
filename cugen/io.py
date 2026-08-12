@@ -266,7 +266,8 @@ class CugenReader:
                 f"1|1 (dosage 2). Use read_haplotypes() for the allele bits, or "
                 f"read_dosages_from_phased() for dosages under the popcount map.")
 
-    def read_haplotypes(self, start: int = 0, end: Optional[int] = None) -> np.ndarray:
+    def read_haplotypes(self, start: int = 0, end: Optional[int] = None,
+                        chunk_variants: int = 65536) -> np.ndarray:
         """Phased allele bits as (2*n_samples, n_variants) uint8 of 0/1.
 
         Row 2i and row 2i+1 are sample i's two haplotypes. This is the natural
@@ -283,12 +284,21 @@ class CugenReader:
             end = self.n_variants
         n_variants = end - start
         n_hap = 2 * self.n_samples
-        packed = np.frombuffer(self.read_packed_bytes(start, end), dtype=np.uint8)
-        packed = packed.reshape(n_variants, self.bytes_per_variant)
-        out = np.empty((self.bytes_per_variant * 8, n_variants), dtype=np.uint8)
-        for k in range(8):
-            out[k::8, :] = (packed.T >> (7 - k)) & 1
-        return out[:n_hap, :]
+        out = np.empty((n_hap, n_variants), dtype=np.uint8)
+        # np.unpackbits is MSB-first, matching the format, and does the whole
+        # thing in C. The obvious loop -- eight strided passes writing
+        # out[k::8, :] from (packed.T >> (7-k)) & 1 -- allocates two full-size
+        # temporaries per pass and writes with a stride of 8 rows, so at
+        # chromosome scale it churns ~16x the array size through cache and runs
+        # for minutes at 100% of one core. Chunking bounds the temporaries to
+        # one block regardless of how many markers are asked for.
+        for lo in range(0, n_variants, chunk_variants):
+            hi = min(lo + chunk_variants, n_variants)
+            packed = np.frombuffer(
+                self.read_packed_bytes(start + lo, start + hi), dtype=np.uint8)
+            packed = packed.reshape(hi - lo, self.bytes_per_variant)
+            out[:, lo:hi] = np.unpackbits(packed, axis=1).T[:n_hap, :]
+        return out
 
     def read_dosages_from_phased(self, start: int = 0,
                                  end: Optional[int] = None) -> np.ndarray:
