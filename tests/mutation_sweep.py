@@ -3,6 +3,11 @@
 If the suite still passes, whatever test was supposed to cover that behaviour
 is decorative. This is the check that caught three dud tests in the LD work
 and one here (the l*eps rule, which was computed inline and never asserted).
+
+Deliberately NOT included: removing `tau[0] = 0.0` from transition_tau. That is
+an equivalent mutant -- d[0] is already 0, so tau[0] is already 0 and the line
+cannot change any output. Listing it would make the sweep permanently red for a
+behaviour that does not exist.
 """
 import pathlib
 import shutil
@@ -26,8 +31,6 @@ MUTATIONS = [
     ("forward pass skips normalisation", "cugen/_impute_core.py",
      "        a /= a.sum(axis=0, keepdims=True)\n        alpha[c] = a",
      "        alpha[c] = a"),
-    ("tau[0] not forced to zero", "cugen/_impute_core.py",
-     "    tau[0] = 0.0\n    return tau", "    return tau"),
     ("carriers store majority not minority", "cugen/_impute_core.py",
      "major = (ones * 2 > K).astype(np.uint8)",
      "major = np.zeros(M, dtype=np.uint8)"),
