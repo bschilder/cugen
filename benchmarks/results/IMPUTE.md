@@ -50,30 +50,40 @@ probability, not the per-genotype dosage r2 usually quoted:
 | 1001–2000 | 53,250 | 0.982 |
 | 2001+ | 21,874 | 0.978 |
 
-## Speed: cugen LOSES this configuration, 2.4x
-
-**cugen 76.7s against Beagle's 32.0s on the same fixture — 0.42x.** Stated
-plainly because it is the honest result and the configuration is a real one.
-
-Where the 76.7s goes:
+## Speed: cugen 28.5s against Beagle's 32.6s — 1.14x
 
 | phase | seconds | scales with |
 |---|---|---|
-| carriers | 30.7 | reference panel only |
-| read | 18.5 | reference panel only |
-| forward-backward (GPU) | 12.1 | targets x panel |
-| write | 7.8 | output size |
-| aggregate | 1.9 | target markers |
-| dose (GPU) | 0.8 | targets x carriers |
+| forward-backward (GPU) | 12.12 | targets x panel |
+| write | 8.46 | output size |
+| carriers (GPU) | 1.73 | reference panel only |
+| summary | 1.39 | output size |
+| read | 0.93 | reference panel only |
+| aggregate | 0.61 | target markers |
+| dose (GPU) | 0.11 | targets x carriers |
+| **total** | **28.31** | |
 
-**GPU work is 12.9 of 76.7 seconds.** The two largest phases do not depend on
-the number of target samples at all. With 52 targets against 2,452 reference
-samples, there is not enough per-target work to amortise preparing the panel.
+This started at 76.7s — a **2.4x loss** — and the two phases responsible were
+both reference-panel work that no target sample ever touches:
 
-That is not a surprising regime — it is one the paper itself flags: *"When
-reference panel size is much greater than the target panel size, the time
-required to read the reference panel from persistent storage dominates the
-computation time."*
+| phase | was | now | |
+|---|---|---|---|
+| carriers | 30.7s | 1.73s | 17.7x |
+| read | 18.5s | 0.93s | 20x |
+
+Neither was made cleverer. The carrier lists are now built on the GPU straight
+from the packed bytes, so the host never expands a window to a (K, M) byte
+matrix — 2.4 GiB per window that was read, written and scanned purely to
+support a step that has since moved off the host entirely. Only the genotyped
+columns are unpacked now: tens of thousands against hundreds of thousands.
+
+The direction came from asking whether the reference panel could be encoded
+once to make reading it cheaper. It already was a `.cugen`; the cost was
+everything *derived* from it on every run.
+
+Beagle solves the same problem the other way, with bref3 — a prepared binary
+panel — and the 2018 paper attributes its sublinear scaling in panel size to
+exactly that.
 
 ## Scaling: the fixed cost is the whole story
 

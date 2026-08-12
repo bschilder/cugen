@@ -1,7 +1,7 @@
 {
   "chrom": 20,
   "ne": 100000,
-  "cugen_seconds": 76.72,
+  "cugen_seconds": 28.54,
   "cugen_dosage_r2_all_imputed": 0.9788636640788397,
   "cugen_paper_r2_by_mac": [
     {
@@ -77,10 +77,10 @@
       "r2": 0.9776556409332294
     }
   ],
-  "beagle_seconds": 31.96,
+  "beagle_seconds": 32.61,
   "beagle_dosage_r2_all_imputed": 0.9791272293719084,
   "cugen_vs_beagle_dose_corr": 0.9990100857987407,
   "cugen_vs_beagle_max_abs_diff": 1.8241406679153442,
   "n_common_markers": 1733484,
-  "speedup_vs_beagle": 0.42
+  "speedup_vs_beagle": 1.14
 }
