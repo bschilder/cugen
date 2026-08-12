@@ -330,6 +330,54 @@ class CugenWriter:
         self.f.write(packed.tobytes())
         self.i += 1
 
+    def add_variants_bulk(self, gidx, dosages):
+        """Append many variants at once. `dosages` is (n_samples, n_variants).
+
+        Float encodings store the values verbatim, so the whole block can be
+        transposed and written in one call and the per-variant statistics can be
+        computed with array operations. The per-variant loop costs a Python
+        iteration and several small numpy calls per marker, which is 32 seconds
+        for one chromosome of imputed output -- more than the entire GPU
+        computation that produced it.
+        """
+        if self.encoding not in (ENCODING_FLOAT16, ENCODING_FLOAT32):
+            raise ValueError(
+                f"add_variants_bulk is for float encodings; this writer has "
+                f"encoding {self.encoding}. The integer encodings need "
+                f"per-variant packing.")
+        d = np.asarray(dosages, dtype=np.float64)
+        if d.ndim != 2 or d.shape[0] != self.n_samples:
+            raise ValueError(f"dosages must be (n_samples={self.n_samples}, "
+                             f"n_variants), got {d.shape}")
+        n = d.shape[1]
+        if self.i + n > self.n_variants:
+            raise IndexError(f"writing {n} variants at position {self.i} "
+                             f"exceeds the declared {self.n_variants}")
+        g = np.asarray(gidx, dtype=np.int64)
+        if g.size != n:
+            raise ValueError(f"{g.size} gidx entries for {n} variants")
+
+        ok = np.isfinite(d) & (d >= 0) & (d <= 2)          # same rule as
+        cnt = ok.sum(axis=0)                                # variant_stats()
+        x = np.where(ok, d, 0.0)
+        mu = np.divide(x.sum(axis=0), np.maximum(cnt, 1))
+        sxx = (np.where(ok, (d - mu[None, :]) ** 2, 0.0)).sum(axis=0)
+        af = mu / 2.0
+        maf = np.minimum(af, 1.0 - af)
+        empty = cnt == 0
+        mu[empty] = 0.0; sxx[empty] = 0.0; maf[empty] = 0.0
+        if bool((cnt < self.n_samples).any()):
+            self.flags |= FLAG_HAS_MISSING
+
+        sl = slice(self.i, self.i + n)
+        self.mu_x[sl] = mu
+        self.sxx[sl] = sxx
+        self.maf[sl] = maf
+        self.gidx[sl] = g
+        dt = np.float16 if self.encoding == ENCODING_FLOAT16 else np.float32
+        self.f.write(np.ascontiguousarray(d.T, dtype=dt).tobytes())
+        self.i += n
+
     def _finalize(self):
         if self.i != self.n_variants:
             raise ValueError(f"declared {self.n_variants} variants, wrote {self.i}")

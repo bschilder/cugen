@@ -159,13 +159,20 @@ def allele_sequence_codes(ref_bits, tgt_bits, starts, stops):
 
     ref_codes = np.empty((C, K), dtype=np.int32)
     tgt_codes = np.empty((C, T), dtype=np.int32)
-    for c in range(C):
+
+    # Singleton aggregates are the overwhelming majority and need no unique()
+    # at all -- the allele IS the code. Doing them as two array assignments
+    # rather than one Python iteration each matters: at chr20 scale there are
+    # tens of thousands of aggregates and this phase measured 43.9s against
+    # 1.6s of actual GPU work.
+    lens = np.asarray(stops) - np.asarray(starts)
+    single = lens == 1
+    if single.any():
+        cols = np.asarray(starts)[single]
+        ref_codes[single] = ref_bits[:, cols].T
+        tgt_codes[single] = tgt_bits[:, cols].T
+    for c in np.flatnonzero(~single):
         a, b = int(starts[c]), int(stops[c])
-        if b - a == 1:
-            # the overwhelmingly common case; skip the unique() machinery
-            ref_codes[c] = ref_bits[:, a]
-            tgt_codes[c] = tgt_bits[:, a]
-            continue
         block = np.concatenate([ref_bits[:, a:b], tgt_bits[:, a:b]], axis=0)
         _, inv = np.unique(block, axis=0, return_inverse=True)
         inv = inv.reshape(-1).astype(np.int32)

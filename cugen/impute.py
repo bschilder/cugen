@@ -370,8 +370,13 @@ def impute(target, *, ref, annotation=None, map=None, out=None,
             from .write import CugenWriter
             with CugenWriter(out, rtgt.n_samples, rref.n_variants,
                              encoding=ENCODING_FLOAT16) as w_:
-                for j in range(rref.n_variants):
-                    w_.add_variant(int(rref.gidx[j]), dose[:, j])
+                # In blocks, not per variant: the per-variant loop measured 32s
+                # for one chromosome, more than the entire GPU computation that
+                # produced the values.
+                step = 200_000
+                for j0 in range(0, rref.n_variants, step):
+                    j1 = min(j0 + step, rref.n_variants)
+                    w_.add_variants_bulk(rref.gidx[j0:j1], dose[:, j0:j1])
             timers["write"] = time.perf_counter() - t0
 
         frame = pd.DataFrame({

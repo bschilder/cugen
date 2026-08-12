@@ -520,3 +520,38 @@ def test_dosage_r2_bounds_and_direction():
     assert np.allclose(dosage_r2(np.full((20, 50), 0.5)), 0.0)
     r = dosage_r2(rng.random((20, 50)))
     assert r.min() >= 0.0 and r.max() <= 1.0
+
+
+def test_bulk_writer_is_byte_identical_to_per_variant(tmp_path):
+    """The fast path must be a pure optimisation, NaNs and all.
+
+    add_variants_bulk recomputes mu/sxx/maf with array operations instead of
+    calling variant_stats per marker, so it is a second implementation of the
+    same statistics and has to be pinned against the first.
+    """
+    from cugen.write import CugenWriter, ENCODING_FLOAT16
+    rng = np.random.default_rng(0)
+    n_s, n_v = 17, 500
+    dose = rng.uniform(0, 2, size=(n_s, n_v))
+    dose[3, 7] = np.nan                      # exercise the missing-value rule
+    dose[5, 9] = 3.5                         # and the out-of-range rule
+    g = np.arange(n_v) * 3
+    a, b = tmp_path / "a.cugen", tmp_path / "b.cugen"
+    with CugenWriter(str(a), n_s, n_v, encoding=ENCODING_FLOAT16) as w:
+        for j in range(n_v):
+            w.add_variant(int(g[j]), dose[:, j])
+    with CugenWriter(str(b), n_s, n_v, encoding=ENCODING_FLOAT16) as w:
+        for lo in range(0, n_v, 137):        # block size must not matter
+            hi = min(lo + 137, n_v)
+            w.add_variants_bulk(g[lo:hi], dose[:, lo:hi])
+    assert a.read_bytes() == b.read_bytes()
+
+
+def test_bulk_writer_refuses_integer_encodings(tmp_path):
+    from cugen.write import CugenWriter, ENCODING_2BIT
+    with CugenWriter(str(tmp_path / "c.cugen"), 4, 2,
+                     encoding=ENCODING_2BIT) as w:
+        with pytest.raises(ValueError, match="float encodings"):
+            w.add_variants_bulk([0, 1], np.zeros((4, 2)))
+        w.add_variant(0, [0, 1, 2, 0])
+        w.add_variant(1, [0, 1, 2, 0])
