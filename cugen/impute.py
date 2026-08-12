@@ -349,13 +349,26 @@ def impute(target, *, ref, annotation=None, map=None, out=None,
             m0, m1 = int(mk[0]), int(mk[-1]) + 1
             assert mk.size == m1 - m0, "window markers are not contiguous"
             t_read = time.perf_counter()
-            sub_ref = rref.read_haplotypes(m0, m1)
+            if use_gpu:
+                # Packed bytes only. The device builds the carrier lists from
+                # them and unpacks just the genotyped columns, so the window is
+                # never expanded to a (K, M) byte matrix on the host -- 2.4 GiB
+                # per window at chr20 scale, read and scanned for nothing.
+                sub_ref = None
+                sub_packed = np.frombuffer(rref.read_packed_bytes(m0, m1),
+                                           dtype=np.uint8)
+            else:
+                sub_ref = rref.read_haplotypes(m0, m1)
+                sub_packed = None
             timers["read"] = timers.get("read", 0.0) + (time.perf_counter() - t_read)
             sub_tgt = tgt_bits_all[:, tk]
             # tgt_idx points into the full reference; re-index into this window
             loc = tgt_idx[tk] - m0
             kw = dict(ne=ne, err=err, cluster=cluster, timers=timers)
-            if not use_gpu:
+            if use_gpu:
+                kw.update(ref_packed=sub_packed, n_hap=K,
+                          bytes_per_variant=rref.bytes_per_variant)
+            else:
                 kw.update(block=block, sparse=sparse)
             pw = engine(sub_ref, sub_tgt, loc, marker_cm[mk], **kw)
             allele_prob[:, mk[keep]] = pw[:, keep]

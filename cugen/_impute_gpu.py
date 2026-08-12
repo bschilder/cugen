@@ -51,7 +51,7 @@ except ImportError:                                            # noqa: BLE001
     HAS_CUPY = False
 
 __all__ = ["fb_posteriors_gpu", "dose_sparse_gpu", "impute_haplotypes_gpu",
-           "plan_t_tile", "IMPUTE_SRC"]
+           "build_carriers_gpu", "plan_t_tile", "IMPUTE_SRC"]
 
 _MODULE = None
 
@@ -272,6 +272,58 @@ __global__ void dose_sparse(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Minority-allele carrier lists, straight from the PACKED reference bytes.
+//
+// This replaced two host phases that between them were 49.2s of a 76.7s run and
+// depend only on the reference panel -- building the carrier lists (30.7s) and
+// unpacking the whole window to (K, M) bytes just to scan it (18.5s). Neither
+// touches target data, so neither belonged on the critical path at all.
+//
+// One thread per marker, walking that marker's bytes serially. Adjacent threads
+// are bytes_per_variant apart so the reads do not coalesce, which is worth it:
+// the alternative orderings either need a block-wide scan to keep indices
+// sorted, or drop the ordering entirely. Sorted output keeps this
+// bit-comparable against the numpy build_carriers.
+// ---------------------------------------------------------------------------
+__global__ void carrier_counts(
+    const unsigned char* __restrict__ packed,   // (M, bpv)
+    long long* __restrict__ ones,               // (M,) out: count of allele 1
+    const int M, const int n_hap, const int bpv)
+{
+    const long long m = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M) return;
+    const unsigned char* row = packed + m * (long long)bpv;
+    int c = 0;
+    const int full = n_hap >> 3;
+    for (int b = 0; b < full; ++b) c += __popc((unsigned int)row[b]);
+    const int rem = n_hap & 7;               // trailing bits are padding zeros,
+    if (rem) {                               // but mask anyway rather than trust
+        const unsigned char mask = (unsigned char)(0xFF << (8 - rem));
+        c += __popc((unsigned int)(row[full] & mask));
+    }
+    ones[m] = c;
+}
+
+__global__ void carrier_scatter(
+    const unsigned char* __restrict__ packed,   // (M, bpv)
+    const long long* __restrict__ indptr,       // (M+1,)
+    const unsigned char* __restrict__ major,    // (M,)
+    int* __restrict__ indices,                  // (nnz,) out
+    const int M, const int n_hap, const int bpv)
+{
+    const long long m = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M) return;
+    const unsigned char* row = packed + m * (long long)bpv;
+    const int want = (major[m] == (unsigned char)1) ? 0 : 1;
+    long long w = indptr[m];
+    const long long end = indptr[m + 1];
+    for (int j = 0; j < n_hap && w < end; ++j) {
+        const int bit = (row[j >> 3] >> (7 - (j & 7))) & 1;
+        if (bit == want) indices[w++] = j;
+    }
+}
+
 }   // extern "C"
 '''
 
@@ -356,10 +408,52 @@ def dose_sparse_gpu(post, indptr, indices, major, left, lam):
     return out
 
 
+def build_carriers_gpu(packed, n_hap, n_markers, bytes_per_variant):
+    """Carrier lists from PACKED reference bytes, on the device.
+
+    packed : (n_markers, bytes_per_variant) uint8, exactly as stored on disk
+    returns: (indptr, indices, major) matching _impute_core.build_carriers
+
+    Takes the packed bytes rather than an unpacked (K, M) matrix, which is the
+    point: the host never has to expand the window at all. Together with
+    computing the counts here instead of in a Python loop, this removes the two
+    phases that were 49.2s of a 76.7s run and that depend only on the reference
+    panel.
+    """
+    mod = _module()
+    pk = cp.ascontiguousarray(cp.asarray(packed, dtype=cp.uint8))
+    M = int(n_markers)
+    ones = cp.empty(M, dtype=cp.int64)
+    threads = 256
+    blocks = (M + threads - 1) // threads
+    mod.get_function("carrier_counts")(
+        (blocks,), (threads,), (pk, ones, np.int32(M), np.int32(n_hap),
+                                np.int32(bytes_per_variant)))
+    major = ((ones * 2) > n_hap).astype(cp.uint8)
+    counts = cp.where(major == 1, n_hap - ones, ones)
+    indptr = cp.zeros(M + 1, dtype=cp.int64)
+    cp.cumsum(counts, out=indptr[1:])
+    nnz = int(indptr[-1].get())
+    indices = cp.empty(max(nnz, 1), dtype=cp.int32)
+    mod.get_function("carrier_scatter")(
+        (blocks,), (threads,), (pk, indptr, major, indices, np.int32(M),
+                                np.int32(n_hap), np.int32(bytes_per_variant)))
+    return indptr, indices[:nnz], major
+
+
 def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
                           ne=100_000, err=None, cluster=0.005, carriers=None,
-                          timers=None, budget_bytes=None):
-    """GPU counterpart of _impute_core.impute_haplotypes. Returns (T, M) float32."""
+                          timers=None, budget_bytes=None, ref_packed=None,
+                          n_hap=None, bytes_per_variant=None):
+    """GPU counterpart of _impute_core.impute_haplotypes. Returns (T, M) float32.
+
+    Pass `ref_packed` (the on-disk bytes, with n_hap and bytes_per_variant) to
+    take the fast path: carriers are built on the device straight from the
+    packed form, and only the genotyped columns are ever unpacked on the host.
+    `ref_bits` may then be None. That skips expanding the window to a (K, M)
+    byte matrix, which for one 40 cM window of chr20 is 2.4 GiB the host reads,
+    writes and then scans -- and which nothing except the carrier build needed.
+    """
     import time
 
     from ._impute_core import (aggregate_markers, aggregate_mismatch,
@@ -372,19 +466,34 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
     def tick(name, t0):
         t[name] = t.get(name, 0.0) + (time.perf_counter() - t0)
 
-    ref_bits = np.asarray(ref_bits)
     tgt_bits = np.asarray(tgt_bits)
     tgt_idx = np.asarray(tgt_idx, dtype=np.int64)
     marker_cm = np.asarray(marker_cm, dtype=np.float64)
-    K, M = ref_bits.shape
     T = tgt_bits.shape[0]
+
+    packed_path = ref_packed is not None
+    if packed_path:
+        if n_hap is None or bytes_per_variant is None:
+            raise ValueError("ref_packed needs n_hap and bytes_per_variant")
+        ref_packed = np.ascontiguousarray(
+            np.asarray(ref_packed, dtype=np.uint8).reshape(-1, bytes_per_variant))
+        K, M = int(n_hap), int(ref_packed.shape[0])
+    else:
+        ref_bits = np.asarray(ref_bits)
+        K, M = ref_bits.shape
     if err is None:
         err = default_err(K)
 
     t0 = time.perf_counter()
     starts, stops, agg_cm = aggregate_markers(marker_cm[tgt_idx], cluster)
+    if packed_path:
+        # Unpack ONLY the genotyped columns -- tens of thousands, against the
+        # window's hundreds of thousands.
+        sub = np.unpackbits(ref_packed[tgt_idx], axis=1).T[:K, :]
+    else:
+        sub = ref_bits[:, tgt_idx]
     ref_codes, tgt_codes = allele_sequence_codes(
-        ref_bits[:, tgt_idx], tgt_bits, starts, stops)
+        sub, tgt_bits, starts, stops)
     tau = transition_tau(agg_cm / 100.0, ne, K)
     mism = aggregate_mismatch(starts, stops, err)
     C = starts.size
@@ -396,7 +505,11 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
 
     if carriers is None:
         t0 = time.perf_counter()
-        carriers = build_carriers(ref_bits)
+        if packed_path:
+            carriers = build_carriers_gpu(ref_packed, K, M, bytes_per_variant)
+            cp.cuda.Device().synchronize()
+        else:
+            carriers = build_carriers(ref_bits)
         tick("carriers", t0)
     indptr, indices, major = carriers
 

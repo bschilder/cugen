@@ -267,3 +267,83 @@ def test_gpu_tiling_is_transparent():
                                   **kw)
     assert t["_t_tile_count"] < 24, f"budget did not force tiling (tile={t['t_tile']})"
     assert np.abs(whole - tiled).max() < 1e-6
+
+
+# --------------------------------------------------------------------------
+# Carrier lists from packed bytes
+# --------------------------------------------------------------------------
+
+def emulate_carriers(packed, n_hap, M, bpv):
+    """Follows carrier_counts and carrier_scatter statement for statement."""
+    ones = np.empty(M, dtype=np.int64)
+    for m in range(M):                                   # carrier_counts
+        row = packed[m]
+        c = 0
+        full = n_hap >> 3
+        for b in range(full):
+            c += int(row[b]).bit_count()
+        rem = n_hap & 7
+        if rem:
+            c += int(row[full] & ((0xFF << (8 - rem)) & 0xFF)).bit_count()
+        ones[m] = c
+    major = ((ones * 2) > n_hap).astype(np.uint8)
+    counts = np.where(major == 1, n_hap - ones, ones)
+    indptr = np.zeros(M + 1, dtype=np.int64)
+    np.cumsum(counts, out=indptr[1:])
+    indices = np.empty(int(indptr[-1]), dtype=np.int32)
+    for m in range(M):                                   # carrier_scatter
+        row = packed[m]
+        want = 0 if major[m] == 1 else 1
+        w = int(indptr[m]); end = int(indptr[m + 1])
+        j = 0
+        while j < n_hap and w < end:
+            if ((row[j >> 3] >> (7 - (j & 7))) & 1) == want:
+                indices[w] = j; w += 1
+            j += 1
+    return indptr, indices, major
+
+
+@pytest.mark.parametrize("n_hap,M", [(8, 5), (13, 7), (4904, 40), (37, 21)])
+def test_carrier_kernel_logic_matches_numpy(n_hap, M):
+    """Non-multiples of 8 on purpose: the trailing bits of the last byte are
+    padding, and counting them would inflate the allele-1 count and flip
+    `major` on markers near 50% frequency."""
+    from cugen.write import pack_hap2bit
+    rng = np.random.default_rng(n_hap * 100 + M)
+    bits = (rng.random((n_hap, M)) < rng.uniform(0.02, 0.98, size=M)).astype(np.uint8)
+    bpv = (n_hap + 7) // 8
+    packed = np.stack([pack_hap2bit(bits[:, m]) for m in range(M)])
+    assert packed.shape == (M, bpv)
+    got = emulate_carriers(packed, n_hap, M, bpv)
+    exp = build_carriers(bits)
+    for a, b, name in zip(got, exp, ("indptr", "indices", "major")):
+        assert np.array_equal(a, b), name
+
+
+def test_carrier_padding_bits_are_masked():
+    """A marker where every haplotype carries allele 1 must count exactly
+    n_hap, not the padded byte width."""
+    from cugen.write import pack_hap2bit
+    n_hap = 13
+    bits = np.ones((n_hap, 1), dtype=np.uint8)
+    packed = np.stack([pack_hap2bit(bits[:, 0])])
+    indptr, indices, major = emulate_carriers(packed, n_hap, 1, (n_hap + 7) // 8)
+    assert major[0] == 1 and indptr[-1] == 0     # no minority carriers at all
+
+
+@requires_gpu
+def test_gpu_carriers_match_numpy():
+    import cupy as cp
+    from cugen._impute_gpu import build_carriers_gpu
+    from cugen.write import pack_hap2bit
+    rng = np.random.default_rng(4)
+    for n_hap, M in ((4904, 5000), (37, 300), (256, 1024)):
+        bits = (rng.random((n_hap, M)) < rng.uniform(0.001, 0.999, size=M)
+                ).astype(np.uint8)
+        bpv = (n_hap + 7) // 8
+        packed = np.stack([pack_hap2bit(bits[:, m]) for m in range(M)])
+        ip, ix, mj = build_carriers_gpu(packed, n_hap, M, bpv)
+        eip, eix, emj = build_carriers(bits)
+        assert np.array_equal(cp.asnumpy(ip), eip), f"indptr n_hap={n_hap}"
+        assert np.array_equal(cp.asnumpy(ix), eix), f"indices n_hap={n_hap}"
+        assert np.array_equal(cp.asnumpy(mj), emj), f"major n_hap={n_hap}"
