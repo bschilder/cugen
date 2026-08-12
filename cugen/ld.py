@@ -590,6 +590,12 @@ def _finalize(df: pd.DataFrame, stats: Sequence[str]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 _CLUMP_BINS = (0.0001, 0.001, 0.01, 0.05)     # plink2 --clump-bins default
 
+# Candidate fraction above which the BANDED scan is used instead of the
+# rectangular one. Module-level so tests can force either shape: the committed
+# clump fixture is 74-100% candidates, so left to itself it would exercise the
+# banded path only and the rectangular kernel would ship untested.
+_CLUMP_DENSE_FRAC = 0.5
+
 
 def _prune_ids(annotation, gidx) -> np.ndarray:
     """IDs for the kept/pruned lists, or '.' when no annotation was given.
@@ -907,6 +913,69 @@ void clump_assign(const int* eu, const int* ev, const int* rank,
     if (is_index[a] && !is_index[b]) atomicMin(&best[b], rank[a]);
     if (is_index[b] && !is_index[a]) atomicMin(&best[a], rank[b]);
 }
+
+/* RECTANGULAR epilogue: index CANDIDATES against their windows, instead of
+   every relevant variant against every other.
+
+   The banded scan computes all-pairs LD across the whole relevant set. That
+   is the right shape when nearly every variant is a candidate (p1 = 1, the
+   polygenic-score case) and badly wrong when few are. Measured on real chr22
+   at standard thresholds -- 168 candidates out of 170,949 variants -- the
+   banded scan did roughly 500x more pair evaluations than the answer needs,
+   and lost to plink2 by 23x. plink computes LD lazily around each index
+   variant; this is that, done in parallel.
+
+   Candidates are scattered, so side A is an explicit row list rather than a
+   base offset. A pair between two candidates is emitted once, from the lower
+   row, so the edge list carries no duplicates. */
+extern "C" __global__
+void clump_epilogue_rect(
+    const float* __restrict__ S,         /* (bi x bj) cross products      */
+    const float* __restrict__ sA, const float* __restrict__ sB,
+    const float* __restrict__ qA, const float* __restrict__ qB,
+    const float nsamp,
+    const long long* __restrict__ rowsA, /* (bi,) global row per candidate */
+    const long long j0, const long long bi, const long long bj,
+    const long long* __restrict__ pos,   /* (p,) positions                */
+    const long long span,                /* kb window, in bp              */
+    const unsigned char* __restrict__ is_cand,
+    const float min_r2,
+    long long* __restrict__ out_i, long long* __restrict__ out_j,
+    float* __restrict__ out_r,
+    unsigned long long* __restrict__ counter, const long long capacity)
+{
+    long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= bi * bj) return;
+    long long a = t / bj;
+    long long b = t - a * bj;
+    long long gi = rowsA[a];
+    long long gj = j0 + b;
+    if (gi == gj) return;
+    if (is_cand[gj] && gj < gi) return;   /* cand-cand: emit once only    */
+
+    long long d = pos[gi] - pos[gj];
+    if (d < 0) d = -d;
+    if (d > span) return;                 /* exact bp window              */
+
+    double n  = (double)nsamp;
+    double sa = (double)sA[a], sb = (double)sB[b];
+    double qa = (double)qA[a], qb = (double)qB[b];
+    double vA = n * qa - sa * sa;
+    double vB = n * qb - sb * sb;
+    if (!(vA > 0.0) || !(vB > 0.0)) return;    /* monomorphic             */
+
+    double r = (n * (double)S[t] - sa * sb) / (sqrt(vA) * sqrt(vB));
+    if (r >  1.0) r =  1.0;
+    if (r < -1.0) r = -1.0;
+    if (min_r2 > 0.0f && (float)(r * r) < min_r2) return;
+
+    unsigned long long slot = atomicAdd(counter, 1ULL);
+    if (slot < (unsigned long long)capacity) {
+        out_i[slot] = gi;
+        out_j[slot] = gj;
+        out_r[slot] = (float)r;
+    }
+}
 '''
 
 assert _CLUMP_SRC.isascii(), "kernel source must be pure ASCII (cf. 34b4a59)"
@@ -1107,6 +1176,104 @@ def _clumps_from_pairs(is_index, rank, a, b):
             members[int(aa[s])] = sorted(int(x) for x in bb[s:e])
     order = idx_rows[np.argsort(rank[idx_rows])]
     return [(int(i), members[int(i)]) for i in order]
+
+
+def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
+                          tf32, verbose, cand_tile=256, nbr_tile=8192):
+    """Edges between index CANDIDATES and their kb windows. Device-resident.
+
+    Complexity is O(n_candidates * window) rather than O(p * window), which is
+    the difference between doing the work the answer needs and doing the whole
+    band. On real chr22 at standard thresholds that is 168 candidates instead
+    of 170,949 variants.
+
+    Candidates are processed in position order, so each tile's windows union
+    into ONE contiguous row range -- searchsorted gives its bounds, and the
+    neighbour side is then a plain contiguous block build, no gather.
+    """
+    ns = int(reader.n_samples)
+    bpv = int(reader.bytes_per_variant)
+    p = len(rows)
+    span = int(round(kb * 1000))
+    pos = np.asarray(positions, dtype=np.int64)
+    cand = np.flatnonzero(np.asarray(cand_mask))
+    if not len(cand):
+        z = cp.empty(0, dtype=cp.int32)
+        return z, z
+
+    packed = cp.asarray(np.frombuffer(reader.read_packed_bytes(),
+                                      dtype=np.uint8))
+    packed = packed.reshape(int(reader.n_variants), bpv)[cp.asarray(rows)]
+
+    # Per-variant moments once, streamed -- identical to the banded scan.
+    s_v = cp.empty(p, dtype=cp.float32)
+    q_v = cp.empty(p, dtype=cp.float32)
+    chunk = max(1, min(p, int(2e8 // max(ns, 1))))
+    for c0 in range(0, p, chunk):
+        c1 = min(c0 + chunk, p)
+        Gc, G2c, _M = _build_dosage(packed, cp.arange(c0, c1), ns, bpv)
+        s_v[c0:c1] = Gc.sum(axis=1, dtype=cp.float32)
+        q_v[c0:c1] = G2c.sum(axis=1, dtype=cp.float32)
+        del Gc, G2c, _M
+    cp.get_default_memory_pool().free_all_blocks()
+
+    pos_d = cp.asarray(pos)
+    is_cand_d = cp.zeros(p, dtype=cp.uint8)
+    is_cand_d[cp.asarray(cand)] = 1
+    kern = _get_clump_module().get_function("clump_epilogue_rect")
+
+    # Bound the work up front so the capacity guess is informed rather than
+    # optimistic: sum of each candidate tile's window width.
+    lo_all = np.searchsorted(pos, pos[cand] - span, side="left")
+    hi_all = np.searchsorted(pos, pos[cand] + span, side="right")
+    planned = int((hi_all - lo_all).sum())
+    if verbose:
+        print(f"[clump] rectangular scan: {len(cand):,} candidates x "
+              f"~{planned / max(len(cand), 1):,.0f} window = {planned:,} pair "
+              f"evaluations (banded would be ~{p * (hi_all - lo_all).max():,})")
+
+    def run(capacity):
+        out_i = cp.empty(capacity, dtype=cp.int64)
+        out_j = cp.empty(capacity, dtype=cp.int64)
+        out_r = cp.empty(capacity, dtype=cp.float32)
+        counter = cp.zeros(1, dtype=cp.uint64)
+        with _Tf32(tf32):
+            for c0 in range(0, len(cand), cand_tile):
+                cs = cand[c0:c0 + cand_tile]
+                rows_d = cp.asarray(cs.astype(np.int64))
+                # gather is tiny: |tile| x bytes_per_variant
+                Ga = _build_g(packed[cp.asarray(cs)], 0, len(cs), ns, bpv)
+                sa, qa = s_v[cp.asarray(cs)], q_v[cp.asarray(cs)]
+                lo = int(np.searchsorted(pos, pos[cs[0]] - span, "left"))
+                hi = int(np.searchsorted(pos, pos[cs[-1]] + span, "right"))
+                for j0 in range(lo, hi, nbr_tile):
+                    j1 = min(j0 + nbr_tile, hi)
+                    Gb = _build_g(packed, j0, j1, ns, bpv)
+                    S = Ga @ Gb.T
+                    bi, bj = len(cs), j1 - j0
+                    nthread = bi * bj
+                    kern(((nthread + 255) // 256,), (256,),
+                         (S, sa, s_v[j0:j1], qa, q_v[j0:j1], np.float32(ns),
+                          rows_d, np.int64(j0), np.int64(bi), np.int64(bj),
+                          pos_d, np.int64(span), is_cand_d,
+                          np.float32(r2_thresh), out_i, out_j, out_r,
+                          counter, np.int64(capacity)))
+                    del S, Gb
+                del Ga
+        return out_i, out_j, out_r, int(counter[0])
+
+    cap = max(1 << 16, min(int(50e6), planned // 4 + 1024))
+    oi, oj, _orr, found = run(cap)
+    if found > cap:
+        if verbose:
+            print(f"[clump] buffer held {cap:,}, {found:,} survived -- "
+                  f"re-running the epilogue at exact size")
+        del oi, oj, _orr
+        cp.get_default_memory_pool().free_all_blocks()
+        oi, oj, _orr, found = run(found)
+    del packed
+    cp.get_default_memory_pool().free_all_blocks()
+    return oi[:found].astype(cp.int32), oj[:found].astype(cp.int32)
 
 
 def _clump_edges_gpu(reader, rows, positions, kb, r2_thresh, tile_size,
@@ -1426,9 +1593,24 @@ def ld_clump(
                 "the kb window would be banded against the wrong neighbours. "
                 "Is the .cugen sorted by position?")
         tf32 = _resolve_precision(precision, int(reader.n_samples), False)
+        # Pick the scan SHAPE by candidate density. The banded scan evaluates
+        # every pair in the band; the rectangular one evaluates only
+        # candidates against their windows. Banded wins when almost everything
+        # is a candidate (its tiles are dense and it reuses plane buffers);
+        # rectangular wins by orders of magnitude when few are, which is the
+        # standard-GWAS case that lost to plink2 by 23x.
+        dense = cand.mean() > _CLUMP_DENSE_FRAC
+        if verbose:
+            print(f"[clump] {int(cand.sum()):,}/{len(cand):,} candidates "
+                  f"({100 * cand.mean():.2f}%) -> "
+                  f"{'banded' if dense else 'rectangular'} scan")
         with _Tf32(tf32):
-            eu, ev = _clump_edges_gpu(reader, rows, rel_pos, kb, r2,
-                                      tile_size, tf32, verbose)
+            if dense:
+                eu, ev = _clump_edges_gpu(reader, rows, rel_pos, kb, r2,
+                                          tile_size, tf32, verbose)
+            else:
+                eu, ev = _clump_edges_rect_gpu(reader, rows, rel_pos, cand,
+                                               kb, r2, tf32, verbose)
         n_edges = int(eu.size)
         rank_d, cand_d = cp.asarray(rank), cp.asarray(cand)
         is_index_d, owner_d, rounds = clump_core(eu, ev, rank_d, cand_d,

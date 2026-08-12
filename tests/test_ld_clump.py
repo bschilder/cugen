@@ -589,3 +589,81 @@ def test_gpu_backend_never_silently_runs_the_cpu_reference(tmp_path,
                backend="numpy", verbose=False)
     assert seen["backend"] == "numpy", (
         "the requested backend must be passed through, not overridden")
+
+
+# ---------------------------------------------------------------------------
+# the rectangular scan. The committed clump fixture is 74-100% candidates, so
+# left alone it exercises the BANDED path only -- these force the other one.
+# ---------------------------------------------------------------------------
+SPARSE_SS = DATA / "clump_sumstats_sparse.tsv"
+SPARSE_GOLD = DATA / "clump_gold_sparse.clumps"
+
+
+def test_sparse_fixture_actually_selects_few_candidates():
+    """Guard the guard: if this fixture ever drifts dense, the rectangular
+    tests below would silently start testing the banded path instead."""
+    ss = pd.read_csv(SPARSE_SS, sep="\t")
+    frac = float((ss["P"] <= 1e-4).mean())
+    assert frac < 0.2, f"{frac:.1%} candidates -- too dense to force rect scan"
+
+
+def test_sparse_golden_exercises_the_p2_asymmetry():
+    want = pd.read_csv(SPARSE_GOLD, sep="\t").rename(
+        columns=lambda c: c.lstrip("#"))
+    listed = want["SP2"].astype(str).apply(
+        lambda s: 0 if s == "." else len(s.split(",")))
+    assert (want["TOTAL"] > listed).any()
+    assert want["NONSIG"].sum() > 0
+
+
+def test_matches_plink2_on_sparse_candidates(tmp_path):
+    """End-to-end parity where only 4% of variants are index candidates --
+    the standard-GWAS regime, and the one the banded scan was 23x too slow
+    for on real chr22."""
+    path, ann = _clump_fixture(tmp_path)
+    got = ld_clump(path, SPARSE_SS, annotation=ann, backend="numpy",
+                   verbose=False)
+    want = pd.read_csv(SPARSE_GOLD, sep="\t").rename(
+        columns=lambda c: c.lstrip("#"))
+    assert len(got) == len(want)
+    a = want.sort_values("ID").reset_index(drop=True)[PARITY_COLS]
+    b = got.sort_values("ID").reset_index(drop=True)[PARITY_COLS]
+    np.testing.assert_allclose(a["P"].to_numpy(float), b["P"].to_numpy(float),
+                               rtol=1e-6)
+    for c in [x for x in PARITY_COLS if x != "P"]:
+        assert (a[c].astype(str).to_numpy() == b[c].astype(str).to_numpy()).all(), \
+            f"column {c} differs from plink2"
+
+
+@requires_gpu
+def test_rectangular_and_banded_scans_agree(tmp_path, monkeypatch):
+    """The two scan shapes must be interchangeable. They evaluate different
+    SETS of pairs -- rectangular skips pairs where neither side is a candidate
+    -- so agreement is evidence that the skipped pairs genuinely cannot matter.
+    """
+    import cugen.ld as L
+    path, ann = _clump_fixture(tmp_path)
+    kw = dict(annotation=ann, backend="gpu", verbose=False)
+    monkeypatch.setattr(L, "_CLUMP_DENSE_FRAC", 1.01)      # force rectangular
+    rect = L.ld_clump(path, SPARSE_SS, **kw)
+    monkeypatch.setattr(L, "_CLUMP_DENSE_FRAC", -0.01)     # force banded
+    band = L.ld_clump(path, SPARSE_SS, **kw)
+    pd.testing.assert_frame_equal(rect.reset_index(drop=True),
+                                  band.reset_index(drop=True))
+
+
+@requires_gpu
+def test_rectangular_scan_matches_plink2_golden(tmp_path, monkeypatch):
+    import cugen.ld as L
+    monkeypatch.setattr(L, "_CLUMP_DENSE_FRAC", 1.01)      # force rectangular
+    path, ann = _clump_fixture(tmp_path)
+    got = L.ld_clump(path, SPARSE_SS, annotation=ann, backend="gpu",
+                     verbose=False)
+    want = pd.read_csv(SPARSE_GOLD, sep="\t").rename(
+        columns=lambda c: c.lstrip("#"))
+    a = want.sort_values("ID").reset_index(drop=True)[PARITY_COLS]
+    b = got.sort_values("ID").reset_index(drop=True)[PARITY_COLS]
+    assert len(a) == len(b)
+    for c in [x for x in PARITY_COLS if x != "P"]:
+        assert (a[c].astype(str).to_numpy() == b[c].astype(str).to_numpy()).all(), \
+            f"column {c} differs from plink2 on the rectangular path"
