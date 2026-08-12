@@ -126,8 +126,11 @@ def main():
                         "CHR": str(c), "ID": [f"{c}:{p}" for p in ref_pos]})
 
     if not os.path.exists(f"{W}/target.cugen"):
+        # see target_axis.py: -T matches on position, so multi-allelic sites
+        # would contribute duplicate rows without this filter
         sh(f"bcftools view -S {W}/targets.txt --force-samples --no-update -Ou "
-           f"{panel} | bcftools view -T {W}/target_sites.txt -Oz "
+           f"{panel} | bcftools view -m2 -M2 -v snps -Ou "
+           f"| bcftools view -T {W}/target_sites.txt -Oz "
            f"-o {W}/target.vcf.gz")
         sh(f"bcftools index -f -t {W}/target.vcf.gz")
         tpos = np.asarray(subprocess.run(
@@ -136,6 +139,10 @@ def main():
             dtype=np.int64)
         gidx = np.searchsorted(ref_pos, tpos)
         assert np.array_equal(ref_pos[gidx], tpos), "target not a subset"
+            assert np.all(np.diff(gidx) > 0), (
+                "target positions are not strictly increasing -- duplicate "
+                "positions from multi-allelic sites survive an equality check "
+                "because both sides are duplicated")
         vcf2cugenh(f"{W}/target.vcf.gz", f"{W}/target.cugen", gidx=gidx,
                    verbose=False)
 

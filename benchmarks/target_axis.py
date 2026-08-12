@@ -154,8 +154,14 @@ def main():
         print(f"\n=== T = {n_t} samples ({2*n_t} haplotypes) ===", flush=True)
 
         if not os.path.exists(f"{W}/{tag}.cugen"):
+            # -T matches on POSITION, and a multi-allelic site contributes
+            # several rows at one position in the full panel, so the same
+            # biallelic-SNV filter has to be reapplied. Without it the target
+            # carries duplicate positions, searchsorted returns a non-increasing
+            # gidx, and impute() refuses the pair.
             sh(f"bcftools view -S {W}/{tag}.txt --force-samples --no-update -Ou "
-               f"{panel} | bcftools view -T {W}/target_sites.txt -Oz "
+               f"{panel} | bcftools view -m2 -M2 -v snps -Ou "
+               f"| bcftools view -T {W}/target_sites.txt -Oz "
                f"-o {W}/{tag}.vcf.gz")
             sh(f"bcftools index -f -t {W}/{tag}.vcf.gz")
             tpos = np.asarray(subprocess.run(
@@ -164,6 +170,10 @@ def main():
                 dtype=np.int64)
             gidx = np.searchsorted(ref_pos, tpos)
             assert np.array_equal(ref_pos[gidx], tpos), "target not a subset"
+            assert np.all(np.diff(gidx) > 0), (
+                "target positions are not strictly increasing -- duplicate "
+                "positions from multi-allelic sites survive an equality check "
+                "because both sides are duplicated")
             vcf2cugenh(f"{W}/{tag}.vcf.gz", f"{W}/{tag}.cugen", gidx=gidx,
                        verbose=False)
 
