@@ -1250,6 +1250,59 @@ def _variant_moments(packed, p, ns, bpv):
     return s_v, q_v
 
 
+def _contiguous_runs(rows):
+    """Split a strictly increasing row index array into contiguous runs.
+
+    A clumping relevant-set is a union of kb windows, so it is a handful of
+    long runs rather than scattered singletons -- which is exactly what makes
+    ranged reads worthwhile instead of one whole-file read plus a gather.
+    """
+    rows = np.asarray(rows, dtype=np.int64)
+    if not len(rows):
+        return []
+    brk = np.flatnonzero(np.diff(rows) != 1)
+    starts = np.r_[0, brk + 1]
+    ends = np.r_[brk + 1, len(rows)]
+    return [(int(rows[s]), int(rows[e - 1]) + 1) for s, e in zip(starts, ends)]
+
+
+def _load_packed_rows(reader, rows, bpv, verbose=False):
+    """Device array of just the packed rows needed, in ``rows`` order.
+
+    Profiling put 96% of standard-GWAS clumping here -- 5.37 s of a 5.62 s run
+    at n=500,000, against 0.05 s for the GEMM scan the previous two
+    optimisation passes had targeted. The old version read the WHOLE file,
+    copied all of it to the device, then fancy-indexed down to the subset: ~2x
+    the bytes it needed, plus a second full-size allocation to do it in.
+
+    Now it reads only the byte ranges the rows cover, straight into their
+    slots. An identity selection skips the copy entirely, which is the C+T
+    case where every variant is a candidate.
+    """
+    rows = np.asarray(rows, dtype=np.int64)
+    p, nv = len(rows), int(reader.n_variants)
+    runs = _contiguous_runs(rows)
+    total = sum(hi - lo for lo, hi in runs)
+    if verbose:
+        print(f"[clump] reading {p:,}/{nv:,} rows in {len(runs):,} run(s) = "
+              f"{total * bpv / 2**30:.2f} GiB (whole file is "
+              f"{nv * bpv / 2**30:.2f} GiB)")
+
+    if len(runs) == 1 and runs[0] == (0, nv) and p == nv:
+        # Whole file wanted: one read, no gather, no second buffer.
+        buf = np.frombuffer(reader.read_packed_bytes(), dtype=np.uint8)
+        return cp.asarray(buf).reshape(nv, bpv)
+
+    out = cp.empty((p, bpv), dtype=cp.uint8)
+    at = 0
+    for lo, hi in runs:
+        buf = np.frombuffer(reader.read_packed_bytes(lo, hi), dtype=np.uint8)
+        k = hi - lo
+        out[at:at + k] = cp.asarray(buf).reshape(k, bpv)
+        at += k
+    return out
+
+
 def _plan_cand_tiles(cand, pos, span, max_cands, row_budget):
     """Group candidates into tiles whose window UNION stays bounded.
 
@@ -1306,9 +1359,7 @@ def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
         return z, z
 
     _t0_read = _time.perf_counter()
-    packed = cp.asarray(np.frombuffer(reader.read_packed_bytes(),
-                                      dtype=np.uint8))
-    packed = packed.reshape(int(reader.n_variants), bpv)[cp.asarray(rows)]
+    packed = _load_packed_rows(reader, rows, bpv, verbose)
     cp.cuda.Stream.null.synchronize()
     _t_read = _time.perf_counter() - _t0_read
 
@@ -2222,8 +2273,7 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
     # B=31,744 and then allocated a 31,744 x 100,000 plane buffer to hold
     # 4,000 rows -- ~8x over-allocation, invisible whenever p >> B.
     B = max(256, min(B, p))
-    packed = cp.asarray(np.frombuffer(reader.read_packed_bytes(), dtype=np.uint8))
-    packed = packed.reshape(int(reader.n_variants), bpv)[cp.asarray(rows)]
+    packed = _load_packed_rows(reader, rows, bpv, verbose)
 
     # Per-variant moments straight from the packed bytes. This previously
     # streamed chunks through _build_dosage, which materialises G, G2 and M --
@@ -2364,8 +2414,7 @@ def _scan_gpu(reader, rows, window, window_kb, positions, min_r2, min_obs,
     B = int(tile_size) if tile_size else _tile_size_for(ns, window=window)
     build = _build_planes if need_table else _build_dosage
 
-    packed = cp.asarray(np.frombuffer(reader.read_packed_bytes(), dtype=np.uint8))
-    packed = packed.reshape(int(reader.n_variants), bpv)[cp.asarray(rows)]
+    packed = _load_packed_rows(reader, rows, bpv, verbose)
 
     out_pairs, out_tabs, out_r, out_n = [], [], [], []
     for i0 in range(0, p, B):

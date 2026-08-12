@@ -751,3 +751,76 @@ def test_tile_count_is_bounded_by_max_cands():
     tiles = _plan_cand_tiles(cand, pos, 250_000, max_cands=64,
                              row_budget=10**9)
     assert max(len(t) for t in tiles) <= 64
+
+
+# ---------------------------------------------------------------------------
+# ranged reads. Profiling put 96% of standard-GWAS clumping in the read, so
+# this is the hot path -- and getting run boundaries wrong would silently
+# permute genotype rows, which no correctness test downstream would attribute
+# to the reader.
+# ---------------------------------------------------------------------------
+def test_contiguous_runs_splits_correctly():
+    from cugen.ld import _contiguous_runs
+    assert _contiguous_runs([]) == []
+    assert _contiguous_runs([5]) == [(5, 6)]
+    assert _contiguous_runs([0, 1, 2, 3]) == [(0, 4)]
+    assert _contiguous_runs([0, 1, 5, 6, 7, 20]) == [(0, 2), (5, 8), (20, 21)]
+
+
+def test_contiguous_runs_covers_every_row_exactly_once():
+    """The invariant that matters: runs must reproduce the input, in order."""
+    rng = np.random.default_rng(8)
+    for _ in range(200):
+        rows = np.sort(rng.choice(5000, size=int(rng.integers(1, 400)),
+                                  replace=False))
+        from cugen.ld import _contiguous_runs
+        runs = _contiguous_runs(rows)
+        rebuilt = np.concatenate([np.arange(lo, hi) for lo, hi in runs])
+        assert np.array_equal(rebuilt, rows)
+        # and runs must be disjoint and ascending
+        assert all(runs[k][1] <= runs[k + 1][0] for k in range(len(runs) - 1))
+
+
+def test_contiguous_runs_of_a_window_union_is_few_runs():
+    """A clumping relevant-set is a union of kb windows, so it should be a
+    handful of long runs -- which is what makes ranged reads worth doing. If
+    this ever becomes thousands of singletons, the read strategy is wrong."""
+    from cugen.ld import _contiguous_runs
+    pos = np.arange(20000, dtype=np.int64) * 1000
+    cand = np.array([100, 5000, 10000, 15000, 19000])
+    span = 250_000
+    keep = np.zeros(len(pos), bool)
+    for c in cand:
+        lo = np.searchsorted(pos, pos[c] - span, "left")
+        hi = np.searchsorted(pos, pos[c] + span, "right")
+        keep[lo:hi] = True
+    runs = _contiguous_runs(np.flatnonzero(keep))
+    assert len(runs) == len(cand), f"{len(runs)} runs for {len(cand)} windows"
+    assert sum(hi - lo for lo, hi in runs) < len(pos) / 3, \
+        "windows should cover a fraction of the file, not most of it"
+
+
+@requires_gpu
+def test_ranged_read_matches_a_whole_file_read(tmp_path):
+    """The ranged read must produce byte-identical rows to reading everything
+    and gathering. Row order is the failure mode: a wrong run boundary
+    permutes genotypes, and every downstream test would blame the kernels."""
+    import cupy as cp
+    from cugen.ld import _load_packed_rows
+    from cugen.io import read_cugen
+    from cugen.write import write_cugen
+    rng = np.random.default_rng(13)
+    G = rng.integers(0, 3, size=(400, 1000)).astype(np.uint8)
+    path = str(tmp_path / "r.cugen")
+    write_cugen(path, G.T)
+    rd = read_cugen(path)
+    bpv = int(rd.bytes_per_variant)
+    whole = cp.asarray(np.frombuffer(rd.read_packed_bytes(), dtype=np.uint8))
+    whole = whole.reshape(int(rd.n_variants), bpv)
+    for rows in (np.arange(400),                        # identity
+                 np.arange(50, 150),                    # one run
+                 np.r_[0:20, 100:140, 380:400],         # three runs
+                 np.array([7])):                        # single row
+        got = _load_packed_rows(rd, rows, bpv)
+        want = whole[cp.asarray(rows)]
+        assert cp.array_equal(got, want), f"mismatch for {len(rows)} rows"
