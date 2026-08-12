@@ -183,51 +183,62 @@ Identical clump counts, identical index-variant sets, no differing column.
 | C+T, r2=0.2 (p1=1) | 170,949 | banded | 1.12 s | 18.49 s |
 | C+T for PRS (p1=1, r2=0.1) | 170,949 | banded | 0.79 s | 12.60 s |
 
-### Sample axis: where the verdict actually comes from
+### Sample axis, and a conclusion that inverted twice
 
-The prediction going in was that the standard-GWAS loss at n=2,504 was an
-artifact of tiny n and would cross over at biobank scale. **It does not.**
-plink2's clump time is nearly FLAT in n (2.80 -> 6.26 s across a 200x sample
-increase) because `--clump` computes LD only around index variants; cugen's
-grows. That is the opposite of `ld_matrix`, where plink2 must compute all
-pairs and went 0.19 -> 62.6 s over the same range, and it is why the LD result
-does not transfer to clumping.
+p = 20,000 held fixed, A100 SXM 80GB (the same part as `nscale.json`).
 
 | samples | standard cugen / plink2 | C+T cugen / plink2 | peak GPU |
 |---|---|---|---|
-| 10,000 | 0.11 / 0.05 s | 0.10 / 3.24 s (31x) | 0.33 GiB |
-| 50,000 | 0.39 / 0.16 s | 0.29 / 3.26 s (11x) | 1.11 GiB |
-| 100,000 | 0.55 / 0.33 s | 0.55 / 3.58 s (6.5x) | 1.22 GiB |
-| 200,000 | 1.11 / 0.45 s | 0.73 / 4.16 s (5.7x) | 1.44 GiB |
-| 500,000 | 3.14 / 1.48 s | 1.96 / 6.26 s (3.2x) | 3.50 GiB |
+| 2,504 | 0.11 / 0.03 s (0.30x) | 0.14 / 1.89 s (**13.5x**) | 0.14 GiB |
+| 10,000 | 0.09 / 0.06 s (0.62x) | 0.18 / 2.54 s (**14.3x**) | 0.20 GiB |
+| 50,000 | 0.11 / 0.18 s (**1.58x**) | 0.64 / 2.16 s (**3.4x**) | 1.11 GiB |
+| 100,000 | 0.20 / 0.31 s (**1.54x**) | 0.61 / 2.91 s (**4.8x**) | 1.22 GiB |
+| 200,000 | 0.21 / 0.47 s (**2.28x**) | 0.91 / 3.68 s (**4.0x**) | 1.43 GiB |
+| 500,000 | 0.46 / 1.57 s (**3.39x**) | 1.95 / 5.94 s (**3.0x**) | 2.18 GiB |
 
-**Use plink2 for standard clumping; use cugen for C+T.** That is the honest
-recommendation and it does not change with cohort size.
+**Recommendation: cugen for C+T at any size, and for standard clumping above
+~25,000 samples.** plink2 still wins standard clumping on small cohorts, where
+there is not enough work to amortise moving genotypes onto the device.
 
-### What the two optimisation passes were worth
+This table replaced two earlier conclusions, both of which were artifacts of
+this code rather than properties of the problem, and both of which were
+recorded here as findings before being disproved:
 
-Measured on the same A100, same fixtures, so the deltas are real:
+1. *"plink2 wins standard clumping."* It did -- by 23x, then 2.7x -- because
+   every scan read the WHOLE file and fancy-indexed down to the subset. That
+   was 96% of the runtime (5.37 s of 5.62 s at n=500,000, against 0.05 s for
+   the GEMM scan).
+2. *"the advantage erodes as cohorts grow."* It eroded because the wasted I/O
+   scaled with n. With ranged reads it GROWS with n: 1.58x at 50,000 to 3.39x
+   at 500,000.
 
-| | standard @ 500k | C+T @ 500k | peak @ 500k |
+Both survived several rounds of scrutiny because they were measured,
+repeatedly, and internally consistent. The measurements were right and the
+attribution was wrong. What broke the loop was instrumenting PHASES rather
+than totals -- a total says how fast you are, only a breakdown says what you
+are doing.
+
+### What the four optimisation passes were worth
+
+Standard clumping at n=500,000, same A100, same fixtures:
+
+| | time | peak | note |
 |---|---|---|---|
-| first working version | 5.83 s | 4.63 s | 16.47 GiB |
-| + moments from packed bytes | 3.40 s | 2.16 s | 16.47 GiB |
-| + data-sized tiles | **3.14 s** | **1.96 s** | **3.50 GiB** |
+| first working version | 5.83 s | 16.47 GiB | |
+| + moments from packed bytes | 3.40 s | 16.47 GiB | ~120 GB of plane writes removed |
+| + data-sized tiles | 3.14 s | 3.50 GiB | a tile constant ignored n |
+| + ranged reads | **0.46 s** | **2.18 GiB** | 96% of runtime was I/O |
 
-1. **Moments straight from packed bytes.** Both scans called `_build_dosage`,
-   which materialises three fp32 planes (G, G2, M) to produce two per-variant
-   sums -- ~120 GB of plane writes at p=20,000, n=500,000, for 160 KB of
-   output. Chunking bounded the peak but not the total. Integer accumulation
-   keeps it bit-exact.
-2. **Tiles sized from the data.** `nbr_tile` was 8,192 rows regardless of n,
-   and `_build_g` materialises a tile x n fp32 plane -- a 16.4 GB allocation
-   at n=500,000, which was the whole peak. Candidate tiles were grouped by
-   count alone, so ~20 scattered candidates landed in one tile whose window
-   union was the entire chromosome.
+**12.7x faster and 7.6x less memory**, and the ordering is the lesson: the
+first two passes optimised the compute path, which was ~1% of the runtime. The
+GEMM scan is 0.05 s of a 0.46 s run even now.
 
-Both are the same underlying mistake -- **a tile constant that ignores a
-dimension it multiplies** -- and it is the third instance of it in this
-module's history, after `_tile_size_for` bounded by memory but not by p.
+Three of the four fixes were the same mistake in different clothes -- a
+quantity sized without reference to a dimension it multiplies:
+`_build_dosage` built three `chunk x n` planes for two per-variant sums;
+`nbr_tile` was 8,192 rows regardless of n (a 16.4 GB plane at n=500,000);
+candidate tiles were grouped by count while their windows spanned positions.
+`_tile_size_for` had already done this once, bounding by memory but not by p.
 
 ### Caveats
 
