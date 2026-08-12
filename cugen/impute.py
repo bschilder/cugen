@@ -287,7 +287,22 @@ def impute(target, *, ref, annotation=None, map=None, out=None,
                   f"ne~{suggested:,} (= ne * {K:,} / 4904, the 1000 Genomes "
                   f"panel that default suits).")
 
-        path = "numpy reference (CPU)"
+        # Resolve the backend ONCE, up front, and print it. In the clumping
+        # work in this repo a fallback branch hardcoded backend="numpy", so
+        # backend="gpu" silently ran a whole chromosome on the CPU reference;
+        # it was only found when the run took hours. A path that cannot be
+        # observed will eventually be the wrong one.
+        from ._impute_gpu import HAS_CUPY
+        from ._impute_gpu import impute_haplotypes_gpu
+        from ._impute_core import impute_haplotypes as impute_haplotypes_cpu
+        if backend == "gpu" and not HAS_CUPY:
+            raise RuntimeError(
+                "backend='gpu' was requested but CuPy is not importable. "
+                "Refusing to fall back to the CPU reference silently -- pass "
+                "backend='numpy' if that is what you want.")
+        use_gpu = (backend == "gpu") or (backend == "auto" and HAS_CUPY)
+        engine = impute_haplotypes_gpu if use_gpu else impute_haplotypes_cpu
+        path = "gpu (fused kernels)" if use_gpu else "numpy reference (CPU)"
         if verbose:
             print(f"[impute] reference {rref.n_samples:,} samples "
                   f"({K:,} haplotypes) x {rref.n_variants:,} markers")
@@ -320,10 +335,10 @@ def impute(target, *, ref, annotation=None, map=None, out=None,
             sub_tgt = tgt_bits_all[:, tk]
             # tgt_idx points into the full reference; re-index into this window
             loc = np.searchsorted(mk, tgt_idx[tk])
-            from ._impute_core import impute_haplotypes
-            pw = impute_haplotypes(sub_ref, sub_tgt, loc, marker_cm[mk],
-                                   ne=ne, err=err, cluster=cluster,
-                                   block=block, sparse=sparse, timers=timers)
+            kw = dict(ne=ne, err=err, cluster=cluster, timers=timers)
+            if not use_gpu:
+                kw.update(block=block, sparse=sparse)
+            pw = engine(sub_ref, sub_tgt, loc, marker_cm[mk], **kw)
             allele_prob[:, mk[keep]] = pw[:, keep]
             if verbose:
                 print(f"[impute]   window {w+1}/{len(bounds)} "
