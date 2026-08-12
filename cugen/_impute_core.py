@@ -85,12 +85,19 @@ def default_err(n_ref_hap):
     will be set equal to theta/(2(theta+H)) where H is the number of haplotypes
     and theta = 1/(0.5 + ln H)."
 
-    NOTE this disagrees with Browning et al. (2018), which states a flat
-    "error rate eps (0.0001 by default)". At H = 4,904 this formula gives
-    ~9e-4, an order of magnitude larger. The manual describes the version we
-    validate against, so it wins here; pass err= explicitly for the paper's
-    constant. Which one the 5.5 binary actually applies is on the list to
-    settle by running it rather than by reading about it.
+    This disagrees with Browning et al. (2018), which states a flat "error rate
+    eps (0.0001 by default)". At H = 4,904 the formula gives 1.133e-05, an
+    order of magnitude smaller.
+
+    SETTLED BY MEASUREMENT, not by reading. Imputing the paper's chr20 fixture
+    under both values and comparing against Beagle 5.5's own output over
+    1,733,484 shared markers:
+
+        err = 1.133e-05 (this formula)   corr 0.999014   mean |diff| 0.000596
+        err = 1.0e-04   (paper constant) corr 0.998637   mean |diff| 0.000739
+
+    The manual's formula agrees more closely on both metrics, so it is the
+    default. Pass err= explicitly for the paper's constant.
     """
     H = float(n_ref_hap)
     if H <= 1:

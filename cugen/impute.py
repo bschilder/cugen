@@ -61,6 +61,13 @@ twice, and the retained value is the one from the window in which the position
 is FURTHER from a window boundary -- imputation accuracy degrades towards the
 edges. That is equivalent to switching windows at the midpoint of the overlap.
 
+The 2018 paper gives the overlap default as 4 cM and the 5.5 manual as 2.0.
+Measured rather than chosen: Beagle 5.5's own chr20 windows convert to
+[-0.00, 39.99], [37.99, 77.99] and [75.99, 108.29] cM, so its overlap is
+2.00 cM and its window 40.00. cugen's plan_windows produces
+[-0.0, 40.0], [38.0, 78.0], [76.0, 116.0] on the same map, which is an
+independent check on the windowing as well as on the default.
+
 OUTPUT
 ------
 Per-marker DR2, AF and IMP, matching the INFO fields Beagle writes, plus
