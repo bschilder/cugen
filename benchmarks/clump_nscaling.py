@@ -135,14 +135,29 @@ def main():
             continue
 
         if not warm:      # absorb CUDA context + NVRTC before ANY timing
+            # BOTH scan shapes must be compiled here, not just one. The
+            # previous warm-up ran a 500-variant slice at the default p1,
+            # which usually contains no significant variant at all -- so it
+            # returned before touching the rectangular kernel, and the first
+            # timed configuration still paid NVRTC. That is why the smallest-n
+            # standard row kept reporting ~4 s while its own phase timings
+            # summed to 0.13 s.
             t0 = time.perf_counter()
-            try:
-                ld_clump(base + ".cugen", ss, annotation=ann.head(500),
-                         backend="gpu", verbose=False)
-                print(f"  warm-up: {time.perf_counter() - t0:.2f} s "
-                      f"(not counted)", flush=True)
-            except Exception as e:                            # noqa: BLE001
-                print(f"  warm-up skipped: {e}", flush=True)
+            sub = ann.head(2000)
+            warm_ss = os.path.join(a.workdir, "warm_ss.tsv")
+            with open(warm_ss, "w") as f:      # guarantee a few candidates
+                f.write("ID\tP\n")
+                for k, vid in enumerate(sub["ID"].astype(str)):
+                    f.write(f"{vid}\t{'1e-12' if k % 500 == 0 else '0.5'}\n")
+            for label, p1, r2 in (("rect", 1e-4, 0.5), ("banded", 1.0, 0.1)):
+                try:
+                    ld_clump(base + ".cugen", warm_ss, annotation=sub, p1=p1,
+                             p2=0.01, r2=r2, kb=250, backend="gpu",
+                             verbose=False)
+                except Exception as e:                        # noqa: BLE001
+                    print(f"  warm-up[{label}] skipped: {e}", flush=True)
+            print(f"  warm-up (both scan shapes): "
+                  f"{time.perf_counter() - t0:.2f} s, not counted", flush=True)
             warm = True
 
         # Two configurations: the one cugen loses at n=2,504, and the one it
