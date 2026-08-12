@@ -175,7 +175,22 @@ def main():
     # marker count and quietly change the denominator of every accuracy figure.
     print("\n=== filtering markers (diallelic SNVs, MAC>=1 in reference) ===",
           flush=True)
-    sh(f"bcftools view -S {W}/reference.txt --force-samples -Ou {panel} "
+    # Two things this panel needs that a typical VCF does not.
+    #
+    # It carries no ##contig lines, so region queries need a tabix index built
+    # first -- otherwise bcftools warns "Contig '20' is not defined in the
+    # header" and region selection silently returns nothing.
+    #
+    # Its header declares only FORMAT/GT: no INFO tags at all. Sample subsetting
+    # normally recomputes AC/AN, and with nothing to recompute bcftools refuses
+    # outright ("Undefined tags in the header, cannot proceed in the sample
+    # subset mode"). --no-update tells it not to try. The minor-allele filter
+    # below still works, because -c 1:minor counts genotypes directly rather
+    # than reading INFO/AC.
+    if not os.path.exists(panel + ".tbi"):
+        sh(f"bcftools index -f -t {panel}")
+    sh(f"bcftools view -S {W}/reference.txt --force-samples --no-update -Ou "
+       f"{panel} "
        f"| bcftools view -m2 -M2 -v snps -Ou "
        f"| bcftools view -c 1:minor -Oz -o {W}/ref.sites.vcf.gz")
     sh(f"bcftools index -f -t {W}/ref.sites.vcf.gz")
@@ -212,14 +227,14 @@ def main():
 
     # --- build the actual reference / target files --------------------------
     print("\n=== writing reference and target VCFs ===", flush=True)
-    sh(f"bcftools view -S {W}/reference.txt --force-samples -Oz "
+    sh(f"bcftools view -S {W}/reference.txt --force-samples --no-update -Oz "
        f"-o {W}/reference.vcf.gz {W}/ref.sites.vcf.gz")
     sh(f"bcftools index -f -t {W}/reference.vcf.gz")
-    sh(f"bcftools view -S {W}/targets.txt --force-samples -Oz "
+    sh(f"bcftools view -S {W}/targets.txt --force-samples --no-update -Oz "
        f"-o {W}/target.masked.vcf.gz {W}/target.sites.vcf.gz")
     sh(f"bcftools index -f -t {W}/target.masked.vcf.gz")
     # truth: the target samples at ALL reference markers, for scoring
-    sh(f"bcftools view -S {W}/targets.txt --force-samples -Oz "
+    sh(f"bcftools view -S {W}/targets.txt --force-samples --no-update -Oz "
        f"-o {W}/target.truth.vcf.gz {W}/ref.sites.vcf.gz")
     sh(f"bcftools index -f -t {W}/target.truth.vcf.gz")
 
