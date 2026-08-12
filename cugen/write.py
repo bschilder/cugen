@@ -15,13 +15,15 @@ ON-DISK FORMAT (v1) - little-endian throughout
          0     8  char[8]   magic "CUPGEN01"   (legacy magic, kept post-rename)
          8     4  uint32    version = 1
         12     4  uint32    encoding            0=2bit 1=uint8 2=f16 3=f32
+                                                4=hap2bit (phased haplotypes)
         16     8  uint64    n_samples
         24     8  uint64    n_variants
         32     8  uint64    bytes_per_variant
         40     8  uint64    stats_offset
         48     8  uint64    data_offset
         56     8  uint64    gidx_offset
-        64     4  uint32    flags               bit0 HAS_MISSING, bit1 HAS_GIDX
+        64     4  uint32    flags               bit0 HAS_MISSING, bit1 HAS_GIDX,
+                                                bit2 PHASED
         68   188  --        zero padding to 256
 
     stats  [stats_offset]  float32 x n_variants x 3, as three CONTIGUOUS arrays
@@ -39,6 +41,46 @@ Sample i lives in byte i>>2 at bit shift 6-2*(i&3), so sample 0 is the HIGH
 pair. Values 0/1/2 are dosages; 3 is missing. bytes_per_variant = ceil(n/4),
 and trailing bits in the last byte are zero (which decodes as dosage 0, not
 missing - readers must bound loops by n_samples).
+
+HAP2BIT ENCODING (phased) - THE SAME BYTES, READ DIFFERENTLY
+-------------------------------------------------------------
+A phased biallelic genotype is two 1-bit alleles, which is exactly the width of
+one 2-bit dosage field, so a phased variant record has the SAME
+bytes_per_variant = ceil(n_samples/4) and needs no new layout.
+
+Pack allele bits 8 per byte, MSB first: haplotype j lives in byte j>>3 at bit
+shift 7-(j&7). Substituting j = 2i and j = 2i+1 gives byte i>>2 at shifts
+7-2*(i&3) and 6-2*(i&3) -- which are precisely the high and low bits of sample
+i's existing 2-bit field. The haplotype-indexed and sample-indexed views are
+therefore THE SAME BYTES, and both are available without conversion: an HMM
+reads 1 bit per haplotype, association code reads 2 bits per sample.
+
+    sample i's code = (hap_{2i} << 1) | hap_{2i+1}      hap_{2i} is the HIGH bit
+
+All four codes are meaningful, so there is no spare code for missing -- which is
+correct, since phased reference panels are required to be non-missing. A
+HAP2BIT file must never set HAS_MISSING.
+
+THE TRAP: THE TWO ENCODINGS SHARE BYTES BUT NOT MEANING
+--------------------------------------------------------
+    code   unphased (2bit)      phased (hap2bit)
+    00     dosage 0             0|0  -> dosage 0     same
+    01     dosage 1             0|1  -> dosage 1     same
+    10     dosage 2             1|0  -> dosage 1     DIFFERENT
+    11     missing              1|1  -> dosage 2     DIFFERENT
+
+Reading a phased file as unphased does not fail, does not produce NaN, and does
+not look wrong: it silently reports the wrong dosage for every het-on-the-first-
+haplotype and every homozygous-alt call. Because the two agree on codes 00 and
+01, a spot check of low-frequency variants can pass while the file is garbage.
+
+Every dosage-returning read path therefore REFUSES a PHASED file unless the
+caller opts in explicitly, at which point the popcount map above is applied.
+Do not remove those guards to make a call site compile.
+
+The stored mu_x/sxx/maf of a phased file are written under the popcount map, so
+they describe dosages and remain directly comparable with an unphased file of
+the same cohort.
 
 PER-VARIANT STATS ARE SAMPLE-SET-SPECIFIC
 ------------------------------------------
@@ -63,14 +105,21 @@ ENCODING_2BIT = 0
 ENCODING_UINT8 = 1
 ENCODING_FLOAT16 = 2
 ENCODING_FLOAT32 = 3
+ENCODING_HAP2BIT = 4
 
 FLAG_HAS_MISSING = 1
 FLAG_HAS_GIDX_MAP = 2
+FLAG_PHASED = 4
 
+# hap2bit stores two 1-bit alleles where 2bit stores one dosage, so the two
+# encodings have identical bytes_per_variant. See the module docstring: this is
+# a coincidence of width that the whole phased design rests on, not an accident
+# to be tidied away.
 _ENC_BYTES = {ENCODING_2BIT: lambda n: (n + 3) // 4,
               ENCODING_UINT8: lambda n: n,
               ENCODING_FLOAT16: lambda n: n * 2,
-              ENCODING_FLOAT32: lambda n: n * 4}
+              ENCODING_FLOAT32: lambda n: n * 4,
+              ENCODING_HAP2BIT: lambda n: (n + 3) // 4}
 
 
 def pack_2bit(geno_u8):
@@ -93,6 +142,62 @@ def unpack_2bit(packed, n_samples):
     out[2::4] = (b >> 2) & 3
     out[3::4] = b & 3
     return out[:n_samples]
+
+
+def pack_hap2bit(alleles):
+    """Pack 1-bit phased alleles into bytes, MSB first, 8 haplotypes per byte.
+
+    `alleles` is (2*n_samples,) with haplotype j at index j, or (n_samples, 2)
+    with column 0 the first haplotype. Values must be 0 or 1.
+
+    Haplotype j lands in byte j>>3 at shift 7-(j&7), which for j = 2i and 2i+1
+    coincides with the high and low bits of sample i's 2-bit field -- so this
+    produces byte-for-byte the same output as pack_2bit would on the derived
+    codes (hap_{2i} << 1) | hap_{2i+1}. test_bit_views_coincide pins that.
+    """
+    a = np.asarray(alleles)
+    if a.ndim == 2:
+        if a.shape[1] != 2:
+            raise ValueError(f"2-D alleles must be (n_samples, 2), got {a.shape}")
+        a = a.reshape(-1)
+    a = a.astype(np.uint8, copy=False)
+    bad = (a > 1)
+    if bad.any():
+        raise ValueError(
+            f"phased alleles must be 0 or 1; found {int(a[bad][0])} at "
+            f"haplotype {int(np.flatnonzero(bad)[0])}. Missing calls cannot be "
+            f"represented in a phased .cugen -- all four 2-bit codes are taken.")
+    pad = (-a.size) % 8
+    if pad:
+        a = np.concatenate([a, np.zeros(pad, dtype=np.uint8)])
+    r = a.reshape(-1, 8)
+    out = np.zeros(r.shape[0], dtype=np.uint8)
+    for k in range(8):
+        out |= (r[:, k] << (7 - k)).astype(np.uint8)
+    return out
+
+
+def unpack_hap2bit(packed, n_haplotypes):
+    """Inverse of pack_hap2bit; returns uint8 0/1 of length n_haplotypes.
+
+    Note the length is in HAPLOTYPES (2 * n_samples), not samples. Passing
+    n_samples here silently returns the first half of the cohort.
+    """
+    b = np.frombuffer(packed, dtype=np.uint8)
+    out = np.empty(b.size * 8, dtype=np.uint8)
+    for k in range(8):
+        out[k::8] = (b >> (7 - k)) & 1
+    return out[:n_haplotypes]
+
+
+def hap2bit_dosages(packed, n_samples):
+    """Phased packed bytes -> dosages, via the popcount map (see docstring).
+
+    This is the ONLY correct way to read a HAP2BIT record as dosages;
+    unpack_2bit on the same bytes maps 10 -> 2 and 11 -> missing, both wrong.
+    """
+    h = unpack_hap2bit(packed, 2 * n_samples)
+    return (h[0::2] + h[1::2]).astype(np.uint8)
 
 
 def variant_stats(dosages):
@@ -151,6 +256,8 @@ class CugenWriter:
         self.maf = np.zeros(self.n_variants, dtype=np.float32)
         self.gidx = np.zeros(self.n_variants, dtype=np.int64)
         self.flags = FLAG_HAS_GIDX_MAP
+        if self.encoding == ENCODING_HAP2BIT:
+            self.flags |= FLAG_PHASED
         self.i = 0
         self.f = None
 
@@ -160,6 +267,12 @@ class CugenWriter:
         return self
 
     def add_variant(self, gidx, dosages):
+        if self.encoding == ENCODING_HAP2BIT:
+            raise ValueError(
+                "this writer is HAP2BIT (phased); use add_variant_phased(gidx, "
+                "alleles) with 0/1 alleles. add_variant takes DOSAGES, and "
+                "dosages cannot be written to a phased file without inventing "
+                "a phase that was never observed.")
         if self.i >= self.n_variants:
             raise IndexError(f"more than the declared {self.n_variants} variants")
         d = np.asarray(dosages)
@@ -186,6 +299,36 @@ class CugenWriter:
             self.f.write(np.asarray(d, dtype=np.float16).tobytes())
         else:
             self.f.write(np.asarray(d, dtype=np.float32).tobytes())
+        self.i += 1
+
+    def add_variant_phased(self, gidx, alleles):
+        """Add one phased variant. `alleles` is (2*n_samples,) or (n_samples, 2).
+
+        Stats are recorded under the popcount map so mu_x/sxx/maf describe
+        dosages and stay comparable with an unphased file of the same cohort.
+        HAS_MISSING is never set: a phased record has no code for missing, and
+        pack_hap2bit rejects anything that is not 0 or 1.
+        """
+        if self.encoding != ENCODING_HAP2BIT:
+            raise ValueError(
+                f"add_variant_phased needs encoding=ENCODING_HAP2BIT, this "
+                f"writer has encoding {self.encoding}. Writing alleles into a "
+                f"dosage encoding would store 1|0 as dosage 1 and lose phase "
+                f"silently.")
+        if self.i >= self.n_variants:
+            raise IndexError(f"more than the declared {self.n_variants} variants")
+        a = np.asarray(alleles)
+        n_hap = a.size if a.ndim == 1 else a.shape[0] * a.shape[1]
+        if n_hap != 2 * self.n_samples:
+            raise ValueError(f"variant {self.i}: {n_hap} alleles != "
+                             f"2 * n_samples {2 * self.n_samples}")
+        packed = pack_hap2bit(a)
+        mu, sxx, maf, _ = variant_stats(hap2bit_dosages(packed, self.n_samples))
+        self.mu_x[self.i] = mu
+        self.sxx[self.i] = sxx
+        self.maf[self.i] = maf
+        self.gidx[self.i] = int(gidx)
+        self.f.write(packed.tobytes())
         self.i += 1
 
     def _finalize(self):
@@ -237,6 +380,31 @@ def write_cugen(path, dosages, gidx=None, encoding=ENCODING_2BIT):
     return path
 
 
+def write_cugen_phased(path, alleles, gidx=None):
+    """Write a phased haplotype array to `path` as a HAP2BIT .cugen.
+
+    `alleles` is (2*n_samples, n_variants) of 0/1, haplotype-major on the row
+    axis: rows 2i and 2i+1 are sample i's two haplotypes. That row order is the
+    format's, not a convention of this function -- see the module docstring.
+    """
+    a = np.asarray(alleles)
+    if a.ndim != 2:
+        raise ValueError("alleles must be 2-D (2*n_samples, n_variants)")
+    n_hap, n_variants = a.shape
+    if n_hap % 2:
+        raise ValueError(f"{n_hap} haplotype rows is odd; expected 2*n_samples")
+    n_samples = n_hap // 2
+    g = np.arange(n_variants, dtype=np.int64) if gidx is None else \
+        np.asarray(gidx, dtype=np.int64)
+    if g.size != n_variants:
+        raise ValueError(f"gidx has {g.size} entries, need {n_variants}")
+    with CugenWriter(path, n_samples, n_variants,
+                     encoding=ENCODING_HAP2BIT) as w:
+        for j in range(n_variants):
+            w.add_variant_phased(int(g[j]), a[:, j])
+    return path
+
+
 def validate_cugen(path, verbose=True):
     """Structural check. Returns a dict; raises nothing, reports `ok`.
 
@@ -274,12 +442,30 @@ def validate_cugen(path, verbose=True):
         r["problems"].append("data_offset overlaps the stats block")
     r["has_gidx"] = bool(r["flags"] & FLAG_HAS_GIDX_MAP)
     r["has_missing"] = bool(r["flags"] & FLAG_HAS_MISSING)
+    r["phased"] = bool(r["flags"] & FLAG_PHASED)
+
+    # PHASED and HAP2BIT must agree. They carry the same bytes_per_variant as
+    # ENCODING_2BIT, so a file with one set and not the other passes every size
+    # check above while decoding to the wrong dosages -- exactly the failure the
+    # encoding table in the module docstring describes.
+    if r["phased"] and r["encoding"] != ENCODING_HAP2BIT:
+        r["problems"].append(
+            f"PHASED flag set but encoding is {r['encoding']}, not "
+            f"{ENCODING_HAP2BIT} (hap2bit)")
+    if r["encoding"] == ENCODING_HAP2BIT and not r["phased"]:
+        r["problems"].append("encoding is hap2bit but the PHASED flag is unset")
+    if r["phased"] and r["has_missing"]:
+        r["problems"].append(
+            "PHASED and HAS_MISSING are both set; a phased record has no code "
+            "for missing (all four 2-bit codes are valid genotypes)")
+
     r["ok"] = not r["problems"]
     if verbose:
         print(f"{'OK  ' if r['ok'] else 'BAD '} {path}")
         print(f"     n_samples={r['n_samples']:,} n_variants={r['n_variants']:,} "
               f"enc={r['encoding']} bpv={r['bytes_per_variant']:,} "
-              f"gidx={r['has_gidx']} missing={r['has_missing']}")
+              f"gidx={r['has_gidx']} missing={r['has_missing']} "
+              f"phased={r['phased']}")
         for p in r["problems"]:
             print(f"     - {p}")
     return r
