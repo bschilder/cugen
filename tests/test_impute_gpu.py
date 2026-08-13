@@ -518,3 +518,38 @@ def test_gpu_selection_survives_partial_warps(T):
     got = cp.asnumpy(fb_posteriors_gpu(rc, tc, tau, mism, sel=sel))
     exp = forward_backward_sel(rc, tc, tau, mism, sel)
     assert np.abs(got - exp).max() < 2e-5
+
+
+@requires_gpu
+def test_reduce_tiles_in_whole_samples():
+    """A tile boundary must never fall between a sample's two haplotypes.
+
+    reduce=True pairs haplotypes 2s and 2s+1, so the tile has to be even. An
+    earlier version refused to tile at all when the budget was tight, which
+    made large cohorts unreachable rather than slower: at T=2,000 with C=2,984
+    and K=3,008 the posterior is 71.8 GiB, 1,532 haplotypes fit, and the run
+    stopped instead of taking two passes.
+    """
+    from cugen._impute_gpu import impute_haplotypes_gpu
+    from cugen.impute import dosage_r2
+    from cugen.write import pack_hap2bit
+    rng = np.random.default_rng(77)
+    K, M, T = 200, 3000, 24
+    ref = simulate_mosaic(K, M, seed=77)
+    tgt_idx = np.sort(rng.choice(M, size=M // 10, replace=False))
+    tgt = simulate_mosaic(T, M, seed=78)[:, tgt_idx]
+    cm = np.linspace(0, 6, M)
+    packed = np.stack([pack_hap2bit(ref[:, m]) for m in range(M)])
+    kw = dict(ne=scaled_ne(K), cluster=0.005, ref_packed=packed, n_hap=K,
+              bytes_per_variant=packed.shape[1])
+    whole = impute_haplotypes_gpu(None, tgt, tgt_idx, cm, reduce=True, **kw)
+    t = {}
+    from cugen._impute_core import aggregate_markers
+    C = aggregate_markers(cm[tgt_idx], 0.005)[0].size
+    tiled = impute_haplotypes_gpu(None, tgt, tgt_idx, cm, reduce=True, timers=t,
+                                  budget_bytes=int(6 * (C * K * 4 + K * 4)),
+                                  **kw)
+    assert t["_t_tile_count"] < T, f"tiling not forced (tile={t['_t_tile_count']})"
+    assert t["_t_tile_count"] % 2 == 0, "tile must be an even number of haplotypes"
+    for a, b in zip(whole, tiled):
+        assert np.abs(a - b).max() < 2e-5

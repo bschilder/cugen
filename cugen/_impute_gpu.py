@@ -620,12 +620,21 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
     indptr, indices, major = carriers
 
     tile = plan_t_tile(C, K, T, budget_bytes=budget_bytes)
-    if reduce and tile < T:
-        raise ValueError(
-            f"reduce=True pairs haplotypes 2s and 2s+1, so every target "
-            f"haplotype must be resident at once, but the memory budget allows "
-            f"a tile of {tile} of {T}. Reduce `window` so fewer aggregate "
-            f"markers are live.")
+    if reduce:
+        # The constraint is not "all T resident" -- it is that haplotypes 2s and
+        # 2s+1 land in the SAME tile, since the reduction pairs them. Tiling in
+        # whole samples satisfies that, and a tile boundary then never falls
+        # between a sample's two haplotypes.
+        #
+        # The first version refused to tile at all here, which made T=2,000
+        # unreachable: the posterior array is 71.8 GiB at C=2,984 and K=3,008,
+        # so only 1,532 of 2,000 haplotypes fit and the run stopped rather than
+        # splitting into two passes it could have done.
+        tile = max(2, (tile // 2) * 2)
+        if tile < 2:
+            raise ValueError(
+                f"cannot fit even one sample's two haplotypes at C={C:,} and "
+                f"K={K:,}; reduce `window` so fewer aggregate markers are live")
     out = None if reduce else np.empty((T, M), dtype=np.float32)
     dose_h = np.empty((T // 2, M), dtype=np.float32) if reduce else None
     af_h = np.empty(M, dtype=np.float32) if reduce else None
