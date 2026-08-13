@@ -218,10 +218,29 @@ Selection only pays once J is well below K: at K=1,200 a J of 800 is SLOWER
 than brute force (4.08 s against 3.93 s), because the selection pass costs more
 than the 1.5x smaller state space saves.
 
-It is not free in accuracy. Against the brute-force answer on simulated mosaic
-panels, correlation is 0.980 at J/K = 1/3 (Beagle's ratio), 0.956 at 1/6 and
-0.899 at 1/12. What that costs against TRUTH on the real fixture has not been
-measured.
+### What selection costs against TRUTH
+
+Measured on the real panel (K = 4,800 haplotypes, 100 target samples,
+1,678,255 imputed markers of 1,733,485), scoring against the held-out genotypes
+rather than against the brute-force answer:
+
+| states | seconds | dosage r2 vs truth |
+|---|---|---|
+| all 4,800 | 14.91 s | 0.9794 |
+| 1,600 | **9.93 s** | **0.9793** |
+| 800 | 7.06 s | 0.9783 |
+| 400 | 5.44 s | 0.9764 |
+
+**At Beagle's ratio the accuracy cost is 0.0001 for a 1.50x speedup.** Against
+that panel's Beagle time of 17 s, cugen with J=1,600 is 9.93 s.
+
+This corrects a number stated earlier in this file. Correlation with the
+BRUTE-FORCE answer is 0.980 at J/K = 1/3, and reading that as the accuracy cost
+overstates it by more than an order of magnitude: brute force and the selected
+answer disagree mainly on markers neither imputes well, so the disagreement
+between them is largely noise that does not exist in the comparison against
+truth. Agreement with a reference implementation is not the same quantity as
+accuracy, and using one as a proxy for the other was wrong here.
 
 ## Scaling: cugen alone, compute only
 
