@@ -128,9 +128,11 @@ has since moved off the host.
 - **Beagle with a bref3 panel.** Required before any two-pipeline wall-clock
   number here is worth stating. Expect Beagle to get faster.
 - **A pipeline comparison from a common starting artifact.**
-- **Either scaling axis, for Beagle.** `benchmarks/target_axis.py` and
-  `benchmarks/panel_axis.py` exist to fix this by running Beagle 5.5 directly.
-  Until they have, nothing here says how Beagle scales.
+- **The panel axis, for Beagle.** `benchmarks/panel_axis.py` exists to measure
+  it; the target axis above has been run. This is the axis where brute-force
+  states are expected to lose.
+- **T beyond 1,000 target haplotypes.** The T=2,000 point did not complete,
+  bounded by a per-window `(T, M_window)` host array.
 
   Note on what is NOT usable as a substitute: Browning et al. (2018) publish
   Beagle scaling sublinearly in panel size (1,000x the reference samples for 11x
@@ -147,7 +149,34 @@ has since moved off the host.
   `.vcf.gz`, or both from their own prepared format, with conversion counted).
 - **The crossover on the target axis.**
 
-## Scaling: the fixed cost is the whole story
+## Target axis: measured against Beagle 5.5, both tools
+
+Reference panel **fixed** at 1,504 samples (3,008 haplotypes) and 1,733,485
+markers; targets drawn from a disjoint pool. Only T moves. Imputation time only
+— Beagle's own figure from its log, cugen's the sum of its compute phases.
+
+| target haplotypes | cugen | Beagle 5.5 | cugen faster by |
+|---|---|---|---|
+| 100 | 8.05 s | 10 s | **1.24x** |
+| 400 | 8.30 s | 24 s | **2.89x** |
+| 1,000 | 11.82 s | 55 s | **4.65x** |
+
+Two independent runs agree (run 1: 1.38x, 3.49x, 4.40x). **10x the targets cost
+cugen 1.5x and Beagle 5.5x.** The mechanism is visible in the phase split: most
+of cugen's cost is panel work that does not depend on T at all, so the marginal
+target is nearly free, while Beagle's per-target work is CPU-bound.
+
+This is the crossover an earlier version of this file could only argue for.
+
+Two things it does not show. The panel here is 3,008 haplotypes, smaller than
+the 4,904 of the accuracy fixture, and cugen is linear in panel size while
+Beagle's `imp-states=1600` is not — so part of cugen's advantage here is the
+smaller panel, not the larger cohort. And the T=2,000 point did not complete:
+it was still bounded by a per-window `(T, M_window)` host array, a smaller
+relative of the memory bug described below.
+
+## Scaling: cugen alone, compute only
+
 
 Compute only (no file I/O), 40,000 markers, 10% genotyped, K = 4,904:
 

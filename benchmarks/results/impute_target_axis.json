@@ -1,0 +1,66 @@
+{
+  "chrom": 20,
+  "n_reference_samples": 1504,
+  "n_reference_haplotypes": 3008,
+  "n_reference_markers": 1733485,
+  "n_target_markers": 55230,
+  "points": [
+    {
+      "n_target_samples": 50,
+      "n_target_haplotypes": 100,
+      "cugen_wall_s": 18.12,
+      "cugen_impute_s": 8.05,
+      "cugen_phases": {
+        "read": 0.712,
+        "aggregate": 0.494,
+        "interp_plan": 0.078,
+        "carriers": 0.085,
+        "forward_backward": 7.408,
+        "dose": 0.064,
+        "summary": 0.0,
+        "write": 6.147
+      },
+      "beagle_wall_s": 24.95,
+      "beagle_impute_s": 10,
+      "impute_ratio_beagle_over_cugen": 1.24
+    },
+    {
+      "n_target_samples": 200,
+      "n_target_haplotypes": 400,
+      "cugen_wall_s": 42.42,
+      "cugen_impute_s": 8.3,
+      "cugen_phases": {
+        "read": 0.752,
+        "aggregate": 0.465,
+        "interp_plan": 0.067,
+        "carriers": 0.094,
+        "forward_backward": 7.502,
+        "dose": 0.235,
+        "summary": 0.0,
+        "write": 23.966
+      },
+      "beagle_wall_s": 34.37,
+      "beagle_impute_s": 24,
+      "impute_ratio_beagle_over_cugen": 2.89
+    },
+    {
+      "n_target_samples": 500,
+      "n_target_haplotypes": 1000,
+      "cugen_wall_s": 201.31,
+      "cugen_impute_s": 11.82,
+      "cugen_phases": {
+        "read": 0.725,
+        "aggregate": 0.492,
+        "interp_plan": 0.067,
+        "carriers": 0.1,
+        "forward_backward": 10.594,
+        "dose": 0.635,
+        "summary": 0.011,
+        "write": 65.357
+      },
+      "beagle_wall_s": 66.27,
+      "beagle_impute_s": 55,
+      "impute_ratio_beagle_over_cugen": 4.65
+    }
+  ]
+}
