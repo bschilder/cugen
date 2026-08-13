@@ -377,15 +377,29 @@ def impute(target, *, ref, annotation=None, map=None, out=None,
             kw = dict(ne=ne, err=err, cluster=cluster, timers=timers)
             if use_gpu:
                 kw.update(ref_packed=sub_packed, n_hap=K,
-                          bytes_per_variant=rref.bytes_per_variant)
+                          bytes_per_variant=rref.bytes_per_variant,
+                          reduce=True)
             else:
                 kw.update(block=block, sparse=sparse)
-            pw = engine(sub_ref, sub_tgt, loc, marker_cm[mk], **kw)
-            kept = pw[:, keep]
-            dose[:, mk[keep]] = (kept[0::2, :] + kept[1::2, :]).astype(np.float32)
-            af[mk[keep]] = kept.mean(axis=0)
-            dr2[mk[keep]] = dosage_r2(kept)
-            del kept, pw
+            if use_gpu:
+                # The device returns per-SAMPLE dosages and the two per-marker
+                # summaries directly. The per-haplotype array is 7.3 GiB at
+                # 2,000 target haplotypes over chr20's largest window and never
+                # crosses to the host.
+                dose_w, af_w, dr2_w = engine(sub_ref, sub_tgt, loc,
+                                             marker_cm[mk], **kw)
+                dose[:, mk[keep]] = dose_w[:, keep]
+                af[mk[keep]] = af_w[keep]
+                dr2[mk[keep]] = dr2_w[keep]
+                del dose_w, af_w, dr2_w
+            else:
+                pw = engine(sub_ref, sub_tgt, loc, marker_cm[mk], **kw)
+                kept = pw[:, keep]
+                dose[:, mk[keep]] = (kept[0::2, :] + kept[1::2, :]
+                                     ).astype(np.float32)
+                af[mk[keep]] = kept.mean(axis=0)
+                dr2[mk[keep]] = dosage_r2(kept)
+                del kept, pw
             if verbose:
                 print(f"[impute]   window {w+1}/{len(bounds)} "
                       f"[{lo:.1f}, {hi:.1f}] cM: {mk.size:,} markers, "

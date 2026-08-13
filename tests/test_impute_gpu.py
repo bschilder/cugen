@@ -347,3 +347,83 @@ def test_gpu_carriers_match_numpy():
         assert np.array_equal(cp.asnumpy(ip), eip), f"indptr n_hap={n_hap}"
         assert np.array_equal(cp.asnumpy(ix), eix), f"indices n_hap={n_hap}"
         assert np.array_equal(cp.asnumpy(mj), emj), f"major n_hap={n_hap}"
+
+
+def emulate_reduce(p, T, M):
+    """Follows the reduce_dose kernel statement for statement."""
+    S = T // 2
+    dose = np.empty((S, M)); af = np.empty(M); dr2 = np.empty(M)
+    for m in range(M):
+        ssum = 0.0; sumsq = 0.0; within = 0.0
+        for s in range(S):
+            a = float(p[2 * s, m]); b = float(p[2 * s + 1, m])
+            dose[s, m] = a + b
+            ssum += a + b
+            sumsq += a * a + b * b
+            within += a * (1 - a) + b * (1 - b)
+        mean = ssum / T
+        between = sumsq / T - mean * mean
+        w = within / T
+        tot = between + w
+        af[m] = mean
+        dr2[m] = between / tot if tot > 0 else 0.0
+    return dose, af, dr2
+
+
+def test_reduce_kernel_logic_matches_the_python_definitions():
+    """The device computes DR2 from raw sums rather than two passes, so it is a
+    second implementation of dosage_r2 and has to agree with the first."""
+    from cugen.impute import dosage_r2
+    rng = np.random.default_rng(8)
+    T, M = 12, 40
+    p = rng.random((T, M)).astype(np.float32)
+    dose, af, dr2 = emulate_reduce(p, T, M)
+    assert np.allclose(dose, p[0::2] + p[1::2], atol=1e-6)
+    assert np.allclose(af, p.mean(axis=0), atol=1e-6)
+    assert np.allclose(dr2, dosage_r2(p), atol=1e-6)
+
+
+def test_reduce_is_exact_when_every_probability_is_certain():
+    """Var(p) with no within-haplotype uncertainty must give DR2 = 1, which is
+    the case a one-pass sumsq formula gets wrong if it drifts."""
+    rng = np.random.default_rng(9)
+    p = rng.integers(0, 2, size=(10, 25)).astype(np.float32)
+    _, _, dr2 = emulate_reduce(p, 10, 25)
+    assert np.allclose(dr2[p.std(axis=0) > 0], 1.0, atol=1e-6)
+
+
+@requires_gpu
+def test_gpu_reduce_matches_numpy():
+    import cupy as cp
+    from cugen._impute_gpu import reduce_dose_gpu
+    from cugen.impute import dosage_r2
+    rng = np.random.default_rng(11)
+    for T, M in ((8, 100), (104, 5000), (2, 17)):
+        p = rng.random((T, M)).astype(np.float32)
+        d, a, r = reduce_dose_gpu(cp.asarray(p), T, M)
+        assert np.allclose(cp.asnumpy(d), p[0::2] + p[1::2], atol=2e-5)
+        assert np.allclose(cp.asnumpy(a), p.mean(axis=0), atol=2e-5)
+        assert np.allclose(cp.asnumpy(r), dosage_r2(p), atol=2e-4)
+
+
+@requires_gpu
+def test_reduce_path_matches_the_unreduced_path():
+    """reduce=True must be a pure memory optimisation."""
+    from cugen._impute_gpu import impute_haplotypes_gpu
+    from cugen.impute import dosage_r2
+    rng = np.random.default_rng(12)
+    K, M = 300, 4000
+    ref = simulate_mosaic(K, M, seed=12)
+    tgt_idx = np.sort(rng.choice(M, size=M // 8, replace=False))
+    tgt = simulate_mosaic(24, M, seed=13)[:, tgt_idx]
+    cm = np.linspace(0, 8, M)
+    from cugen.write import pack_hap2bit
+    packed = np.stack([pack_hap2bit(ref[:, m]) for m in range(M)])
+    kw = dict(ne=scaled_ne(K), cluster=0.005, ref_packed=packed, n_hap=K,
+              bytes_per_variant=packed.shape[1])
+    full = impute_haplotypes_gpu(None, tgt, tgt_idx, cm, **kw)
+    dose, af, dr2 = impute_haplotypes_gpu(None, tgt, tgt_idx, cm, reduce=True,
+                                          marker_chunk=997, **kw)
+    assert np.allclose(dose, full[0::2] + full[1::2], atol=2e-5)
+    assert np.allclose(af, full.mean(axis=0), atol=2e-5)
+    assert np.allclose(dr2, dosage_r2(full), atol=2e-4)

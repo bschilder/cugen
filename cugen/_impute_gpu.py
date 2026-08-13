@@ -50,8 +50,9 @@ except ImportError:                                            # noqa: BLE001
     cp = None
     HAS_CUPY = False
 
-__all__ = ["fb_posteriors_gpu", "dose_sparse_gpu", "impute_haplotypes_gpu",
-           "build_carriers_gpu", "plan_t_tile", "IMPUTE_SRC"]
+__all__ = ["fb_posteriors_gpu", "dose_sparse_gpu", "reduce_dose_gpu",
+           "impute_haplotypes_gpu", "build_carriers_gpu", "plan_t_tile",
+           "IMPUTE_SRC"]
 
 _MODULE = None
 
@@ -324,6 +325,43 @@ __global__ void carrier_scatter(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-sample dosages from per-haplotype allele probabilities, plus the two
+// per-marker summaries, computed on the device so the host never receives the
+// (T, M) haplotype array. At 2,000 target haplotypes over chr20's largest
+// window that array is 7.3 GiB, and it was copied again on arrival.
+//
+// dose(s, m)  = p(2s, m) + p(2s+1, m)
+// af(m)       = mean over haplotypes
+// dr2(m)      = Var(p) / (Var(p) + mean(p(1-p)))     -- see impute.dosage_r2
+// ---------------------------------------------------------------------------
+__global__ void reduce_dose(
+    const float* __restrict__ p,        // (T, M) allele probabilities
+    float* __restrict__ dose,           // (T/2, M) out
+    float* __restrict__ af,             // (M,) out
+    float* __restrict__ dr2,            // (M,) out
+    const int T, const int M)
+{
+    const long long m = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M) return;
+    const int S = T >> 1;
+    double sum = 0.0, sumsq = 0.0, within = 0.0;
+    for (int s = 0; s < S; ++s) {
+        const float a = p[(long long)(2 * s) * M + m];
+        const float b = p[(long long)(2 * s + 1) * M + m];
+        dose[(long long)s * M + m] = a + b;
+        sum += a + b;
+        sumsq += (double)a * a + (double)b * b;
+        within += (double)a * (1.0 - a) + (double)b * (1.0 - b);
+    }
+    const double mean = sum / (double)T;
+    const double between = sumsq / (double)T - mean * mean;
+    const double w = within / (double)T;
+    const double tot = between + w;
+    af[m] = (float)mean;
+    dr2[m] = (tot > 0.0) ? (float)(between / tot) : 0.0f;
+}
+
 }   // extern "C"
 '''
 
@@ -390,8 +428,31 @@ def fb_posteriors_gpu(ref_codes, tgt_codes, tau, mism):
     return post
 
 
-def dose_sparse_gpu(post, indptr, indices, major, left, lam):
-    """Allele-1 probabilities as a (T, M) CuPy array. Mirrors dose_sparse."""
+def reduce_dose_gpu(p_dev, T, M):
+    """(T, M) allele probabilities -> (T/2, M) dosages, plus AF and DR2.
+
+    On the device, so the host never receives the per-haplotype array: at 2,000
+    target haplotypes over chr20's largest window that is 7.3 GiB, and it was
+    copied again on arrival.
+    """
+    mod = _module()
+    dose = cp.empty((T // 2, M), dtype=cp.float32)
+    af = cp.empty(M, dtype=cp.float32)
+    dr2 = cp.empty(M, dtype=cp.float32)
+    threads = 256
+    mod.get_function("reduce_dose")(
+        ((M + threads - 1) // threads,), (threads,),
+        (p_dev, dose, af, dr2, np.int32(T), np.int32(M)))
+    return dose, af, dr2
+
+
+def dose_sparse_gpu(post, indptr, indices, major, left, lam, col_offset=0):
+    """Allele-1 probabilities as a (T, n) CuPy array. Mirrors dose_sparse.
+
+    `col_offset` selects a slice of the marker axis, so a caller can walk the
+    markers in chunks. indptr is sliced to start at col_offset and `major` with
+    it; `indices` is NOT sliced, because indptr's values index into it globally.
+    """
     mod = _module()
     C, K, T = post.shape
     M = int(len(lam))
@@ -403,8 +464,9 @@ def dose_sparse_gpu(post, indptr, indices, major, left, lam):
     out = cp.empty((T, M), dtype=cp.float32)
     threads = min(256, max(32, ((T + 31) // 32) * 32))
     mod.get_function("dose_sparse")(
-        (M,), (threads,), (post, ip, ix, mj, lf, lm, out,
-                           np.int32(C), np.int32(K), np.int32(T), np.int32(M)))
+        (M,), (threads,), (post, ip[col_offset:], ix, mj[col_offset:], lf, lm,
+                           out, np.int32(C), np.int32(K), np.int32(T),
+                           np.int32(M)))
     return out
 
 
@@ -444,7 +506,8 @@ def build_carriers_gpu(packed, n_hap, n_markers, bytes_per_variant):
 def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
                           ne=100_000, err=None, cluster=0.005, carriers=None,
                           timers=None, budget_bytes=None, ref_packed=None,
-                          n_hap=None, bytes_per_variant=None):
+                          n_hap=None, bytes_per_variant=None, reduce=False,
+                          marker_chunk=250_000):
     """GPU counterpart of _impute_core.impute_haplotypes. Returns (T, M) float32.
 
     Pass `ref_packed` (the on-disk bytes, with n_hap and bytes_per_variant) to
@@ -514,7 +577,17 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
     indptr, indices, major = carriers
 
     tile = plan_t_tile(C, K, T, budget_bytes=budget_bytes)
-    out = np.empty((T, M), dtype=np.float32)
+    if reduce and tile < T:
+        raise ValueError(
+            f"reduce=True pairs haplotypes 2s and 2s+1, so every target "
+            f"haplotype must be resident at once, but the memory budget allows "
+            f"a tile of {tile} of {T}. Reduce `window` so fewer aggregate "
+            f"markers are live.")
+    out = None if reduce else np.empty((T, M), dtype=np.float32)
+    dose_h = np.empty((T // 2, M), dtype=np.float32) if reduce else None
+    af_h = np.empty(M, dtype=np.float32) if reduce else None
+    dr2_h = np.empty(M, dtype=np.float32) if reduce else None
+
     for lo in range(0, T, tile):
         hi = min(lo + tile, T)
         t0 = time.perf_counter()
@@ -523,14 +596,29 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
         tick("forward_backward", t0)
 
         t0 = time.perf_counter()
-        d = dose_sparse_gpu(post, indptr, indices, major, left, lam)
+        # Walk the marker axis in chunks: the dose output is (T, chunk) on the
+        # device and (T/2, chunk) crossing to the host, so neither grows with
+        # the window's marker count.
+        for m0 in range(0, M, marker_chunk):
+            m1 = min(m0 + marker_chunk, M)
+            sl = slice(m0, m1)
+            d = dose_sparse_gpu(post, indptr, indices, major, left[sl],
+                                lam[sl], col_offset=m0)
+            if reduce:
+                dd, aa, rr = reduce_dose_gpu(d, hi - lo, m1 - m0)
+                dose_h[(lo // 2):(hi // 2), sl] = cp.asnumpy(dd)
+                af_h[sl] = cp.asnumpy(aa)
+                dr2_h[sl] = cp.asnumpy(rr)
+                del dd, aa, rr
+            else:
+                out[lo:hi, sl] = cp.asnumpy(d)
+            del d
         cp.cuda.Device().synchronize()
         tick("dose", t0)
-        out[lo:hi] = cp.asnumpy(d)
-        del post, d
+        del post
         cp.get_default_memory_pool().free_all_blocks()
     # NOT in the seconds dict: it is a count, and it printed as
     # "t_tile 104.00s" at the top of the phase table, which reads
     # exactly like the dominant cost.
     t["_t_tile_count"] = tile
-    return out
+    return (dose_h, af_h, dr2_h) if reduce else out
