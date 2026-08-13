@@ -212,7 +212,8 @@ def _match_markers(tgt_gidx, ref_gidx):
 def impute(target, *, ref, annotation=None, map=None, out=None,
            ne=_DEFAULT_NE, err=None, window=_DEFAULT_WINDOW_CM,
            overlap=_DEFAULT_OVERLAP_CM, cluster=_DEFAULT_CLUSTER_CM,
-           chrom=None, block=None, sparse=True, backend="auto", device=0,
+           chrom=None, block=None, sparse=True, imp_states=None,
+           imp_step=0.1, backend="auto", device=0,
            verbose=True, _timers_out=None):
     """Impute ungenotyped markers into `target` from the phased panel `ref`.
 
@@ -374,7 +375,8 @@ def impute(target, *, ref, annotation=None, map=None, out=None,
             sub_tgt = tgt_bits_all[:, tk]
             # tgt_idx points into the full reference; re-index into this window
             loc = tgt_idx[tk] - m0
-            kw = dict(ne=ne, err=err, cluster=cluster, timers=timers)
+            kw = dict(ne=ne, err=err, cluster=cluster, timers=timers,
+                      imp_states=imp_states, imp_step=imp_step)
             if use_gpu:
                 kw.update(ref_packed=sub_packed, n_hap=K,
                           bytes_per_variant=rref.bytes_per_variant,

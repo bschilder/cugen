@@ -427,3 +427,66 @@ def test_reduce_path_matches_the_unreduced_path():
     assert np.allclose(dose, full[0::2] + full[1::2], atol=2e-5)
     assert np.allclose(af, full.mean(axis=0), atol=2e-5)
     assert np.allclose(dr2, dosage_r2(full), atol=2e-4)
+
+
+@requires_gpu
+def test_gpu_selection_of_everything_matches_no_selection():
+    """sel = identity must reproduce the unselected kernels bit for bit in
+    intent -- the boundary case that makes everything below it interpretable."""
+    import cupy as cp
+    from cugen._impute_gpu import fb_posteriors_gpu
+    rng = np.random.default_rng(41)
+    C, K, T = 25, 60, 9
+    rc = rng.integers(0, 3, size=(C, K)).astype(np.int32)
+    tc = rng.integers(0, 3, size=(C, T)).astype(np.int32)
+    tau = np.concatenate([[0.0], rng.uniform(1e-4, 0.2, size=C - 1)])
+    mism = np.full(C, 1e-3)
+    plain = cp.asnumpy(fb_posteriors_gpu(rc, tc, tau, mism))
+    ident = np.tile(np.arange(K, dtype=np.int32), (T, 1))
+    withsel = cp.asnumpy(fb_posteriors_gpu(rc, tc, tau, mism, sel=ident))
+    assert np.abs(plain - withsel).max() < 1e-6
+
+
+@requires_gpu
+@pytest.mark.parametrize("K,J,T", [(60, 20, 7), (200, 64, 33), (37, 11, 3)])
+def test_gpu_selected_fb_matches_numpy(K, J, T):
+    import cupy as cp
+    from cugen._impute_core import forward_backward_sel
+    from cugen._impute_gpu import fb_posteriors_gpu
+    rng = np.random.default_rng(K * 7 + J)
+    C = 22
+    rc = rng.integers(0, 3, size=(C, K)).astype(np.int32)
+    tc = rng.integers(0, 3, size=(C, T)).astype(np.int32)
+    tau = np.concatenate([[0.0], rng.uniform(1e-4, 0.25, size=C - 1)])
+    mism = np.full(C, 1e-3)
+    sel = np.stack([rng.choice(K, size=J, replace=False).astype(np.int32)
+                    for _ in range(T)])
+    exp = forward_backward_sel(rc, tc, tau, mism, sel)
+    got = cp.asnumpy(fb_posteriors_gpu(rc, tc, tau, mism, sel=sel))
+    assert got.shape == exp.shape == (C, J, T)
+    assert np.abs(got - exp).max() < 2e-5
+
+
+@requires_gpu
+def test_gpu_selected_dose_matches_numpy():
+    import cupy as cp
+    from cugen._impute_core import dose_sparse_sel, state_inverse_map
+    from cugen._impute_gpu import dose_sparse_gpu
+    rng = np.random.default_rng(43)
+    C, K, J, T, M = 7, 80, 25, 11, 250
+    post = rng.random((C, J, T)).astype(np.float32)
+    post /= post.sum(axis=1, keepdims=True)
+    bits = (rng.random((K, M)) < rng.uniform(0.01, 0.99, size=M)).astype(np.uint8)
+    indptr, indices, major = build_carriers(bits)
+    sel = np.stack([rng.choice(K, size=J, replace=False).astype(np.int32)
+                    for _ in range(T)])
+    inv = state_inverse_map(sel, K)
+    left, lam = interpolation_weights(np.sort(rng.random(C)), np.sort(rng.random(M)))
+    got = cp.asnumpy(dose_sparse_gpu(cp.asarray(post), indptr, indices, major,
+                                     left, lam, inv=inv, n_ref_hap=K))
+    exp = np.empty((T, M))
+    for m in range(M):
+        cl = int(left[m]); cr = min(cl + 1, C - 1)
+        exp[:, m] = dose_sparse_sel(post[cl], post[cr], np.array([lam[m]]),
+                                    indptr, indices, major, [m], inv)[:, 0]
+    assert np.abs(got - exp).max() < 2e-5

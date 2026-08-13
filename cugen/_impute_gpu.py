@@ -86,9 +86,15 @@ __global__ void fb_backward(
     const int* __restrict__ tgt_codes,     // (C, T)
     const float* __restrict__ tau,         // (C,)
     const float* __restrict__ mism,        // (C,)
-    float* __restrict__ post,              // (C, K, T)
-    const int C, const int K, const int T)
+    float* __restrict__ post,              // (C, J, T)
+    const int* __restrict__ sel,           // (T, J) or null
+    const int C, const int K, const int T, const int J)
 {
+    // State j of target t is reference haplotype sel[t*J + j]. With sel null
+    // the state space is the whole panel and j IS the haplotype. K stays the
+    // ref_codes row stride; J is the STATE count and so is what the transition
+    // normalises by -- using K there while running J states would make the
+    // jump term J/K too small and the chain far stickier than intended.
     extern __shared__ float sh[];          // blockDim.x * blockDim.y partials
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
@@ -97,8 +103,8 @@ __global__ void fb_backward(
     const bool live = (t < T);
 
     // beta at the last marker is uniformly 1
-    for (int k = ty; k < K; k += blockDim.y) {
-        if (live) post[((long long)(C - 1) * K + k) * T + t] = 1.0f;
+    for (int j = ty; j < J; j += blockDim.y) {
+        if (live) post[((long long)(C - 1) * J + j) * T + t] = 1.0f;
     }
     __syncthreads();
 
@@ -113,9 +119,10 @@ __global__ void fb_backward(
         // come out as alpha * e * beta, an extra emission factor at every
         // marker. Recomputing e in pass 2 is one integer compare and costs less
         // than the write plus re-read it replaces.
-        for (int k = ty; k < K; k += blockDim.y) {
-            const long long o = ((long long)c * K + k) * T + t;
+        for (int j = ty; j < J; j += blockDim.y) {
+            const long long o = ((long long)c * J + j) * T + t;
             if (live) {
+                const int k = (sel == 0) ? j : sel[(long long)t * J + j];
                 partial += emit(ref_codes[(long long)c * K + k], tc, mm)
                            * post[o];
             }
@@ -134,14 +141,15 @@ __global__ void fb_backward(
         // sum_k[(1-tau)eb(k) + tau*S/K] = (1-tau)S + tau*S = S exactly, so the
         // normaliser is the same S already reduced -- no second reduction.
         const float keep = 1.0f - tau[c];
-        const float jump = (S > 0.0f) ? (tau[c] * S / (float)K) : 0.0f;
+        const float jump = (S > 0.0f) ? (tau[c] * S / (float)J) : 0.0f;
         const float inv = (S > 0.0f) ? (1.0f / S) : 0.0f;
-        for (int k = ty; k < K; k += blockDim.y) {
-            const long long o = ((long long)c * K + k) * T + t;
+        for (int j = ty; j < J; j += blockDim.y) {
+            const long long o = ((long long)c * J + j) * T + t;
             if (live) {
+                const int k = (sel == 0) ? j : sel[(long long)t * J + j];
                 const float eb = emit(ref_codes[(long long)c * K + k], tc, mm)
                                  * post[o];
-                post[((long long)(c - 1) * K + k) * T + t] =
+                post[((long long)(c - 1) * J + j) * T + t] =
                     (keep * eb + jump) * inv;
             }
         }
@@ -159,9 +167,10 @@ __global__ void fb_forward(
     const int* __restrict__ tgt_codes,
     const float* __restrict__ tau,
     const float* __restrict__ mism,
-    float* __restrict__ post,              // (C, K, T) beta in, posterior out
-    float* __restrict__ alpha,             // (K, T) scratch
-    const int C, const int K, const int T)
+    float* __restrict__ post,              // (C, J, T) beta in, posterior out
+    float* __restrict__ alpha,             // (J, T) scratch
+    const int* __restrict__ sel,           // (T, J) or null
+    const int C, const int K, const int T, const int J)
 {
     extern __shared__ float sh[];
     const int tx = threadIdx.x;
@@ -174,18 +183,19 @@ __global__ void fb_forward(
         const float mm = mism[c];
         const int tc = live ? tgt_codes[(long long)c * T + t] : 0;
         const float keep = 1.0f - tau[c];
-        const float jump = tau[c] / (float)K;
+        const float jump = tau[c] / (float)J;
 
         float partial = 0.0f;
-        for (int k = ty; k < K; k += blockDim.y) {
+        for (int j = ty; j < J; j += blockDim.y) {
+            const int k = (sel == 0) ? j : sel[(long long)t * J + j];
             const float e = emit(ref_codes[(long long)c * K + k], tc, mm);
             float a;
             if (c == 0) {
-                a = e / (float)K;
+                a = e / (float)J;
             } else {
-                a = e * (keep * alpha[(long long)k * T + t] + jump);
+                a = e * (keep * alpha[(long long)j * T + t] + jump);
             }
-            if (live) alpha[(long long)k * T + t] = a;
+            if (live) alpha[(long long)j * T + t] = a;
             partial += a;
         }
         sh[lane] = partial;
@@ -200,9 +210,9 @@ __global__ void fb_forward(
         // normalise alpha, fold in beta, and accumulate the posterior norm
         float pp = 0.0f;
         const float inv = (SA > 0.0f) ? (1.0f / SA) : 0.0f;
-        for (int k = ty; k < K; k += blockDim.y) {
-            const long long ka = (long long)k * T + t;
-            const long long o = ((long long)c * K + k) * T + t;
+        for (int j = ty; j < J; j += blockDim.y) {
+            const long long ka = (long long)j * T + t;
+            const long long o = ((long long)c * J + j) * T + t;
             if (live) {
                 const float a = alpha[ka] * inv;
                 alpha[ka] = a;
@@ -221,8 +231,8 @@ __global__ void fb_forward(
         __syncthreads();
 
         const float invp = (SP > 0.0f) ? (1.0f / SP) : 0.0f;
-        for (int k = ty; k < K; k += blockDim.y) {
-            const long long o = ((long long)c * K + k) * T + t;
+        for (int j = ty; j < J; j += blockDim.y) {
+            const long long o = ((long long)c * J + j) * T + t;
             if (live) post[o] *= invp;
         }
         __syncthreads();
@@ -240,15 +250,20 @@ __global__ void fb_forward(
 // across the warp. That is the whole reason for the (C, K, T) layout.
 // ---------------------------------------------------------------------------
 __global__ void dose_sparse(
-    const float* __restrict__ post,        // (C, K, T)
+    const float* __restrict__ post,        // (C, J, T)
     const long long* __restrict__ indptr,  // (M + 1,)
     const int* __restrict__ indices,       // (nnz,)
     const unsigned char* __restrict__ major,
     const int* __restrict__ left,          // (M,) bracketing aggregate index
     const float* __restrict__ lam,         // (M,)
     float* __restrict__ out,               // (T, M)
-    const int C, const int K, const int T, const int M)
+    const int* __restrict__ inv,           // (T, K) hap -> state, or null
+    const int C, const int K, const int T, const int M, const int J)
 {
+    // With target-specific states a carrier's reference-haplotype index no
+    // longer indexes the posterior. `inv` restores the connection, and -1 means
+    // that haplotype is not among this target's states -- it contributes
+    // nothing, which is precisely the approximation the selection makes.
     const int m = blockIdx.x;
     if (m >= M) return;
     const long long s = indptr[m];
@@ -260,10 +275,12 @@ __global__ void dose_sparse(
     for (int t = threadIdx.x; t < T; t += blockDim.x) {
         float sl = 0.0f;
         float sr = 0.0f;
-        for (long long j = s; j < e; ++j) {
-            const int k = indices[j];
-            sl += post[((long long)cl * K + k) * T + t];
-            sr += post[((long long)cr * K + k) * T + t];
+        for (long long q = s; q < e; ++q) {
+            const int k = indices[q];
+            const int j = (inv == 0) ? k : inv[(long long)t * K + k];
+            if (j < 0) continue;
+            sl += post[((long long)cl * J + j) * T + t];
+            sr += post[((long long)cr * J + j) * T + t];
         }
         if (major[m] == (unsigned char)1) {
             sl = 1.0f - sl;
@@ -404,27 +421,33 @@ def plan_t_tile(C, K, T, budget_bytes=None, safety=0.70):
     return min(tile, int(T))
 
 
-def fb_posteriors_gpu(ref_codes, tgt_codes, tau, mism):
-    """Posteriors as a (C, K, T) CuPy array. Mirrors forward_backward_ref."""
+def fb_posteriors_gpu(ref_codes, tgt_codes, tau, mism, sel=None):
+    """Posteriors as a (C, J, T) CuPy array; J == K when sel is None.
+
+    Mirrors forward_backward_ref, or forward_backward_sel when sel is given.
+    """
     mod = _module()
     C, K = ref_codes.shape
     T = tgt_codes.shape[1]
+    J = K if sel is None else int(sel.shape[1])
+    sel_d = 0 if sel is None else cp.ascontiguousarray(
+        cp.asarray(sel, dtype=cp.int32))
     rc = cp.ascontiguousarray(cp.asarray(ref_codes, dtype=cp.int32))
     tc = cp.ascontiguousarray(cp.asarray(tgt_codes, dtype=cp.int32))
     ta = cp.ascontiguousarray(cp.asarray(tau, dtype=cp.float32))
     mm = cp.ascontiguousarray(cp.asarray(mism, dtype=cp.float32))
-    post = cp.empty((C, K, T), dtype=cp.float32)
-    alpha = cp.zeros((K, T), dtype=cp.float32)
+    post = cp.empty((C, J, T), dtype=cp.float32)
+    alpha = cp.zeros((J, T), dtype=cp.float32)
 
     grid = ((T + _TX - 1) // _TX,)
     blk = (_TX, _TY)
     shmem = _TX * _TY * 4
     mod.get_function("fb_backward")(
-        grid, blk, (rc, tc, ta, mm, post, np.int32(C), np.int32(K),
-                    np.int32(T)), shared_mem=shmem)
+        grid, blk, (rc, tc, ta, mm, post, sel_d, np.int32(C), np.int32(K),
+                    np.int32(T), np.int32(J)), shared_mem=shmem)
     mod.get_function("fb_forward")(
-        grid, blk, (rc, tc, ta, mm, post, alpha, np.int32(C), np.int32(K),
-                    np.int32(T)), shared_mem=shmem)
+        grid, blk, (rc, tc, ta, mm, post, alpha, sel_d, np.int32(C),
+                    np.int32(K), np.int32(T), np.int32(J)), shared_mem=shmem)
     return post
 
 
@@ -446,7 +469,8 @@ def reduce_dose_gpu(p_dev, T, M):
     return dose, af, dr2
 
 
-def dose_sparse_gpu(post, indptr, indices, major, left, lam, col_offset=0):
+def dose_sparse_gpu(post, indptr, indices, major, left, lam, col_offset=0,
+                    inv=None, n_ref_hap=None):
     """Allele-1 probabilities as a (T, n) CuPy array. Mirrors dose_sparse.
 
     `col_offset` selects a slice of the marker axis, so a caller can walk the
@@ -454,8 +478,11 @@ def dose_sparse_gpu(post, indptr, indices, major, left, lam, col_offset=0):
     it; `indices` is NOT sliced, because indptr's values index into it globally.
     """
     mod = _module()
-    C, K, T = post.shape
+    C, J, T = post.shape
+    K = J if inv is None else int(n_ref_hap)
     M = int(len(lam))
+    inv_d = 0 if inv is None else cp.ascontiguousarray(
+        cp.asarray(inv, dtype=cp.int32))
     ip = cp.ascontiguousarray(cp.asarray(indptr, dtype=cp.int64))
     ix = cp.ascontiguousarray(cp.asarray(indices, dtype=cp.int32))
     mj = cp.ascontiguousarray(cp.asarray(major, dtype=cp.uint8))
@@ -465,8 +492,8 @@ def dose_sparse_gpu(post, indptr, indices, major, left, lam, col_offset=0):
     threads = min(256, max(32, ((T + 31) // 32) * 32))
     mod.get_function("dose_sparse")(
         (M,), (threads,), (post, ip[col_offset:], ix, mj[col_offset:], lf, lm,
-                           out, np.int32(C), np.int32(K), np.int32(T),
-                           np.int32(M)))
+                           out, inv_d, np.int32(C), np.int32(K), np.int32(T),
+                           np.int32(M), np.int32(J)))
     return out
 
 
@@ -507,7 +534,7 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
                           ne=100_000, err=None, cluster=0.005, carriers=None,
                           timers=None, budget_bytes=None, ref_packed=None,
                           n_hap=None, bytes_per_variant=None, reduce=False,
-                          marker_chunk=250_000):
+                          marker_chunk=250_000, imp_states=None, imp_step=0.1):
     """GPU counterpart of _impute_core.impute_haplotypes. Returns (T, M) float32.
 
     Pass `ref_packed` (the on-disk bytes, with n_hap and bytes_per_variant) to
@@ -522,6 +549,7 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
     from ._impute_core import (aggregate_markers, aggregate_mismatch,
                                allele_sequence_codes, build_carriers,
                                default_err, interpolation_weights,
+                               select_states, state_inverse_map,
                                transition_tau)
 
     t = {} if timers is None else timers
@@ -557,10 +585,19 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
         sub = ref_bits[:, tgt_idx]
     ref_codes, tgt_codes = allele_sequence_codes(
         sub, tgt_bits, starts, stops)
-    tau = transition_tau(agg_cm / 100.0, ne, K)
     mism = aggregate_mismatch(starts, stops, err)
     C = starts.size
     tick("aggregate", t0)
+
+    sel = inv = None
+    if imp_states is not None and imp_states < K:
+        t0s = time.perf_counter()
+        sel = select_states(sub, tgt_bits, marker_cm[tgt_idx],
+                            n_states=imp_states, step=imp_step)
+        inv = state_inverse_map(sel, K)
+        tick("select_states", t0s)
+    # normalise by the STATE count, not the panel size
+    tau = transition_tau(agg_cm / 100.0, ne, K if sel is None else sel.shape[1])
 
     t0 = time.perf_counter()
     left, lam = interpolation_weights(agg_cm, marker_cm)
@@ -591,7 +628,8 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
     for lo in range(0, T, tile):
         hi = min(lo + tile, T)
         t0 = time.perf_counter()
-        post = fb_posteriors_gpu(ref_codes, tgt_codes[:, lo:hi], tau, mism)
+        post = fb_posteriors_gpu(ref_codes, tgt_codes[:, lo:hi], tau, mism,
+                                 sel=None if sel is None else sel[lo:hi])
         cp.cuda.Device().synchronize()
         tick("forward_backward", t0)
 
@@ -603,7 +641,9 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
             m1 = min(m0 + marker_chunk, M)
             sl = slice(m0, m1)
             d = dose_sparse_gpu(post, indptr, indices, major, left[sl],
-                                lam[sl], col_offset=m0)
+                                lam[sl], col_offset=m0,
+                                inv=None if inv is None else inv[lo:hi],
+                                n_ref_hap=K)
             if reduce:
                 dd, aa, rr = reduce_dose_gpu(d, hi - lo, m1 - m0)
                 dose_h[(lo // 2):(hi // 2), sl] = cp.asnumpy(dd)
