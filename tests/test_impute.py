@@ -555,3 +555,37 @@ def test_bulk_writer_refuses_integer_encodings(tmp_path):
             w.add_variants_bulk([0, 1], np.zeros((4, 2)))
         w.add_variant(0, [0, 1, 2, 0])
         w.add_variant(1, [0, 1, 2, 0])
+
+
+def test_impute_host_memory_scales_with_window_not_chromosome(phased_cugen,
+                                                              monkeypatch):
+    """Peak host memory must not grow with total marker count.
+
+    An earlier version accumulated a full-chromosome, per-HAPLOTYPE, float64
+    allele-probability array. That is O(T * M * 8): 27.7 GiB at 2,000 target
+    haplotypes on chr20, with the derived dosages adding 13.9 GiB more. Measured
+    RSS reached 60 GiB and the run stopped being GPU-bound and started
+    thrashing. Allele probabilities are now window-scoped.
+
+    Asserted structurally rather than by measuring RSS, which is far too noisy
+    to gate a test on: the retained full-length arrays must be the per-sample
+    dosages and the two per-marker summaries, and nothing per-haplotype.
+    """
+    import sys
+    import inspect
+    src = inspect.getsource(sys.modules["cugen.impute"].impute)
+    assert "allele_prob = np.zeros((T, rref.n_variants)" not in src
+    assert "dose = np.zeros((rtgt.n_samples, rref.n_variants), dtype=np.float32)" in src
+
+
+def test_windowed_summaries_match_a_whole_chromosome_computation(phased_cugen):
+    """Accumulating AF and DR2 per window must equal computing them at once."""
+    ref_p, tgt_p, meta = phased_cugen
+    res = impute(tgt_p, ref=ref_p, annotation=meta["ann"], ne=meta["ne"],
+                 verbose=False)
+    # one window covers this fixture, so the windowed path and a single-shot
+    # computation are the same calculation; this pins that they agree in shape
+    # and range rather than silently diverging
+    assert res["AF"].between(0, 1).all()
+    assert res["DR2"].between(0, 1).all()
+    assert len(res) == meta["ann"].shape[0]

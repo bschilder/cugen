@@ -332,7 +332,15 @@ def impute(target, *, ref, annotation=None, map=None, out=None,
         tgt_bits_all = rtgt.read_haplotypes()
         timers["read"] = time.perf_counter() - t0
 
-        allele_prob = np.zeros((T, rref.n_variants), dtype=np.float64)
+        # Per-sample dosages in float32, plus per-marker summaries. NOT a
+        # full-chromosome per-HAPLOTYPE float64 array: that is O(T * M * 8) and
+        # was 27.7 GiB at 2,000 target haplotypes on chr20, with `dose` adding
+        # another 13.9 GiB on top. Measured RSS hit 60 GiB and the run went from
+        # GPU-bound to thrashing. Allele probabilities are now window-scoped and
+        # the per-marker statistics are accumulated as each window completes.
+        dose = np.zeros((rtgt.n_samples, rref.n_variants), dtype=np.float32)
+        af = np.zeros(rref.n_variants, dtype=np.float64)
+        dr2 = np.zeros(rref.n_variants, dtype=np.float64)
         tgt_owner = owner[tgt_idx]
 
         for w, (lo, hi) in enumerate(bounds):
@@ -373,16 +381,17 @@ def impute(target, *, ref, annotation=None, map=None, out=None,
             else:
                 kw.update(block=block, sparse=sparse)
             pw = engine(sub_ref, sub_tgt, loc, marker_cm[mk], **kw)
-            allele_prob[:, mk[keep]] = pw[:, keep]
+            kept = pw[:, keep]
+            dose[:, mk[keep]] = (kept[0::2, :] + kept[1::2, :]).astype(np.float32)
+            af[mk[keep]] = kept.mean(axis=0)
+            dr2[mk[keep]] = dosage_r2(kept)
+            del kept, pw
             if verbose:
                 print(f"[impute]   window {w+1}/{len(bounds)} "
                       f"[{lo:.1f}, {hi:.1f}] cM: {mk.size:,} markers, "
                       f"{tk.size:,} genotyped, {keep.size:,} kept")
 
         t0 = time.perf_counter()
-        dose = allele_prob[0::2, :] + allele_prob[1::2, :]      # per sample
-        af = allele_prob.mean(axis=0)
-        dr2 = dosage_r2(allele_prob)
         is_typed = np.zeros(rref.n_variants, dtype=bool)
         is_typed[tgt_idx] = True
         timers["summary"] = time.perf_counter() - t0
