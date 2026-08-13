@@ -175,6 +175,54 @@ smaller panel, not the larger cohort. And the T=2,000 point did not complete:
 it was still bounded by a per-window `(T, M_window)` host array, a smaller
 relative of the memory bug described below.
 
+## Panel axis: measured against Beagle 5.5, both tools
+
+Target cohort **fixed** at 100 samples (200 haplotypes); reference panels nested
+so only their size changes, never which individuals are in them; marker set
+computed once from the largest panel and reused. Imputation time only.
+
+| K (haplotypes) | cugen | Beagle 5.5 | cugen faster by |
+|---|---|---|---|
+| 400 | 1.56 s | 8 s | 5.13x |
+| 1,200 | 4.13 s | 12 s | 2.91x |
+| 2,400 | 7.28 s | 15 s | 2.06x |
+| 4,800 | 13.98 s | 17 s | 1.22x |
+
+**12x the panel costs cugen 9.0x and Beagle 2.1x.** cugen with brute-force
+states is linear in panel size; Beagle, selecting `imp-states=1600` regardless,
+is not. Extrapolating the two fits, they cross at roughly 6,000 haplotypes --
+about 3,000 reference samples, just past 1000 Genomes. That is where brute force
+stops being viable, and it is close enough to matter.
+
+Together with the target axis, the two axes explain the whole picture: cugen
+wins on cohort size and loses on panel size, and any single ratio is really a
+statement about where on those two axes it was measured.
+
+## State selection changes cugen's slope
+
+Same panels, cugen only, with `imp_states` selecting a per-target subset:
+
+| K (haplotypes) | brute force | J=1,600 | J=800 |
+|---|---|---|---|
+| 400 | 1.39 s | -- | -- |
+| 1,200 | 3.93 s | -- | 4.08 s |
+| 2,400 | 7.28 s | 7.64 s | 4.83 s |
+| 4,800 | 13.99 s | **9.26 s** | **6.57 s** |
+
+The slope is the point, not the row. Brute force costs **10.1x** going from
+K=400 to K=4,800. At a fixed J=800 the cost from K=2,400 to K=4,800 is **1.36x**
+for twice the panel -- sublinear, which is the shape Beagle has and brute force
+does not.
+
+Selection only pays once J is well below K: at K=1,200 a J of 800 is SLOWER
+than brute force (4.08 s against 3.93 s), because the selection pass costs more
+than the 1.5x smaller state space saves.
+
+It is not free in accuracy. Against the brute-force answer on simulated mosaic
+panels, correlation is 0.980 at J/K = 1/3 (Beagle's ratio), 0.956 at 1/6 and
+0.899 at 1/12. What that costs against TRUTH on the real fixture has not been
+measured.
+
 ## Scaling: cugen alone, compute only
 
 
