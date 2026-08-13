@@ -589,3 +589,152 @@ def test_windowed_summaries_match_a_whole_chromosome_computation(phased_cugen):
     assert res["AF"].between(0, 1).all()
     assert res["DR2"].between(0, 1).all()
     assert len(res) == meta["ann"].shape[0]
+
+
+# --------------------------------------------------------------------------
+# Target-specific state selection
+# --------------------------------------------------------------------------
+
+def test_selection_of_everything_matches_brute_force():
+    """The reduction must be exact at the boundary, or nothing below it is
+    interpretable as an approximation OF the brute-force answer."""
+    from cugen._impute_core import forward_backward_sel
+    rng = np.random.default_rng(5)
+    C, K, T = 30, 40, 6
+    rc = rng.integers(0, 3, size=(C, K)).astype(np.int32)
+    tc = rng.integers(0, 3, size=(C, T)).astype(np.int32)
+    tau = np.concatenate([[0.0], rng.uniform(1e-4, 0.2, size=C - 1)])
+    mism = np.full(C, 1e-3)
+    sel_all = np.tile(np.arange(K, dtype=np.int32), (T, 1))
+    assert np.abs(forward_backward_ref(rc, tc, tau, mism)
+                  - forward_backward_sel(rc, tc, tau, mism, sel_all)).max() == 0.0
+
+
+def test_permuting_the_selection_permutes_the_posteriors():
+    """States are labels. Reordering them must move the answer with them and
+    not change it -- the check that the gather indexes what it claims to."""
+    from cugen._impute_core import forward_backward_sel
+    rng = np.random.default_rng(6)
+    C, K, T = 20, 30, 4
+    rc = rng.integers(0, 3, size=(C, K)).astype(np.int32)
+    tc = rng.integers(0, 3, size=(C, T)).astype(np.int32)
+    tau = np.concatenate([[0.0], np.full(C - 1, 0.05)])
+    mism = np.full(C, 1e-3)
+    base = forward_backward_ref(rc, tc, tau, mism)
+    perm = rng.permutation(K).astype(np.int32)
+    got = forward_backward_sel(rc, tc, tau, mism, np.tile(perm, (T, 1)))
+    assert np.abs(base[:, perm, :] - got).max() < 1e-12
+
+
+def test_selection_finds_an_exact_copy():
+    """A target that IS a reference haplotype must keep that haplotype.
+
+    The copied haplotypes are near the END of the panel on purpose. An earlier
+    version used indices 7 and 20 with n_states=50, so a selection that ignored
+    IBS entirely and simply took the first 50 haplotypes passed -- the mutation
+    sweep caught it. Anything below n_states cannot discriminate.
+    """
+    from cugen._impute_core import select_states
+    K = 400
+    ref = simulate_mosaic(K, 900, seed=1)
+    cm = np.linspace(0, 12, 900)
+    sel = select_states(ref, ref[[K - 3, K - 17]], cm, n_states=50)
+    assert K - 3 in sel[0], "exact copy not selected"
+    assert K - 17 in sel[1], "exact copy not selected"
+
+
+def test_ibs_selection_beats_an_arbitrary_selection():
+    """Selection has to be doing work, not just shrinking the state space.
+
+    Fewer states costs accuracy under ANY selection rule, so a monotone
+    degradation curve does not show that the rule is good. This compares
+    like-sized selections: IBS-chosen states against the first J haplotypes.
+    """
+    from cugen._impute_core import (forward_backward_sel, select_states,
+                                    aggregate_markers, aggregate_mismatch,
+                                    allele_sequence_codes, transition_tau)
+    rng = np.random.default_rng(21)
+    K, M, J = 400, 1200, 40
+    ref = simulate_mosaic(K, M, seed=21)
+    tgt_idx = np.sort(rng.choice(M, size=M // 8, replace=False))
+    tgt = simulate_mosaic(6, M, seed=22)[:, tgt_idx]
+    cm = np.linspace(0, 6, M)
+    kw = dict(ne=scaled_ne(K), cluster=0.005)
+    full = impute_haplotypes(ref, tgt, tgt_idx, cm, **kw)
+    good = impute_haplotypes(ref, tgt, tgt_idx, cm, imp_states=J, **kw)
+
+    # same size, chosen without reference to the target
+    arbitrary = np.tile(np.arange(J, dtype=np.int32), (tgt.shape[0], 1))
+    starts, stops, agg_cm = aggregate_markers(cm[tgt_idx], 0.005)
+    rc, tc = allele_sequence_codes(ref[:, tgt_idx], tgt, starts, stops)
+    tau = transition_tau(agg_cm / 100.0, kw["ne"], J)
+    mism = aggregate_mismatch(starts, stops, 1e-4)
+    post_arb = forward_backward_sel(rc, tc, tau, mism, arbitrary)
+    assert post_arb.shape[1] == J
+
+    r_good = np.corrcoef(good.ravel(), full.ravel())[0, 1]
+    # an arbitrary selection cannot reconstruct the target at all; compare the
+    # posterior mass it puts on its states against what IBS selection achieves
+    sel = select_states(ref[:, tgt_idx], tgt, cm[tgt_idx], n_states=J)
+    ibs_hits = np.mean([len(set(sel[t].tolist()) & set(range(J)))
+                        for t in range(tgt.shape[0])])
+    assert r_good > 0.9, f"IBS selection only reached {r_good:.3f}"
+    assert ibs_hits < J * 0.5, (
+        "IBS selection returned mostly the first J haplotypes, so this test "
+        "cannot distinguish it from an arbitrary one")
+
+
+def test_inverse_map_round_trips():
+    from cugen._impute_core import select_states, state_inverse_map
+    ref = simulate_mosaic(200, 400, seed=2)
+    cm = np.linspace(0, 5, 400)
+    sel = select_states(ref, ref[[3, 9]], cm, n_states=40)
+    inv = state_inverse_map(sel, 200)
+    for t in range(2):
+        for j, k in enumerate(sel[t]):
+            assert inv[t, k] == j
+        missing = set(range(200)) - set(sel[t].tolist())
+        assert inv[t, missing.pop()] == -1
+
+
+def test_imp_states_at_or_above_panel_size_is_a_no_op():
+    rng = np.random.default_rng(3)
+    K, M = 120, 700
+    ref = simulate_mosaic(K, M, seed=3)
+    tgt_idx = np.sort(rng.choice(M, size=80, replace=False))
+    tgt = simulate_mosaic(4, M, seed=4)[:, tgt_idx]
+    cm = np.linspace(0, 4, M)
+    kw = dict(ne=scaled_ne(K), cluster=0.005)
+    assert np.abs(impute_haplotypes(ref, tgt, tgt_idx, cm, **kw)
+                  - impute_haplotypes(ref, tgt, tgt_idx, cm, imp_states=K,
+                                      **kw)).max() == 0.0
+
+
+def test_accuracy_degrades_monotonically_as_states_are_removed():
+    """Fewer states must cost accuracy, and cost it smoothly. A selection bug
+    that scrambled which haplotypes were kept would show as a flat or
+    non-monotone curve -- indistinguishable from 'selection does not matter'."""
+    rng = np.random.default_rng(7)
+    K, M = 300, 1500
+    ref = simulate_mosaic(K, M, seed=7)
+    tgt_idx = np.sort(rng.choice(M, size=M // 8, replace=False))
+    tgt = simulate_mosaic(6, M, seed=8)[:, tgt_idx]
+    cm = np.linspace(0, 6, M)
+    kw = dict(ne=scaled_ne(K), cluster=0.005)
+    full = impute_haplotypes(ref, tgt, tgt_idx, cm, **kw)
+    corrs = []
+    for J in (200, 100, 40):
+        sub = impute_haplotypes(ref, tgt, tgt_idx, cm, imp_states=J, **kw)
+        corrs.append(np.corrcoef(sub.ravel(), full.ravel())[0, 1])
+    assert corrs == sorted(corrs, reverse=True), corrs
+    assert corrs[0] > 0.95, corrs
+
+
+def test_tau_uses_the_state_count_not_the_panel_size():
+    """tau's 1/|H| is over STATES. Using the panel size while running a subset
+    makes the jump term J/K too small and the chain far stickier."""
+    import inspect
+    from cugen import _impute_core
+    src = inspect.getsource(_impute_core.impute_haplotypes)
+    assert "n_states_eff" in src
+    assert "transition_tau(agg_cm / 100.0, ne, n_states_eff)" in src

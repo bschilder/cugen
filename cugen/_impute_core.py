@@ -497,7 +497,8 @@ def dose_sparse(post_left, post_right, lam, indptr, indices, major, cols):
 
 def impute_haplotypes(ref_bits, tgt_bits, tgt_idx, marker_cm, *, ne=100_000,
                       err=None, cluster=0.005, block=None, sparse=True,
-                      carriers=None, timers=None):
+                      carriers=None, timers=None, imp_states=None,
+                      imp_step=0.1):
     """End-to-end allele-1 probabilities for every reference marker.
 
     ref_bits  : (K, M_ref) uint8 0/1   phased reference panel
@@ -542,9 +543,23 @@ def impute_haplotypes(ref_bits, tgt_bits, tgt_idx, marker_cm, *, ne=100_000,
     ref_codes, tgt_codes = allele_sequence_codes(
         ref_bits[:, tgt_idx], tgt_bits, starts, stops)
     C = starts.size
-    tau = transition_tau(agg_cm / 100.0, ne, K)          # cM -> Morgans
     mism = aggregate_mismatch(starts, stops, err)
     tick("aggregate", t0)
+
+    sel = inv = None
+    if imp_states is not None and imp_states < K:
+        t0 = time.perf_counter()
+        sel = select_states(ref_bits[:, tgt_idx], tgt_bits,
+                            marker_cm[tgt_idx], n_states=imp_states,
+                            step=imp_step)
+        inv = state_inverse_map(sel, K)
+        tick("select_states", t0)
+    # tau's 1/|H| is the number of STATES, not the panel size: with a selected
+    # subset the chain re-randomises among the states that exist. Using K here
+    # while running J states would make the jump term J/K too small and the
+    # chain far stickier than intended.
+    n_states_eff = K if sel is None else sel.shape[1]
+    tau = transition_tau(agg_cm / 100.0, ne, n_states_eff)   # cM -> Morgans
 
     t0 = time.perf_counter()
     left, lam = interpolation_weights(agg_cm, marker_cm)
@@ -553,7 +568,7 @@ def impute_haplotypes(ref_bits, tgt_bits, tgt_idx, marker_cm, *, ne=100_000,
     group_stop = np.searchsorted(left[order], np.arange(C), side="right")
     tick("interp_plan", t0)
 
-    if sparse and carriers is None:
+    if (sparse or sel is not None) and carriers is None:
         t0 = time.perf_counter()
         carriers = build_carriers(ref_bits)
         tick("carriers", t0)
@@ -566,8 +581,11 @@ def impute_haplotypes(ref_bits, tgt_bits, tgt_idx, marker_cm, *, ne=100_000,
         if cols.size == 0:
             return
         t0 = time.perf_counter()
-        if sparse:
-            indptr, indices, major = carriers
+        indptr, indices, major = carriers if sparse else (None, None, None)
+        if sel is not None:
+            out[:, cols] = dose_sparse_sel(post_l, post_r, lam[cols], indptr,
+                                           indices, major, cols, inv)
+        elif sparse:
             out[:, cols] = dose_sparse(post_l, post_r, lam[cols],
                                        indptr, indices, major, cols)
         else:
@@ -583,12 +601,194 @@ def impute_haplotypes(ref_bits, tgt_bits, tgt_idx, marker_cm, *, ne=100_000,
         state["prev"] = post.copy()
         state["prev_c"] = c
 
-    forward_backward_blocked(ref_codes, tgt_codes, tau, mism,
-                             block=block, emit=emit)
+    if sel is not None:
+        # The blocked form has no selection-aware variant; selection already
+        # shrinks the posterior array by K/J, which is the memory the blocking
+        # existed to save.
+        for c, pc in enumerate(forward_backward_sel(ref_codes, tgt_codes, tau,
+                                                    mism, sel)):
+            emit(c, pc)
+    else:
+        forward_backward_blocked(ref_codes, tgt_codes, tau, mism,
+                                 block=block, emit=emit)
     # Markers past the last aggregate interpolate against nothing; their left
     # index is C-2 (clipped) and they were flushed above, except when C == 1,
     # where every marker takes the single posterior outright.
     if C == 1 and state["prev"] is not None:
         flush(0, state["prev"], state["prev"])
     t["forward_backward"] = time.perf_counter() - fb0 - t.get("dose", 0.0)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Target-specific state selection
+# ---------------------------------------------------------------------------
+
+def interval_bounds(cm, step=0.1):
+    """Consecutive non-overlapping intervals of `step` cM over the markers.
+
+    Returns (starts, stops) into the marker axis. Beagle's imp-step default is
+    0.1 cM.
+    """
+    cm = np.asarray(cm, dtype=np.float64)
+    n = cm.size
+    if n == 0:
+        e = np.empty(0, dtype=np.int64)
+        return e, e
+    edges = np.arange(cm[0], cm[-1] + step, step)
+    starts = np.searchsorted(cm, edges, side="left")
+    starts = np.unique(np.concatenate([[0], starts]))
+    starts = starts[starts < n]
+    stops = np.append(starts[1:], n)
+    keep = stops > starts
+    return starts[keep], stops[keep]
+
+
+def select_states(ref_typed, tgt_typed, cm_typed, n_states=1600, step=0.1):
+    """Per-target reference haplotypes, chosen by longest IBS run.
+
+    ref_typed : (K, C) uint8   reference alleles at GENOTYPED markers
+    tgt_typed : (T, C) uint8   target alleles at the same markers
+    returns   : sel (T, J) int32 reference haplotype indices, J <= n_states
+
+    Beagle reduces the state space to `imp-states=1600` composite reference
+    haplotypes: it divides the window into `imp-step=0.1` cM intervals, finds
+    the reference haplotypes identical-by-state with the target in each, prefers
+    those matching across more consecutive intervals (`imp-nsteps=7`), and then
+    packs the surviving segments into exactly 1,600 MOSAIC haplotypes.
+
+    THIS IS NOT THAT, and the difference is worth stating rather than glossing.
+    Segments are not assembled into mosaics; each selected reference haplotype
+    enters the state space whole, ranked by the longest run of consecutive
+    intervals over which it is IBS with the target. That is the "target-specific
+    set of reference haplotypes" the 2018 paper describes as the PREVIOUS
+    generation of methods, and whose weakness it names: a haplotype useful in
+    one part of the window occupies a state across all of it. Composite
+    haplotypes fix that and are not implemented here.
+
+    Matching is by integer code per interval, not by comparing alleles: two
+    haplotypes are IBS across an interval exactly when their packed allele
+    sequences are equal, so an interval costs O(K + T) instead of O(K*T*l).
+    """
+    ref_typed = np.asarray(ref_typed)
+    tgt_typed = np.asarray(tgt_typed)
+    K, C = ref_typed.shape
+    T = tgt_typed.shape[0]
+    if tgt_typed.shape[1] != C:
+        raise ValueError(f"ref has {C} typed markers, target has "
+                         f"{tgt_typed.shape[1]}")
+    if n_states >= K:
+        return np.tile(np.arange(K, dtype=np.int32), (T, 1))
+
+    starts, stops = interval_bounds(cm_typed, step)
+    run = np.zeros((K, T), dtype=np.int32)
+    best = np.zeros((K, T), dtype=np.int32)
+    for a, b in zip(starts, stops):
+        rc, tc = allele_sequence_codes(ref_typed, tgt_typed,
+                                       np.array([a]), np.array([b]))
+        m = rc[0][:, None] == tc[0][None, :]
+        run = np.where(m, run + 1, 0)
+        np.maximum(best, run, out=best)
+
+    # Ties are common -- many haplotypes share the longest run -- so break them
+    # by total intervals matched, which is a second, weaker IBS signal. Without
+    # a tiebreak the selection is whatever argpartition happens to return, and
+    # that varies with array layout rather than with the data.
+    sel = np.empty((T, n_states), dtype=np.int32)
+    for t in range(T):
+        score = best[:, t].astype(np.int64) * (K + 1) - np.arange(K)
+        idx = np.argpartition(-score, n_states - 1)[:n_states]
+        sel[t] = np.sort(idx).astype(np.int32)
+    return sel
+
+
+def state_inverse_map(sel, n_ref_hap):
+    """(T, K) int32 mapping reference haplotype -> state index, or -1.
+
+    The sparse dose step sums over the reference haplotypes carrying a marker's
+    minor allele. Once states are target-specific those haplotype indices no
+    longer index the posterior directly, and this is what restores the
+    connection -- without it the carrier lists would have to be rebuilt per
+    target, which is the whole cost the sparse representation exists to avoid.
+    """
+    sel = np.asarray(sel)
+    T, J = sel.shape
+    inv = np.full((T, int(n_ref_hap)), -1, dtype=np.int32)
+    rows = np.repeat(np.arange(T), J)
+    inv[rows, sel.reshape(-1)] = np.tile(np.arange(J, dtype=np.int32), T)
+    return inv
+
+
+def forward_backward_sel(ref_codes, tgt_codes, tau, mism, sel):
+    """Forward-backward over TARGET-SPECIFIC states. Returns (C, J, T).
+
+    Identical recursion to forward_backward_ref; only the emission differs.
+    State j of target t is reference haplotype sel[t, j], so the allele code is
+    gathered per target rather than shared:
+
+        e(j, t) = [ ref_codes[c, sel[t, j]] == tgt_codes[c, t] ]
+
+    With sel = every haplotype for every target this reduces exactly to
+    forward_backward_ref, which test_selection_of_everything_matches_brute_force
+    pins.
+    """
+    C = ref_codes.shape[0]
+    T, J = sel.shape
+    selT = np.ascontiguousarray(sel.T)              # (J, T)
+    alpha = np.empty((C, J, T), dtype=np.float64)
+
+    def emis(c):
+        rc = ref_codes[c][selT]                     # (J, T) gather
+        return np.where(rc == tgt_codes[c][None, :], 1.0 - mism[c], mism[c])
+
+    a = None
+    for c in range(C):
+        e = emis(c)
+        a = e * (1.0 / J) if c == 0 else e * ((1.0 - tau[c]) * a + tau[c] / J)
+        a /= a.sum(axis=0, keepdims=True)
+        alpha[c] = a
+
+    post = np.empty_like(alpha)
+    b = np.ones((J, T), dtype=np.float64)
+    for c in range(C - 1, -1, -1):
+        p = alpha[c] * b
+        post[c] = p / p.sum(axis=0, keepdims=True)
+        if c == 0:
+            break
+        eb = emis(c) * b
+        b = (1.0 - tau[c]) * eb + tau[c] / J * eb.sum(axis=0, keepdims=True)
+        b /= b.sum(axis=0, keepdims=True)
+    return post
+
+
+def dose_sparse_sel(post_left, post_right, lam, indptr, indices, major, cols,
+                    inv):
+    """Sparse dose over target-specific states, via the inverse map.
+
+    post_* : (J, T)
+    inv    : (T, K) reference haplotype -> state index, or -1
+
+    A carrier that is not among a target's selected states contributes nothing,
+    which is the approximation the selection makes: its posterior probability is
+    not small, it is absent. That is why `major` still has to be honoured from
+    the FULL panel -- the complement 1 - sum(carriers) is only valid because the
+    posterior sums to 1 over the states that DO exist.
+    """
+    T = post_left.shape[1]
+    n = len(cols)
+    out = np.zeros((T, n), dtype=np.float64)
+    for j, m in enumerate(cols):
+        s, e = int(indptr[m]), int(indptr[m + 1])
+        idx = indices[s:e]
+        for t in range(T):
+            if idx.size:
+                js = inv[t, idx]
+                ok = js >= 0
+                sl = post_left[js[ok], t].sum() if ok.any() else 0.0
+                sr = post_right[js[ok], t].sum() if ok.any() else 0.0
+            else:
+                sl = sr = 0.0
+            if major[m] == 1:
+                sl, sr = 1.0 - sl, 1.0 - sr
+            out[t, j] = lam[j] * sl + (1.0 - lam[j]) * sr
     return out
