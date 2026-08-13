@@ -490,6 +490,12 @@ def dose_sparse_gpu(post, indptr, indices, major, left, lam, col_offset=0,
     M = int(len(lam))
     inv_d = 0 if inv is None else cp.ascontiguousarray(
         cp.asarray(inv, dtype=cp.int32))
+    # cp.asarray is a no-op when the input is already on the device, so a
+    # caller that hoists these out of a loop pays the transfer once. That
+    # matters: `indices` is 428 MB of carrier data at chr20 scale, and when the
+    # marker axis was chunked this function started being called seven times
+    # per tile -- re-uploading all of it each time and making the dose phase 87x
+    # more expensive per haplotype.
     ip = cp.ascontiguousarray(cp.asarray(indptr, dtype=cp.int64))
     ix = cp.ascontiguousarray(cp.asarray(indices, dtype=cp.int32))
     mj = cp.ascontiguousarray(cp.asarray(major, dtype=cp.uint8))
@@ -619,6 +625,10 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
             carriers = build_carriers(ref_bits)
         tick("carriers", t0)
     indptr, indices, major = carriers
+    # upload once, before any tile or chunk loop touches them
+    indptr = cp.ascontiguousarray(cp.asarray(indptr, dtype=cp.int64))
+    indices = cp.ascontiguousarray(cp.asarray(indices, dtype=cp.int32))
+    major = cp.ascontiguousarray(cp.asarray(major, dtype=cp.uint8))
 
     tile = plan_t_tile(C, K, T, budget_bytes=budget_bytes)
     if reduce:

@@ -522,7 +522,8 @@ def test_dosage_r2_bounds_and_direction():
     assert r.min() >= 0.0 and r.max() <= 1.0
 
 
-def test_bulk_writer_is_byte_identical_to_per_variant(tmp_path):
+@pytest.mark.parametrize("dtype", [np.float64, np.float32])
+def test_bulk_writer_is_byte_identical_to_per_variant(tmp_path, dtype):
     """The fast path must be a pure optimisation, NaNs and all.
 
     add_variants_bulk recomputes mu/sxx/maf with array operations instead of
@@ -532,7 +533,11 @@ def test_bulk_writer_is_byte_identical_to_per_variant(tmp_path):
     from cugen.write import CugenWriter, ENCODING_FLOAT16
     rng = np.random.default_rng(0)
     n_s, n_v = 17, 500
-    dose = rng.uniform(0, 2, size=(n_s, n_v))
+    # float32 is the dtype impute() actually passes. An earlier version of the
+    # bulk path promoted everything to float64, which doubled four full-size
+    # temporaries and made writing the largest phase of a chromosome run; this
+    # test covered only float64 and so could not see the change.
+    dose = rng.uniform(0, 2, size=(n_s, n_v)).astype(dtype)
     dose[3, 7] = np.nan                      # exercise the missing-value rule
     dose[5, 9] = 3.5                         # and the out-of-range rule
     g = np.arange(n_v) * 3

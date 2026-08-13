@@ -345,7 +345,13 @@ class CugenWriter:
                 f"add_variants_bulk is for float encodings; this writer has "
                 f"encoding {self.encoding}. The integer encodings need "
                 f"per-variant packing.")
-        d = np.asarray(dosages, dtype=np.float64)
+        # Keep the caller's precision. Promoting float32 dosages to float64
+        # doubles every temporary below, and there are four of them at full
+        # size; at 1.73M markers that was the largest single phase in a
+        # chromosome run.
+        d = np.asarray(dosages)
+        if d.dtype not in (np.float32, np.float64):
+            d = d.astype(np.float64)
         if d.ndim != 2 or d.shape[0] != self.n_samples:
             raise ValueError(f"dosages must be (n_samples={self.n_samples}, "
                              f"n_variants), got {d.shape}")
@@ -359,9 +365,15 @@ class CugenWriter:
 
         ok = np.isfinite(d) & (d >= 0) & (d <= 2)          # same rule as
         cnt = ok.sum(axis=0)                                # variant_stats()
-        x = np.where(ok, d, 0.0)
-        mu = np.divide(x.sum(axis=0), np.maximum(cnt, 1))
-        sxx = (np.where(ok, (d - mu[None, :]) ** 2, 0.0)).sum(axis=0)
+        # Accumulate in float64 from float32 inputs without materialising a
+        # float64 copy of the whole block: sum and sum-of-squares are enough for
+        # both statistics, and np.einsum keeps the accumulator wide while the
+        # operand stays narrow.
+        w = np.where(ok, d, 0)
+        s1 = w.sum(axis=0, dtype=np.float64)
+        s2 = np.einsum("ij,ij->j", w, w, dtype=np.float64)
+        mu = s1 / np.maximum(cnt, 1)
+        sxx = s2 - 2.0 * mu * s1 + mu * mu * cnt
         af = mu / 2.0
         maf = np.minimum(af, 1.0 - af)
         empty = cnt == 0
