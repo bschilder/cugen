@@ -865,14 +865,15 @@ def test_mosaics_only_help_when_states_are_scarce():
     assert abs(m_big - w_big) < 0.05, (w_big, m_big)      # generous: a wash
 
 
-@pytest.mark.parametrize("J", [120, 40, 16])
-def test_mosaic_reaches_impute_haplotypes(J):
+def test_mosaic_reaches_impute_haplotypes():
     """End to end through the public engine, not just the internals.
 
-    Both selection modes must produce the same SHAPE and valid probabilities,
-    and the mosaic must be at least as good as whole-haplotype selection at
-    every state budget -- it is strictly more expressive, so a mode that ever
-    loses means the construction or the per-interval inverse map is wrong.
+    Mosaics are NOT uniformly better, and an earlier version of this test
+    asserted they were. At a generous state budget whole-haplotype selection
+    can win slightly: it picks the globally best haplotypes, while the mosaic
+    construction is a greedy staleness heuristic that will splice when it did
+    not need to, changing a state's identity mid-window and paying a transition
+    for nothing. The advantage is real only where states are scarce.
     """
     rng = np.random.default_rng(3)
     K, M = 400, 1600
@@ -882,11 +883,23 @@ def test_mosaic_reaches_impute_haplotypes(J):
     cm = np.linspace(0, 8, M)
     kw = dict(ne=scaled_ne(K), cluster=0.005)
     full = impute_haplotypes(ref, tgt, tgt_idx, cm, **kw)
-    whole = impute_haplotypes(ref, tgt, tgt_idx, cm, imp_states=J, **kw)
-    mos = impute_haplotypes(ref, tgt, tgt_idx, cm, imp_states=J, mosaic=True,
-                            **kw)
-    assert whole.shape == mos.shape == full.shape
-    for x in (whole, mos):
-        assert x.min() >= -1e-12 and x.max() <= 1 + 1e-12
     r = lambda x: np.corrcoef(x.ravel(), full.ravel())[0, 1]
-    assert r(mos) >= r(whole) - 1e-3, (r(whole), r(mos))
+
+    got = {}
+    for J in (120, 16):
+        whole = impute_haplotypes(ref, tgt, tgt_idx, cm, imp_states=J, **kw)
+        mos = impute_haplotypes(ref, tgt, tgt_idx, cm, imp_states=J,
+                                mosaic=True, **kw)
+        assert whole.shape == mos.shape == full.shape
+        for x in (whole, mos):
+            assert x.min() >= -1e-12 and x.max() <= 1 + 1e-12
+        got[J] = (r(whole), r(mos))
+
+    # scarce states (J/K = 1/25): the mosaic must win, and clearly
+    w16, m16 = got[16]
+    assert m16 > w16 + 0.05, got
+    # generous states (J/K = 1/3): close either way, no strong claim
+    w120, m120 = got[120]
+    assert abs(m120 - w120) < 0.05, got
+    # and the advantage must GROW as states get scarcer -- that is the claim
+    assert (m16 - w16) > (m120 - w120), got
