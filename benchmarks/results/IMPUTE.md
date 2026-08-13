@@ -207,6 +207,36 @@ smaller panel, not the larger cohort. And the T=2,000 point did not complete:
 it was still bounded by a per-window `(T, M_window)` host array, a smaller
 relative of the memory bug described below.
 
+### T = 2,000 haplotypes, the point that never ran
+
+The largest cohort in the grid is what exposed the float64 memory bug, and it
+had never completed. It does now, on a SEPARATE (slower) pod, so these two
+points are comparable to each other and not to the table above:
+
+| T (haplotypes) | cugen | Beagle 5.5 | cugen faster |
+|---|---|---|---|
+| 500 | 21.77 s | 39 s | 1.79x |
+| 2,000 | 26.92 s | 60 s | **2.23x** |
+
+**4x the targets for 1.24x the time.** The first attempt at this point gave
+64.60 s and 0.93x -- cugen losing -- and both causes were regressions this
+branch had introduced and never exercised at that size:
+
+- `dose_sparse_gpu` uploads its carrier arrays on entry, and chunking the marker
+  axis had turned one call per tile into seven. `indices` is 428 MB, so it was
+  re-uploaded every chunk. Hoisted above the loops.
+- `CugenWriter.add_variants_bulk` promoted float32 dosages to float64,
+  doubling four full-size temporaries. Writing was 73-119 s, the largest phase
+  of the run. Now the caller's precision is kept and the two moments accumulate
+  in float64 via einsum.
+
+Two honesty notes on this table. `write` is 110 s at T=2,000, larger than the
+imputation itself, and it is NOT in the cugen column -- that column is
+imputation only, matching Beagle's own figure. And the `dose` phase timed 11.9 s
+at T=500 against 4.0 s at T=2,000, which is backwards and unexplained; the
+totals are consistent but that split is not, so it should not be read as
+evidence about how the dose kernel scales.
+
 ## Panel axis: measured against Beagle 5.5, both tools
 
 Target cohort **fixed** at 100 samples (200 haplotypes); reference panels nested
