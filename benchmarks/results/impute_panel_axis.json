@@ -1,0 +1,84 @@
+{
+  "chrom": 20,
+  "n_target_samples": 100,
+  "n_target_haplotypes": 200,
+  "n_reference_markers": 1733485,
+  "points": [
+    {
+      "n_reference_samples": 200,
+      "n_reference_haplotypes": 400,
+      "cugen_wall_s": 8.85,
+      "cugen_impute_s": 1.56,
+      "cugen_phases": {
+        "read": 0.058,
+        "aggregate": 0.178,
+        "interp_plan": 0.058,
+        "carriers": 0.026,
+        "forward_backward": 0.822,
+        "dose": 0.532,
+        "summary": 0.0,
+        "write": 5.62
+      },
+      "beagle_wall_s": 13.42,
+      "beagle_impute_s": 8,
+      "impute_ratio_beagle_over_cugen": 5.13
+    },
+    {
+      "n_reference_samples": 600,
+      "n_reference_haplotypes": 1200,
+      "cugen_wall_s": 14.47,
+      "cugen_impute_s": 4.13,
+      "cugen_phases": {
+        "read": 0.218,
+        "aggregate": 0.264,
+        "interp_plan": 0.05,
+        "carriers": 0.348,
+        "forward_backward": 2.954,
+        "dose": 0.561,
+        "summary": 0.0,
+        "write": 8.493
+      },
+      "beagle_wall_s": 18.99,
+      "beagle_impute_s": 12,
+      "impute_ratio_beagle_over_cugen": 2.91
+    },
+    {
+      "n_reference_samples": 1200,
+      "n_reference_haplotypes": 2400,
+      "cugen_wall_s": 20.7,
+      "cugen_impute_s": 7.28,
+      "cugen_phases": {
+        "read": 0.433,
+        "aggregate": 0.382,
+        "interp_plan": 0.061,
+        "carriers": 0.48,
+        "forward_backward": 5.803,
+        "dose": 0.612,
+        "summary": 0.0,
+        "write": 11.091
+      },
+      "beagle_wall_s": 25.43,
+      "beagle_impute_s": 15,
+      "impute_ratio_beagle_over_cugen": 2.06
+    },
+    {
+      "n_reference_samples": 2400,
+      "n_reference_haplotypes": 4800,
+      "cugen_wall_s": 32.12,
+      "cugen_impute_s": 13.98,
+      "cugen_phases": {
+        "read": 0.986,
+        "aggregate": 0.594,
+        "interp_plan": 0.049,
+        "carriers": 0.966,
+        "forward_backward": 11.721,
+        "dose": 0.701,
+        "summary": 0.0,
+        "write": 15.266
+      },
+      "beagle_wall_s": 33.75,
+      "beagle_impute_s": 17,
+      "impute_ratio_beagle_over_cugen": 1.22
+    }
+  ]
+}

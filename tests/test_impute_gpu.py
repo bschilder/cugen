@@ -490,3 +490,31 @@ def test_gpu_selected_dose_matches_numpy():
         exp[:, m] = dose_sparse_sel(post[cl], post[cr], np.array([lam[m]]),
                                     indptr, indices, major, [m], inv)[:, 0]
     assert np.abs(got - exp).max() < 2e-5
+
+
+@requires_gpu
+@pytest.mark.parametrize("T", [1, 3, 7, 31, 33, 63, 65])
+def test_gpu_selection_survives_partial_warps(T):
+    """Regression: dead lanes must not read the selection table.
+
+    blockDim.x is 32, so any T that is not a multiple of it leaves lanes with
+    t >= T. fb_forward read sel[t*J + j] on those lanes, got a garbage
+    haplotype index, and used it to index ref_codes -- an illegal access whose
+    visibility depended on whether the garbage happened to land in range. The
+    unselected path never had this exposure because the state index IS the
+    haplotype index and is always in range.
+    """
+    import cupy as cp
+    from cugen._impute_core import forward_backward_sel
+    from cugen._impute_gpu import fb_posteriors_gpu
+    rng = np.random.default_rng(100 + T)
+    C, K, J = 12, 50, 9
+    rc = rng.integers(0, 3, size=(C, K)).astype(np.int32)
+    tc = rng.integers(0, 3, size=(C, T)).astype(np.int32)
+    tau = np.concatenate([[0.0], np.full(C - 1, 0.05)])
+    mism = np.full(C, 1e-3)
+    sel = np.stack([rng.choice(K, size=J, replace=False).astype(np.int32)
+                    for _ in range(T)])
+    got = cp.asnumpy(fb_posteriors_gpu(rc, tc, tau, mism, sel=sel))
+    exp = forward_backward_sel(rc, tc, tau, mism, sel)
+    assert np.abs(got - exp).max() < 2e-5

@@ -187,7 +187,13 @@ __global__ void fb_forward(
 
         float partial = 0.0f;
         for (int j = ty; j < J; j += blockDim.y) {
-            const int k = (sel == 0) ? j : sel[(long long)t * J + j];
+            // `live` MUST gate the sel read. blockDim.x is 32, so a block
+            // whose T is not a multiple of 32 carries dead lanes with t >= T;
+            // reading sel[t*J + j] there returns a garbage haplotype index
+            // which then indexes ref_codes out of bounds. The unselected path
+            // never had this exposure because k was j, always in range.
+            const int k = (!live || sel == 0) ? j
+                                              : sel[(long long)t * J + j];
             const float e = emit(ref_codes[(long long)c * K + k], tc, mm);
             float a;
             if (c == 0) {
