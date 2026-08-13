@@ -498,7 +498,7 @@ def dose_sparse(post_left, post_right, lam, indptr, indices, major, cols):
 def impute_haplotypes(ref_bits, tgt_bits, tgt_idx, marker_cm, *, ne=100_000,
                       err=None, cluster=0.005, block=None, sparse=True,
                       carriers=None, timers=None, imp_states=None,
-                      imp_step=0.1):
+                      imp_step=0.1, mosaic=False):
     """End-to-end allele-1 probabilities for every reference marker.
 
     ref_bits  : (K, M_ref) uint8 0/1   phased reference panel
@@ -546,19 +546,27 @@ def impute_haplotypes(ref_bits, tgt_bits, tgt_idx, marker_cm, *, ne=100_000,
     mism = aggregate_mismatch(starts, stops, err)
     tick("aggregate", t0)
 
-    sel = inv = None
+    sel = inv = hap_at = agg_int = None
     if imp_states is not None and imp_states < K:
         t0 = time.perf_counter()
-        sel = select_states(ref_bits[:, tgt_idx], tgt_bits,
-                            marker_cm[tgt_idx], n_states=imp_states,
-                            step=imp_step)
-        inv = state_inverse_map(sel, K)
+        if mosaic:
+            ibs, ist, _ = ibs_sets(ref_bits[:, tgt_idx], tgt_bits,
+                                   marker_cm[tgt_idx], step=imp_step,
+                                   max_per=max(4, imp_states // 60))
+            hap_at = composite_haplotypes(ibs, imp_states, tgt_bits.shape[0])
+            agg_int = marker_intervals(agg_cm, ist, marker_cm[tgt_idx])
+        else:
+            sel = select_states(ref_bits[:, tgt_idx], tgt_bits,
+                                marker_cm[tgt_idx], n_states=imp_states,
+                                step=imp_step)
+            inv = state_inverse_map(sel, K)
         tick("select_states", t0)
     # tau's 1/|H| is the number of STATES, not the panel size: with a selected
     # subset the chain re-randomises among the states that exist. Using K here
     # while running J states would make the jump term J/K too small and the
     # chain far stickier than intended.
-    n_states_eff = K if sel is None else sel.shape[1]
+    n_states_eff = (imp_states if (sel is not None or hap_at is not None)
+                    else K)
     tau = transition_tau(agg_cm / 100.0, ne, n_states_eff)   # cM -> Morgans
 
     t0 = time.perf_counter()
@@ -568,7 +576,7 @@ def impute_haplotypes(ref_bits, tgt_bits, tgt_idx, marker_cm, *, ne=100_000,
     group_stop = np.searchsorted(left[order], np.arange(C), side="right")
     tick("interp_plan", t0)
 
-    if (sparse or sel is not None) and carriers is None:
+    if (sparse or sel is not None or hap_at is not None) and carriers is None:
         t0 = time.perf_counter()
         carriers = build_carriers(ref_bits)
         tick("carriers", t0)
@@ -582,7 +590,13 @@ def impute_haplotypes(ref_bits, tgt_bits, tgt_idx, marker_cm, *, ne=100_000,
             return
         t0 = time.perf_counter()
         indptr, indices, major = carriers if sparse else (None, None, None)
-        if sel is not None:
+        if hap_at is not None:
+            # the inverse map is per interval, and only the left bracketing
+            # aggregate's is needed for these columns
+            out[:, cols] = dose_sparse_sel(
+                post_l, post_r, lam[cols], indptr, indices, major, cols,
+                mosaic_inverse_map(hap_at[agg_int[c_left]], K))
+        elif sel is not None:
             out[:, cols] = dose_sparse_sel(post_l, post_r, lam[cols], indptr,
                                            indices, major, cols, inv)
         elif sparse:
@@ -601,7 +615,12 @@ def impute_haplotypes(ref_bits, tgt_bits, tgt_idx, marker_cm, *, ne=100_000,
         state["prev"] = post.copy()
         state["prev_c"] = c
 
-    if sel is not None:
+    if hap_at is not None:
+        for c, pc in enumerate(forward_backward_mosaic(ref_codes, tgt_codes,
+                                                       tau, mism, hap_at,
+                                                       agg_int)):
+            emit(c, pc)
+    elif sel is not None:
         # The blocked form has no selection-aware variant; selection already
         # shrinks the posterior array by K/J, which is the memory the blocking
         # existed to save.

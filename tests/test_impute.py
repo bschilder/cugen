@@ -863,3 +863,30 @@ def test_mosaics_only_help_when_states_are_scarce():
     w_small, m_small = agreement(20)
     assert m_small > w_small + 0.05, (w_small, m_small)   # scarce: mosaic wins
     assert abs(m_big - w_big) < 0.05, (w_big, m_big)      # generous: a wash
+
+
+@pytest.mark.parametrize("J", [120, 40, 16])
+def test_mosaic_reaches_impute_haplotypes(J):
+    """End to end through the public engine, not just the internals.
+
+    Both selection modes must produce the same SHAPE and valid probabilities,
+    and the mosaic must be at least as good as whole-haplotype selection at
+    every state budget -- it is strictly more expressive, so a mode that ever
+    loses means the construction or the per-interval inverse map is wrong.
+    """
+    rng = np.random.default_rng(3)
+    K, M = 400, 1600
+    ref = simulate_mosaic(K, M, seed=3, n_founders=20)
+    tgt_idx = np.sort(rng.choice(M, size=M // 10, replace=False))
+    tgt = simulate_mosaic(4, M, seed=4, n_founders=20)[:, tgt_idx]
+    cm = np.linspace(0, 8, M)
+    kw = dict(ne=scaled_ne(K), cluster=0.005)
+    full = impute_haplotypes(ref, tgt, tgt_idx, cm, **kw)
+    whole = impute_haplotypes(ref, tgt, tgt_idx, cm, imp_states=J, **kw)
+    mos = impute_haplotypes(ref, tgt, tgt_idx, cm, imp_states=J, mosaic=True,
+                            **kw)
+    assert whole.shape == mos.shape == full.shape
+    for x in (whole, mos):
+        assert x.min() >= -1e-12 and x.max() <= 1 + 1e-12
+    r = lambda x: np.corrcoef(x.ravel(), full.ravel())[0, 1]
+    assert r(mos) >= r(whole) - 1e-3, (r(whole), r(mos))
