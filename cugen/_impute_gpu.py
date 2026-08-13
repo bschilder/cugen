@@ -361,10 +361,15 @@ __global__ void carrier_scatter(
 __global__ void reduce_dose(
     const float* __restrict__ p,        // (T, M) allele probabilities
     float* __restrict__ dose,           // (T/2, M) out
-    float* __restrict__ af,             // (M,) out
-    float* __restrict__ dr2,            // (M,) out
+    double* __restrict__ acc,           // (3, M) out: sum, sumsq, within
     const int T, const int M)
 {
+    // Sufficient statistics, NOT finished AF and DR2. Both are per-marker
+    // quantities over EVERY target haplotype, and this kernel sees only one
+    // tile of them; returning finished values let each tile overwrite the last
+    // and the final tile's subset won. Dosages were unaffected, since each tile
+    // writes its own sample rows -- so the error was confined to the two
+    // summary columns and invisible in the imputed genotypes.
     const long long m = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (m >= M) return;
     const int S = T >> 1;
@@ -377,12 +382,9 @@ __global__ void reduce_dose(
         sumsq += (double)a * a + (double)b * b;
         within += (double)a * (1.0 - a) + (double)b * (1.0 - b);
     }
-    const double mean = sum / (double)T;
-    const double between = sumsq / (double)T - mean * mean;
-    const double w = within / (double)T;
-    const double tot = between + w;
-    af[m] = (float)mean;
-    dr2[m] = (tot > 0.0) ? (float)(between / tot) : 0.0f;
+    acc[m] = sum;
+    acc[(long long)M + m] = sumsq;
+    acc[(long long)2 * M + m] = within;
 }
 
 }   // extern "C"
@@ -458,7 +460,7 @@ def fb_posteriors_gpu(ref_codes, tgt_codes, tau, mism, sel=None):
 
 
 def reduce_dose_gpu(p_dev, T, M):
-    """(T, M) allele probabilities -> (T/2, M) dosages, plus AF and DR2.
+    """(T, M) allele probabilities -> (T/2, M) dosages, plus sufficient stats.
 
     On the device, so the host never receives the per-haplotype array: at 2,000
     target haplotypes over chr20's largest window that is 7.3 GiB, and it was
@@ -466,13 +468,12 @@ def reduce_dose_gpu(p_dev, T, M):
     """
     mod = _module()
     dose = cp.empty((T // 2, M), dtype=cp.float32)
-    af = cp.empty(M, dtype=cp.float32)
-    dr2 = cp.empty(M, dtype=cp.float32)
+    acc = cp.empty((3, M), dtype=cp.float64)     # sum, sumsq, within
     threads = 256
     mod.get_function("reduce_dose")(
         ((M + threads - 1) // threads,), (threads,),
-        (p_dev, dose, af, dr2, np.int32(T), np.int32(M)))
-    return dose, af, dr2
+        (p_dev, dose, acc, np.int32(T), np.int32(M)))
+    return dose, acc
 
 
 def dose_sparse_gpu(post, indptr, indices, major, left, lam, col_offset=0,
@@ -637,8 +638,7 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
                 f"K={K:,}; reduce `window` so fewer aggregate markers are live")
     out = None if reduce else np.empty((T, M), dtype=np.float32)
     dose_h = np.empty((T // 2, M), dtype=np.float32) if reduce else None
-    af_h = np.empty(M, dtype=np.float32) if reduce else None
-    dr2_h = np.empty(M, dtype=np.float32) if reduce else None
+    acc_h = np.zeros((3, M), dtype=np.float64) if reduce else None
 
     for lo in range(0, T, tile):
         hi = min(lo + tile, T)
@@ -660,11 +660,10 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
                                 inv=None if inv is None else inv[lo:hi],
                                 n_ref_hap=K)
             if reduce:
-                dd, aa, rr = reduce_dose_gpu(d, hi - lo, m1 - m0)
+                dd, acc = reduce_dose_gpu(d, hi - lo, m1 - m0)
                 dose_h[(lo // 2):(hi // 2), sl] = cp.asnumpy(dd)
-                af_h[sl] = cp.asnumpy(aa)
-                dr2_h[sl] = cp.asnumpy(rr)
-                del dd, aa, rr
+                acc_h[:, sl] += cp.asnumpy(acc)      # accumulate ACROSS tiles
+                del dd, acc
             else:
                 out[lo:hi, sl] = cp.asnumpy(d)
             del d
@@ -676,4 +675,12 @@ def impute_haplotypes_gpu(ref_bits, tgt_bits, tgt_idx, marker_cm, *,
     # "t_tile 104.00s" at the top of the phase table, which reads
     # exactly like the dominant cost.
     t["_t_tile_count"] = tile
-    return (dose_h, af_h, dr2_h) if reduce else out
+    if not reduce:
+        return out
+    # finish AF and DR2 only once every tile has contributed
+    mean = acc_h[0] / T
+    between = acc_h[1] / T - mean * mean
+    within = acc_h[2] / T
+    tot = between + within
+    dr2_h = np.where(tot > 0, between / np.where(tot > 0, tot, 1.0), 0.0)
+    return dose_h, mean.astype(np.float32), dr2_h.astype(np.float32)

@@ -400,10 +400,15 @@ def test_gpu_reduce_matches_numpy():
     rng = np.random.default_rng(11)
     for T, M in ((8, 100), (104, 5000), (2, 17)):
         p = rng.random((T, M)).astype(np.float32)
-        d, a, r = reduce_dose_gpu(cp.asarray(p), T, M)
+        d, acc = reduce_dose_gpu(cp.asarray(p), T, M)
+        acc = cp.asnumpy(acc)
+        mean = acc[0] / T
+        between = acc[1] / T - mean * mean
+        within = acc[2] / T
+        r = between / np.where(between + within > 0, between + within, 1.0)
         assert np.allclose(cp.asnumpy(d), p[0::2] + p[1::2], atol=2e-5)
-        assert np.allclose(cp.asnumpy(a), p.mean(axis=0), atol=2e-5)
-        assert np.allclose(cp.asnumpy(r), dosage_r2(p), atol=2e-4)
+        assert np.allclose(mean, p.mean(axis=0), atol=2e-5)
+        assert np.allclose(r, dosage_r2(p), atol=2e-4)
 
 
 @requires_gpu
