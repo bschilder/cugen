@@ -169,7 +169,7 @@ def main():
                     t0 = time.perf_counter()
                     cg = ld_clump(base + ".cugen", ss, annotation=ann, p1=p1,
                                   p2=0.01, r2=r2, kb=250, backend="gpu",
-                                  verbose=False)
+                                  verbose=True)   # phase breakdown
                     dt = time.perf_counter() - t0
                 rec[f"{label}_gpu_s"] = round(dt, 3)
                 rec[f"{label}_gpu_gib"] = s.peak_gib
