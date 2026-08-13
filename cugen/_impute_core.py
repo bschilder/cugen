@@ -792,3 +792,171 @@ def dose_sparse_sel(post_left, post_right, lam, indptr, indices, major, cols,
                 sl, sr = 1.0 - sl, 1.0 - sr
             out[t, j] = lam[j] * sl + (1.0 - lam[j]) * sr
     return out
+
+
+def ibs_sets(ref_typed, tgt_typed, cm_typed, step=0.1, nsteps=7, max_per=26):
+    """Per-interval IBS haplotype sets, longest matches first.
+
+    Returns a list of length n_intervals; entry k is an (T, <=max_per) int32
+    array of reference haplotypes that are identical-by-state with each target
+    across interval k, preferring those that also match across the following
+    intervals.
+
+    Follows the paper's rule: "We add reference haplotypes to S_k that are IBS
+    with the target haplotype in seven consecutive intervals, six consecutive
+    intervals, and so on, until S_k has size s or we have added all haplotypes
+    that are identical by state in I_k."
+
+    `max_per` is that s. The paper sets it so the segments added across L cM
+    number fewer than the composite haplotypes available:
+    s = floor(J * step / segment_cM), which is floor(1600 * 0.1 / 6.0) = 26 at
+    Beagle's defaults.
+    """
+    ref_typed = np.asarray(ref_typed)
+    tgt_typed = np.asarray(tgt_typed)
+    K = ref_typed.shape[0]
+    T = tgt_typed.shape[0]
+    starts, stops = interval_bounds(cm_typed, step)
+    n_int = starts.size
+
+    # match[k] is (K, T): does reference hap k match target t across interval k
+    match = np.empty((n_int, K, T), dtype=bool)
+    for i, (a, b) in enumerate(zip(starts, stops)):
+        rc, tc = allele_sequence_codes(ref_typed, tgt_typed,
+                                       np.array([a]), np.array([b]))
+        match[i] = rc[0][:, None] == tc[0][None, :]
+
+    out = []
+    for k in range(n_int):
+        # rank by how many CONSECUTIVE intervals from k the haplotype matches,
+        # capped at nsteps -- this is the "seven, then six, then five" rule
+        run = np.zeros((K, T), dtype=np.int32)
+        for n in range(min(nsteps, n_int - k) - 1, -1, -1):
+            run += match[k + n]
+            run *= match[k + n]          # zero unless the whole prefix matched
+        sets = np.full((T, max_per), -1, dtype=np.int32)
+        for t in range(T):
+            cand = np.flatnonzero(run[:, t] > 0)
+            if cand.size:
+                order = cand[np.argsort(-run[cand, t], kind="stable")]
+                take = order[:max_per]
+                sets[t, :take.size] = take
+        out.append(sets)
+    return out, starts, stops
+
+
+def composite_haplotypes(ibs, n_states, n_targets):
+    """Stitch IBS segments into `n_states` mosaics per target.
+
+    Returns (n_intervals, T, J) int32: the reference haplotype that state j of
+    target t copies during interval k.
+
+    This is the paper's Figure 2, per target. Each mosaic is a sequence of
+    segments from different reference haplotypes, so a state SLOT is reused
+    along the chromosome rather than being spent on one haplotype for the whole
+    window. That is what lets a long window run on a small state space: with
+    whole-haplotype selection a haplotype that is IBS for 8 cM of a 40 cM window
+    still occupies its slot for all 40.
+
+    L[j] is staleness -- the last interval in which mosaic j's current tail
+    haplotype was still IBS. A haplotype that is not already some mosaic's tail
+    is spliced onto the STALEST mosaic, and the splice point is placed midway
+    between that mosaic's last useful interval and the current one, which is
+    where the outgoing haplotype has stopped helping and the incoming one has
+    not yet started.
+    """
+    n_int = len(ibs)
+    T = int(n_targets)
+    J = int(n_states)
+    hap_at = np.zeros((n_int, T, J), dtype=np.int32)
+    for t in range(T):
+        tail = np.full(J, -1, dtype=np.int64)     # H[j] last haplotype
+        stale = np.zeros(J, dtype=np.int64)       # L[j]
+        seg_start = np.zeros(J, dtype=np.int64)   # interval the tail began at
+        for k in range(n_int):
+            cand = ibs[k][t]
+            cand = cand[cand >= 0]
+            for h in cand:
+                same = np.flatnonzero(tail == h)
+                if same.size:
+                    stale[same[0]] = k            # extend, do not splice
+                    continue
+                j = int(np.argmin(stale))         # the stalest mosaic
+                if tail[j] >= 0:
+                    # splice midway between where j last helped and now
+                    mid = (stale[j] + k) // 2
+                    hap_at[seg_start[j]:mid + 1, t, j] = tail[j]
+                    seg_start[j] = mid + 1
+                tail[j] = h
+                stale[j] = k
+        for j in range(J):                        # flush the trailing segments
+            if tail[j] >= 0:
+                hap_at[seg_start[j]:, t, j] = tail[j]
+    return hap_at
+
+
+def marker_intervals(agg_cm, starts, cm_typed):
+    """Which interval each AGGREGATE marker falls in."""
+    edges = np.asarray(cm_typed)[np.asarray(starts)]
+    return np.clip(np.searchsorted(edges, np.asarray(agg_cm), side="right") - 1,
+                   0, edges.size - 1).astype(np.int64)
+
+
+def forward_backward_mosaic(ref_codes, tgt_codes, tau, mism, hap_at, agg_int):
+    """Forward-backward where a state's haplotype changes along the window.
+
+    hap_at  : (n_intervals, T, J) reference haplotype copied by each state
+    agg_int : (C,) interval index of each aggregate marker
+
+    The only difference from forward_backward_sel is that the gather is indexed
+    by the marker's interval as well as the state, so a state SLOT can copy
+    different haplotypes in different parts of the window. That is the whole
+    point of the mosaic: with a fixed haplotype per state, one that is IBS for
+    8 cM of a 40 cM window still occupies its slot for all 40.
+
+    With hap_at constant along the interval axis this reduces exactly to
+    forward_backward_sel, which test_constant_mosaic_matches_selection pins.
+    """
+    C = ref_codes.shape[0]
+    T, J = hap_at.shape[1], hap_at.shape[2]
+    alpha = np.empty((C, J, T), dtype=np.float64)
+
+    def emis(c):
+        h = hap_at[agg_int[c]]                       # (T, J)
+        rc = ref_codes[c][h.T]                       # (J, T) gather
+        return np.where(rc == tgt_codes[c][None, :], 1.0 - mism[c], mism[c])
+
+    a = None
+    for c in range(C):
+        e = emis(c)
+        a = e * (1.0 / J) if c == 0 else e * ((1.0 - tau[c]) * a + tau[c] / J)
+        a /= a.sum(axis=0, keepdims=True)
+        alpha[c] = a
+
+    post = np.empty_like(alpha)
+    b = np.ones((J, T), dtype=np.float64)
+    for c in range(C - 1, -1, -1):
+        p = alpha[c] * b
+        post[c] = p / p.sum(axis=0, keepdims=True)
+        if c == 0:
+            break
+        eb = emis(c) * b
+        b = (1.0 - tau[c]) * eb + tau[c] / J * eb.sum(axis=0, keepdims=True)
+        b /= b.sum(axis=0, keepdims=True)
+    return post
+
+
+def mosaic_inverse_map(hap_at_interval, n_ref_hap):
+    """(T, K) haplotype -> state, for ONE interval.
+
+    Built per aggregate marker rather than for the whole window: the full
+    (n_intervals, T, K) table is 816 MB at chromosome scale, while one
+    interval's is 2 MB and only two are ever needed at once -- the pair
+    bracketing the markers being imputed.
+    """
+    h = np.asarray(hap_at_interval)                  # (T, J)
+    T, J = h.shape
+    inv = np.full((T, int(n_ref_hap)), -1, dtype=np.int32)
+    rows = np.repeat(np.arange(T), J)
+    inv[rows, h.reshape(-1)] = np.tile(np.arange(J, dtype=np.int32), T)
+    return inv

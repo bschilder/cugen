@@ -738,3 +738,128 @@ def test_tau_uses_the_state_count_not_the_panel_size():
     src = inspect.getsource(_impute_core.impute_haplotypes)
     assert "n_states_eff" in src
     assert "transition_tau(agg_cm / 100.0, ne, n_states_eff)" in src
+
+
+# --------------------------------------------------------------------------
+# Mosaic composite reference haplotypes
+# --------------------------------------------------------------------------
+
+def test_constant_mosaic_matches_plain_selection():
+    """A mosaic whose haplotype never changes IS whole-haplotype selection."""
+    from cugen._impute_core import forward_backward_mosaic, forward_backward_sel
+    rng = np.random.default_rng(9)
+    C, K, J, T, n_int = 25, 60, 12, 5, 6
+    rc = rng.integers(0, 3, size=(C, K)).astype(np.int32)
+    tc = rng.integers(0, 3, size=(C, T)).astype(np.int32)
+    tau = np.concatenate([[0.0], rng.uniform(1e-4, 0.2, size=C - 1)])
+    mism = np.full(C, 1e-3)
+    sel = np.stack([rng.choice(K, size=J, replace=False).astype(np.int32)
+                    for _ in range(T)])
+    agg_int = np.repeat(np.arange(n_int), int(np.ceil(C / n_int)))[:C]
+    hap = np.broadcast_to(sel, (n_int, T, J)).copy()
+    a = forward_backward_sel(rc, tc, tau, mism, sel)
+    b = forward_backward_mosaic(rc, tc, tau, mism, hap, agg_int)
+    assert np.abs(a - b).max() < 1e-15      # gathers differ in layout, not value
+
+
+def test_mosaic_slots_are_reused_along_the_window():
+    """The defining property. A slot holding one haplotype throughout is
+    whole-haplotype selection wearing a different name."""
+    from cugen._impute_core import composite_haplotypes, ibs_sets
+    ref = simulate_mosaic(300, 1200, seed=3)
+    cm = np.linspace(0, 8, 1200)
+    ibs, _, _ = ibs_sets(ref, ref[[11, 250]], cm, max_per=8)
+    hap = composite_haplotypes(ibs, n_states=16, n_targets=2)
+    per_slot = [len(np.unique(hap[:, 0, j])) for j in range(16)]
+    assert np.mean(per_slot) > 1.5, per_slot
+
+
+def test_mosaic_keeps_an_exact_copy_present():
+    from cugen._impute_core import composite_haplotypes, ibs_sets
+    ref = simulate_mosaic(300, 1200, seed=3)
+    cm = np.linspace(0, 8, 1200)
+    ibs, _, _ = ibs_sets(ref, ref[[11, 250]], cm, max_per=26)
+    hap = composite_haplotypes(ibs, n_states=40, n_targets=2)
+    for r, h in enumerate((11, 250)):
+        frac = (hap[:, r, :] == h).any(axis=1).mean()
+        assert frac > 0.9, f"exact copy present in only {frac:.0%} of intervals"
+
+
+def test_mosaic_inverse_map_is_per_interval():
+    from cugen._impute_core import mosaic_inverse_map
+    hap = np.array([[3, 7, 1], [2, 9, 4]], dtype=np.int32)   # (T=2, J=3)
+    inv = mosaic_inverse_map(hap, 12)
+    assert inv[0, 3] == 0 and inv[0, 7] == 1 and inv[0, 1] == 2
+    assert inv[1, 2] == 0 and inv[1, 9] == 1 and inv[1, 4] == 2
+    assert inv[0, 2] == -1 and inv[1, 3] == -1
+
+
+def test_mosaics_only_help_when_states_are_scarce():
+    """Pins WHERE mosaics matter, which is the whole reason to have them.
+
+    At a generous state budget a mosaic and a whole haplotype per slot are
+    equivalent -- there are enough slots for every useful haplotype to hold one
+    outright. The gain appears only as J/K falls, which is the regime a
+    biobank-scale panel puts you in: J stays at 1,600 while K grows to tens or
+    hundreds of thousands.
+
+    Scored on the implied ALLELE PROBABILITIES against the brute-force answer.
+    A first version used posterior entropy as a proxy and it pointed the wrong
+    way: the mosaic posterior is MORE diffuse, because it spreads mass over
+    states that are all locally plausible, while whole-haplotype selection
+    concentrates on a few that are locally wrong. Concentration is not quality.
+    """
+    from cugen._impute_core import (aggregate_markers, aggregate_mismatch,
+                                    allele_sequence_codes, build_carriers,
+                                    composite_haplotypes, dose_sparse_sel,
+                                    forward_backward_mosaic, forward_backward_ref,
+                                    forward_backward_sel, ibs_sets,
+                                    interpolation_weights, marker_intervals,
+                                    mosaic_inverse_map, select_states,
+                                    state_inverse_map, transition_tau)
+    rng = np.random.default_rng(31)
+    K, M = 500, 2500
+    ref = simulate_mosaic(K, M, seed=31, n_founders=25)
+    tgt_idx = np.sort(rng.choice(M, size=M // 10, replace=False))
+    tgt = simulate_mosaic(4, M, seed=32, n_founders=25)[:, tgt_idx]
+    cm = np.linspace(0, 12, M)
+    ne = scaled_ne(K)
+    starts, stops, agg_cm = aggregate_markers(cm[tgt_idx], 0.005)
+    rc, tc = allele_sequence_codes(ref[:, tgt_idx], tgt, starts, stops)
+    mism = aggregate_mismatch(starts, stops, 1e-4)
+    left, lam = interpolation_weights(agg_cm, cm)
+    ip, ix, mj = build_carriers(ref)
+
+    def allele_prob(post, inv_of):
+        out = np.zeros((tgt.shape[0], M))
+        for c in range(post.shape[0] - 1):
+            cols = np.flatnonzero(left == c)
+            if cols.size:
+                out[:, cols] = dose_sparse_sel(post[c], post[c + 1], lam[cols],
+                                               ip, ix, mj, cols, inv_of(c))
+        return out
+
+    tau_full = transition_tau(agg_cm / 100.0, ne, K)
+    base = allele_prob(forward_backward_ref(rc, tc, tau_full, mism),
+                       lambda c: state_inverse_map(
+                           np.tile(np.arange(K, dtype=np.int32),
+                                   (tgt.shape[0], 1)), K))
+
+    def agreement(J):
+        tau = transition_tau(agg_cm / 100.0, ne, J)
+        sel = select_states(ref[:, tgt_idx], tgt, cm[tgt_idx], n_states=J)
+        aw = allele_prob(forward_backward_sel(rc, tc, tau, mism, sel),
+                         lambda c: state_inverse_map(sel, K))
+        ibs, ist, _ = ibs_sets(ref[:, tgt_idx], tgt, cm[tgt_idx],
+                               max_per=max(4, J // 8))
+        hap = composite_haplotypes(ibs, n_states=J, n_targets=tgt.shape[0])
+        ai = marker_intervals(agg_cm, ist, cm[tgt_idx])
+        am = allele_prob(forward_backward_mosaic(rc, tc, tau, mism, hap, ai),
+                         lambda c: mosaic_inverse_map(hap[ai[c]], K))
+        r = lambda x: np.corrcoef(x.ravel(), base.ravel())[0, 1]
+        return r(aw), r(am)
+
+    w_big, m_big = agreement(150)
+    w_small, m_small = agreement(20)
+    assert m_small > w_small + 0.05, (w_small, m_small)   # scarce: mosaic wins
+    assert abs(m_big - w_big) < 0.05, (w_big, m_big)      # generous: a wash
