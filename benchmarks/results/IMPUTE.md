@@ -123,6 +123,38 @@ straight from the packed bytes; the host never expands a window to a `(K, M)`
 byte matrix, 2.4 GiB per window read and written and scanned to feed a step that
 has since moved off the host.
 
+## bref3: an I/O format, not a compute one
+
+Every Beagle timing above used a bgzipped VCF panel, and an earlier version of
+this file warned that bref3 -- Beagle's prepared binary format -- might change
+its imputation time too, which would have contaminated even the like-for-like
+comparison. Measured, on the same fixture:
+
+| K (haps) | format | size | convert | **impute** | wall |
+|---|---|---|---|---|---|
+| 1,200 | vcf.gz | 110 MB | -- | 12 s | 20.2 s |
+| 1,200 | bref3 | 88 MB | 43.0 s | **13 s** | 19.2 s |
+| 2,400 | vcf.gz | 171 MB | -- | 17 s | 29.5 s |
+| 2,400 | bref3 | 116 MB | 65.7 s | **16 s** | 22.9 s |
+| 4,800 | vcf.gz | 284 MB | -- | 19 s | 39.5 s |
+| 4,800 | bref3 | 164 MB | 96.3 s | **20 s** | 27.9 s |
+
+**Imputation time does not move** -- 12 to 13, 17 to 16, 19 to 20, all inside
+Beagle's one-second reporting granularity. Wall clock does, by up to 29% at the
+largest panel.
+
+So the concern was half right. The two-pipeline wall-clock comparison WAS unfair
+to Beagle and remains so. The like-for-like imputation comparison was not
+contaminated, and the 11 s figure it rests on stands.
+
+The paper's sentence I built the worry on -- "bref3 ... reduces imputation time
+relative to the preceding version (bref v2)" -- compares bref3 to bref v2, both
+binary. I read it as evidence that the format reaches the compute path at all,
+and it is not.
+
+One symmetry worth noting: bref3 conversion costs 43-96 s, more than a single
+imputation run saves. Like `.cugen`, it is a bet on reuse, not a free win.
+
 ### Not measured
 
 - **Beagle with a bref3 panel.** Required before any two-pipeline wall-clock
