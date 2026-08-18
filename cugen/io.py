@@ -43,9 +43,28 @@ ENCODING_2BIT = 0
 ENCODING_UINT8 = 1
 ENCODING_FLOAT16 = 2
 ENCODING_FLOAT32 = 3
+ENCODING_HAP2BIT = 4
 
 FLAG_HAS_MISSING = 1
 FLAG_HAS_GIDX_MAP = 2
+FLAG_PHASED = 4
+
+# Indexed by the header's encoding field. A dict rather than a list because an
+# unfamiliar encoding should read back as "unknown(7)" from a forward-written
+# file, not raise IndexError from inside a header reader.
+_ENCODING_NAMES = {ENCODING_2BIT: "2bit", ENCODING_UINT8: "uint8",
+                   ENCODING_FLOAT16: "float16", ENCODING_FLOAT32: "float32",
+                   ENCODING_HAP2BIT: "hap2bit"}
+
+
+def encoding_name(enc):
+    return _ENCODING_NAMES.get(int(enc), f"unknown({int(enc)})")
+
+
+# These constants are duplicated in write.py rather than imported, to keep io.py
+# free of an import from a module that __init__ loads after it. Drift between
+# the two copies would misread files rather than fail, so
+# test_io_and_write_constants_agree pins them together.
 
 _UNPACK_2BIT_KERNEL = None
 _FUSED_UNIVARIATE_KERNEL = None
@@ -160,6 +179,26 @@ class CugenReader:
         self.flags = struct.unpack_from('<I', header, 64)[0]
         self.has_missing = bool(self.flags & FLAG_HAS_MISSING)
         self.has_gidx_map = bool(self.flags & FLAG_HAS_GIDX_MAP)
+        self.phased = bool(self.flags & FLAG_PHASED)
+
+        # A file whose PHASED flag and encoding disagree decodes to plausible
+        # wrong dosages (codes 10 and 11 mean different things in the two
+        # encodings) while passing every size check, because hap2bit and 2bit
+        # share bytes_per_variant. Refuse it at open rather than at first use.
+        if self.phased and self.encoding != ENCODING_HAP2BIT:
+            raise ValueError(
+                f"{self.path}: PHASED flag set but encoding is {self.encoding}, "
+                f"not {ENCODING_HAP2BIT} (hap2bit). Refusing to guess which is "
+                f"right -- run cg.validate_cugen() on this file.")
+        if self.encoding == ENCODING_HAP2BIT and not self.phased:
+            raise ValueError(
+                f"{self.path}: encoding is hap2bit but the PHASED flag is "
+                f"unset. Refusing to guess -- run cg.validate_cugen().")
+        if self.phased and self.has_missing:
+            raise ValueError(
+                f"{self.path}: PHASED and HAS_MISSING both set, but a phased "
+                f"record has no code for missing (all four 2-bit codes are "
+                f"valid genotypes).")
 
     def _load_stats(self):
         n = self.n_variants
@@ -211,8 +250,65 @@ class CugenReader:
         self._mmap.seek(byte_offset)
         return self._mmap.read(n_bytes)
 
+    def _require_unphased(self, method: str):
+        """Refuse to decode a phased file through a dosage path.
+
+        The 2-bit codes 10 and 11 mean `dosage 2` and `missing` unphased but
+        `1|0` (dosage 1) and `1|1` (dosage 2) phased, so a dosage read of a
+        phased file returns wrong numbers for exactly those two codes and right
+        numbers for the other two. Nothing raises, nothing is NaN, and a spot
+        check of rare variants passes -- so this has to be refused up front.
+        """
+        if self.phased:
+            raise ValueError(
+                f"{method}() decodes 2-bit codes as dosages, but {self.path} is "
+                f"PHASED (hap2bit), where code 10 is 1|0 (dosage 1) and 11 is "
+                f"1|1 (dosage 2). Use read_haplotypes() for the allele bits, or "
+                f"read_dosages_from_phased() for dosages under the popcount map.")
+
+    def read_haplotypes(self, start: int = 0, end: Optional[int] = None,
+                        chunk_variants: int = 65536) -> np.ndarray:
+        """Phased allele bits as (2*n_samples, n_variants) uint8 of 0/1.
+
+        Row 2i and row 2i+1 are sample i's two haplotypes. This is the natural
+        view for a Li-Stephens HMM, and it costs no conversion: haplotype j is
+        bit 7-(j&7) of byte j>>3, which is the same byte the unphased reader
+        addresses as sample (j>>1)'s 2-bit field.
+        """
+        if not self.phased:
+            raise ValueError(
+                f"{self.path} is not phased (encoding {self.encoding}); it has "
+                f"no haplotype information to read. Phase is discarded at "
+                f"conversion unless the file was written as hap2bit.")
+        if end is None:
+            end = self.n_variants
+        n_variants = end - start
+        n_hap = 2 * self.n_samples
+        out = np.empty((n_hap, n_variants), dtype=np.uint8)
+        # np.unpackbits is MSB-first, matching the format, and does the whole
+        # thing in C. The obvious loop -- eight strided passes writing
+        # out[k::8, :] from (packed.T >> (7-k)) & 1 -- allocates two full-size
+        # temporaries per pass and writes with a stride of 8 rows, so at
+        # chromosome scale it churns ~16x the array size through cache and runs
+        # for minutes at 100% of one core. Chunking bounds the temporaries to
+        # one block regardless of how many markers are asked for.
+        for lo in range(0, n_variants, chunk_variants):
+            hi = min(lo + chunk_variants, n_variants)
+            packed = np.frombuffer(
+                self.read_packed_bytes(start + lo, start + hi), dtype=np.uint8)
+            packed = packed.reshape(hi - lo, self.bytes_per_variant)
+            out[:, lo:hi] = np.unpackbits(packed, axis=1).T[:n_hap, :]
+        return out
+
+    def read_dosages_from_phased(self, start: int = 0,
+                                 end: Optional[int] = None) -> np.ndarray:
+        """Dosages from a phased file, under the popcount map. (n_samples, n_var)."""
+        h = self.read_haplotypes(start, end)
+        return (h[0::2, :] + h[1::2, :]).astype(np.float32)
+
     def read_indices_to_gpu(self, indices: Union[list, np.ndarray],
                             stream: Optional['cp.cuda.Stream'] = None) -> 'cp.ndarray':
+        self._require_unphased("read_indices_to_gpu")
         if not HAS_CUPY:
             raise RuntimeError("CuPy not available")
         indices = np.asarray(indices, dtype=np.int64)
@@ -260,6 +356,7 @@ class CugenReader:
 
         Reduces syscall count 10-100× when adjacent indices survive top-K selection.
         """
+        self._require_unphased("read_indices_to_gpu_batched")
         if not HAS_CUPY:
             raise RuntimeError("CuPy not available")
         indices = np.asarray(indices, dtype=np.int64)
@@ -313,6 +410,7 @@ class CugenReader:
 
     def read_to_numpy(self, start: int = 0, end: Optional[int] = None) -> np.ndarray:
         """Unpack to CPU numpy. Slow — use read_to_gpu where possible."""
+        self._require_unphased("read_to_numpy")
         if end is None:
             end = self.n_variants
         n_variants = end - start
@@ -329,6 +427,7 @@ class CugenReader:
 
     def read_to_gpu(self, start: int = 0, end: Optional[int] = None,
                     stream: Optional['cp.cuda.Stream'] = None) -> 'cp.ndarray':
+        self._require_unphased("read_to_gpu")
         if not HAS_CUPY:
             raise RuntimeError("CuPy not available")
         if end is None:
@@ -359,6 +458,7 @@ class CugenReader:
                          lambda_reg: float = 0.0,
                          stream=None) -> Tuple['cp.ndarray', 'cp.ndarray', 'cp.ndarray']:
         """Fused univariate regression directly from packed genotypes (no float32 matrix)."""
+        self._require_unphased("fused_univariate")
         if not HAS_CUPY:
             raise RuntimeError("CuPy not available")
         if end is None:
@@ -406,7 +506,8 @@ class CugenReader:
         return {
             'path': self.path,
             'version': self.version,
-            'encoding': ['2bit', 'uint8', 'float16', 'float32'][self.encoding],
+            'encoding': encoding_name(self.encoding),
+            'phased': self.phased,
             'n_samples': self.n_samples,
             'n_variants': self.n_variants,
             'bytes_per_variant': self.bytes_per_variant,
@@ -484,6 +585,9 @@ class CugenReaderPinned(CugenReader):
 
     def read_to_gpu(self, start: int = 0, end: Optional[int] = None,
                     stream: Optional['cp.cuda.Stream'] = None) -> 'cp.ndarray':
+        self._require_unphased("read_to_gpu")     # overrides the base method,
+        # so it needs its own guard -- inheriting the signature does not inherit
+        # the check, and this subclass is what read_cugen() returns by default.
         if end is None:
             end = self.n_variants
         n_variants = end - start
@@ -561,9 +665,9 @@ def read_cugen_header(path: str) -> dict:
     return {
         'path': path,
         'version': struct.unpack_from('<I', header, 8)[0],
-        'encoding': ['2bit', 'uint8', 'float16', 'float32'][
-            struct.unpack_from('<I', header, 12)[0]
-        ],
+        'encoding': encoding_name(struct.unpack_from('<I', header, 12)[0]),
+        'flags': struct.unpack_from('<I', header, 64)[0],
+        'phased': bool(struct.unpack_from('<I', header, 64)[0] & FLAG_PHASED),
         'n_samples': struct.unpack_from('<Q', header, 16)[0],
         'n_variants': struct.unpack_from('<Q', header, 24)[0],
         'bytes_per_variant': struct.unpack_from('<Q', header, 32)[0],

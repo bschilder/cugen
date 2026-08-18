@@ -86,6 +86,7 @@ from .qc import sample_qc, variant_qc
 from .score import score
 from .ld import ld_clump, ld_matrix, ld_prune
 from .popstruct import grm, king, pca, pc_project
+from .impute import impute
 
 # --- alias wiring (PLINK + Hail) ---
 from .aliases import (  # noqa: F401
@@ -114,6 +115,7 @@ from .aliases import (  # noqa: F401
 from . import ultralasso  # noqa: F401
 
 # --- stub modules (v0.2 roadmap) ---
+from . import impute as _impute_mod  # noqa: F401
 from . import ld, plot, popstruct, qc, score, subset  # noqa: F401
 
 __all__ = [
@@ -168,5 +170,7 @@ __all__ = [
 ]
 
 # --- writing / conversion (v0.1.8) ------------------------------------------
-from .write import CugenWriter, write_cugen, validate_cugen  # noqa: E402,F401
-from .convert import pgen2cugen, vcf2cugen, bed2cugen        # noqa: E402,F401
+from .write import (CugenWriter, write_cugen, write_cugen_phased,  # noqa: E402,F401
+                    validate_cugen)
+from .convert import (pgen2cugen, vcf2cugen, vcf2cugenh,      # noqa: E402,F401
+                      bed2cugen)

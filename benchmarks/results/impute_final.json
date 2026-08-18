@@ -1,0 +1,86 @@
+{
+  "chrom": 20,
+  "ne": 100000,
+  "cugen_seconds": 28.54,
+  "cugen_dosage_r2_all_imputed": 0.9788636640788397,
+  "cugen_paper_r2_by_mac": [
+    {
+      "mac_lo": 1,
+      "mac_hi": 1,
+      "n_markers": 759745,
+      "r2": 0.12560492771294968
+    },
+    {
+      "mac_lo": 2,
+      "mac_hi": 2,
+      "n_markers": 194298,
+      "r2": 0.3158971920041204
+    },
+    {
+      "mac_lo": 3,
+      "mac_hi": 5,
+      "n_markers": 189265,
+      "r2": 0.5050520751675961
+    },
+    {
+      "mac_lo": 6,
+      "mac_hi": 10,
+      "n_markers": 114150,
+      "r2": 0.6488019775016169
+    },
+    {
+      "mac_lo": 11,
+      "mac_hi": 20,
+      "n_markers": 94971,
+      "r2": 0.758501040210915
+    },
+    {
+      "mac_lo": 21,
+      "mac_hi": 50,
+      "n_markers": 100781,
+      "r2": 0.8527823791579194
+    },
+    {
+      "mac_lo": 51,
+      "mac_hi": 100,
+      "n_markers": 59229,
+      "r2": 0.9161703117852514
+    },
+    {
+      "mac_lo": 101,
+      "mac_hi": 200,
+      "n_markers": 43714,
+      "r2": 0.9456689808472013
+    },
+    {
+      "mac_lo": 201,
+      "mac_hi": 500,
+      "n_markers": 45698,
+      "r2": 0.9683100547523436
+    },
+    {
+      "mac_lo": 501,
+      "mac_hi": 1000,
+      "n_markers": 40174,
+      "r2": 0.9778986489958009
+    },
+    {
+      "mac_lo": 1001,
+      "mac_hi": 2000,
+      "n_markers": 53250,
+      "r2": 0.9816469501039992
+    },
+    {
+      "mac_lo": 2001,
+      "mac_hi": 1000000000,
+      "n_markers": 21874,
+      "r2": 0.9776556409332294
+    }
+  ],
+  "beagle_seconds": 32.61,
+  "beagle_dosage_r2_all_imputed": 0.9791272293719084,
+  "cugen_vs_beagle_dose_corr": 0.9990100857987407,
+  "cugen_vs_beagle_max_abs_diff": 1.8241406679153442,
+  "n_common_markers": 1733484,
+  "speedup_vs_beagle": 1.14
+}

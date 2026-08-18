@@ -1,0 +1,15 @@
+{
+  "note": "Beagle 5.5 on the same fixture with a bgzipped VCF panel vs a bref3 panel. Imputation time is Beagle's own figure from its log; wall is the whole java process.",
+  "chrom": 20, "n_target_samples": 100, "n_reference_markers": 1733485,
+  "points": [
+    {"n_reference_haplotypes": 1200, "vcf_mb": 110, "bref3_mb": 88,
+     "bref3_convert_s": 43.0, "vcf_impute_s": 12, "bref3_impute_s": 13,
+     "vcf_wall_s": 20.2, "bref3_wall_s": 19.2},
+    {"n_reference_haplotypes": 2400, "vcf_mb": 171, "bref3_mb": 116,
+     "bref3_convert_s": 65.7, "vcf_impute_s": 17, "bref3_impute_s": 16,
+     "vcf_wall_s": 29.5, "bref3_wall_s": 22.9},
+    {"n_reference_haplotypes": 4800, "vcf_mb": 284, "bref3_mb": 164,
+     "bref3_convert_s": 96.3, "vcf_impute_s": 19, "bref3_impute_s": 20,
+     "vcf_wall_s": 39.5, "bref3_wall_s": 27.9}
+  ]
+}

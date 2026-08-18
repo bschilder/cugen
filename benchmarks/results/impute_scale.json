@@ -1,0 +1,154 @@
+{
+  "markers": 40000,
+  "frac_typed": 0.1,
+  "backend": "gpu",
+  "target_axis": [
+    {
+      "K": 4904,
+      "T": 32,
+      "M": 40000,
+      "seconds": 1.682,
+      "phases": {
+        "aggregate": 0.0724,
+        "interp_plan": 0.0009,
+        "carriers": 1.0109,
+        "forward_backward": 0.2969,
+        "dose": 0.2932
+      },
+      "peak_gib": 0.0,
+      "shape": [
+        32,
+        40000
+      ]
+    },
+    {
+      "K": 4904,
+      "T": 128,
+      "M": 40000,
+      "seconds": 1.449,
+      "phases": {
+        "aggregate": 0.071,
+        "interp_plan": 0.0007,
+        "carriers": 1.0088,
+        "forward_backward": 0.2964,
+        "dose": 0.056
+      },
+      "peak_gib": 0.0,
+      "shape": [
+        128,
+        40000
+      ]
+    },
+    {
+      "K": 4904,
+      "T": 512,
+      "M": 40000,
+      "seconds": 1.687,
+      "phases": {
+        "aggregate": 0.0707,
+        "interp_plan": 0.0007,
+        "carriers": 1.0963,
+        "forward_backward": 0.3343,
+        "dose": 0.1453
+      },
+      "peak_gib": 0.0,
+      "shape": [
+        512,
+        40000
+      ]
+    },
+    {
+      "K": 4904,
+      "T": 2048,
+      "M": 40000,
+      "seconds": 2.408,
+      "phases": {
+        "aggregate": 0.0867,
+        "interp_plan": 0.0008,
+        "carriers": 0.9596,
+        "forward_backward": 0.536,
+        "dose": 0.6778
+      },
+      "peak_gib": 0.0,
+      "shape": [
+        2048,
+        40000
+      ]
+    },
+    {
+      "K": 4904,
+      "T": 8192,
+      "M": 40000,
+      "seconds": 5.277,
+      "phases": {
+        "aggregate": 0.0973,
+        "interp_plan": 0.0008,
+        "carriers": 0.9972,
+        "forward_backward": 0.6783,
+        "dose": 2.9702
+      },
+      "peak_gib": 0.0,
+      "shape": [
+        8192,
+        40000
+      ]
+    }
+  ],
+  "panel_axis": [
+    {
+      "K": 1000,
+      "T": 256,
+      "M": 40000,
+      "seconds": 0.518,
+      "phases": {
+        "aggregate": 0.0199,
+        "interp_plan": 0.0011,
+        "carriers": 0.3417,
+        "forward_backward": 0.0636,
+        "dose": 0.0715
+      },
+      "peak_gib": 0.0,
+      "shape": [
+        256,
+        40000
+      ]
+    },
+    {
+      "K": 2500,
+      "T": 256,
+      "M": 40000,
+      "seconds": 0.999,
+      "phases": {
+        "aggregate": 0.0464,
+        "interp_plan": 0.0009,
+        "carriers": 0.6179,
+        "forward_backward": 0.1786,
+        "dose": 0.1362
+      },
+      "peak_gib": 0.0,
+      "shape": [
+        256,
+        40000
+      ]
+    },
+    {
+      "K": 4904,
+      "T": 256,
+      "M": 40000,
+      "seconds": 1.408,
+      "phases": {
+        "aggregate": 0.0696,
+        "interp_plan": 0.0008,
+        "carriers": 0.9435,
+        "forward_backward": 0.2964,
+        "dose": 0.0725
+      },
+      "peak_gib": 0.0,
+      "shape": [
+        256,
+        40000
+      ]
+    }
+  ],
+  "gpu": "NVIDIA A100 80GB PCIe"
+}
