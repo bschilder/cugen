@@ -228,10 +228,15 @@ def test_gpu_fused_phased_matches_numpy_reference(tmp_path, capsys):
     assert "fused kernel" in capsys.readouterr().out, \
         "fused path was not taken -- this test would be checking nothing"
 
-    r_ref = {(int(a), int(b)): float(v) for a, b, v in
-             zip(ref["gidx_a"], ref["gidx_b"], ref["R_PHASED"])}
-    r_got = {(int(a), int(b)): float(v) for a, b, v in
-             zip(got["gidx_a"], got["gidx_b"], got["R_PHASED"])}
+    # the fused path returns a cudf.DataFrame, whose Series are deliberately
+    # not iterable -- go through .to_numpy() so this works for either backend
+    def as_map(df, col):
+        return {(int(a), int(b)): float(v) for a, b, v in
+                zip(df["gidx_a"].to_numpy(), df["gidx_b"].to_numpy(),
+                    df[col].to_numpy())}
+
+    r_ref = as_map(ref, "R_PHASED")
+    r_got = as_map(got, "R_PHASED")
     assert r_got, "GPU path returned nothing"
     for k, v in r_got.items():
         assert k in r_ref, f"GPU emitted a pair the reference did not: {k}"
