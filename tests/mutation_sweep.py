@@ -17,6 +17,32 @@ import sys
 ROOT = pathlib.Path("/Users/bschilder/code/cugen")
 
 MUTATIONS = [
+    # ---- LD significance ----
+    ('chi2 counts individuals, not gametes', 'cugen/ld.py',
+     """    n_eff = (2 * int(reader.n_samples) if want_phased
+                 else int(reader.n_samples))""",
+     """    n_eff = int(reader.n_samples)""", "tests/test_ld_significance.py"),
+    # The device emit builds its own n_obs, but that path needs cuDF, so a
+    # mutation there is unreachable on a CPU box and would leave the sweep
+    # permanently red. phased_from_haplotypes is the CPU-side equivalent.
+    ('phased N counts individuals, not haplotypes', 'cugen/ld.py',
+     """            "n": np.full(pairs.shape[0], H)}""",
+     """            "n": np.full(pairs.shape[0], H / 2.0)}""", "tests/test_ld_significance.py"),
+    ('asymptotic p-value branch taken far too early', 'cugen/ld.py',
+     """_NLP_ASYMPTOTIC_FROM = 400.0""",
+     """_NLP_ASYMPTOTIC_FROM = 30.0""", "tests/test_ld_significance.py"),
+    ('erfc branch used everywhere, no asymptotic tail', 'cugen/ld.py',
+     """    return xp.where(z <= cut, small, large)""",
+     """    return small""", "tests/test_ld_significance.py"),
+    ('BH inequality flipped', 'cugen/ld.py',
+     """    ok = order >= np.log10(m / (k * alpha))""",
+     """    ok = order <= np.log10(m / (k * alpha))""", "tests/test_ld_significance.py"),
+    ('BH uses the survivor count as m, not the test count', 'cugen/ld.py',
+     """        cut, k = _bh_threshold_neglog10p(vals, m, alpha)""",
+     """        cut, k = _bh_threshold_neglog10p(vals, vals.size, alpha)""", "tests/test_ld_significance.py"),
+    ('Bonferroni forgets to divide by the test count', 'cugen/ld.py',
+     """        max_p = alpha / m_tests""",
+     """        max_p = alpha""", "tests/test_ld_significance.py"),
     ("aggregate pos = mean(all) not mean(first,last)", "cugen/_impute_core.py",
      "agg_cm = 0.5 * (cm[starts] + cm[stops - 1])",
      "agg_cm = np.array([cm[a:b].mean() for a, b in zip(starts, stops)])"),
@@ -60,22 +86,31 @@ MUTATIONS = [
 ]
 
 
-def run():
-    r = subprocess.run([".venv/bin/python", "-m", "pytest", "tests/test_impute.py",
+# Each mutation names the test file that is SUPPOSED to catch it. Running the
+# whole suite per mutation would be correct but slow; running one fixed file --
+# which this did, always tests/test_impute.py -- silently gives every mutation
+# outside that file a free pass. Both failure modes are worse than this.
+DEFAULT_TARGET = "tests/test_impute.py"
+
+
+def run(target=DEFAULT_TARGET):
+    r = subprocess.run([".venv/bin/python", "-m", "pytest", target,
                         "-q", "--no-header", "-p", "no:cacheprovider"],
                        cwd=ROOT, capture_output=True, text=True)
     return (r.stdout + r.stderr).strip().splitlines()[-1]
 
 
 caught = missed = 0
-for desc, rel, frm, to in MUTATIONS:
+for entry in MUTATIONS:
+    desc, rel, frm, to = entry[:4]
+    target = entry[4] if len(entry) > 4 else DEFAULT_TARGET
     f = ROOT / rel
     bak = f.read_text()
     if frm not in bak:
         print(f"  {desc:48s} !! PATTERN NOT FOUND")
         continue
     f.write_text(bak.replace(frm, to, 1))
-    line = run()
+    line = run(target)
     f.write_text(bak)
     ok = "failed" in line
     caught += ok

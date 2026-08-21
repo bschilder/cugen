@@ -625,6 +625,74 @@ def _add_significance(res, stats, xp=np):
     return res
 
 
+def _bh_threshold_neglog10p(neglog10p, m, alpha):
+    """Benjamini-Hochberg, computed entirely in -log10(p) space.
+
+    BH rejects the k smallest p-values for the largest k satisfying
+    p_(k) <= k*alpha/m. Taking -log10 of both sides flips the inequality:
+
+        neglog10p_(k) >= log10(m / (k*alpha))
+
+    where neglog10p_(k) is the k-th LARGEST. Working in log space is not a
+    convenience here -- at m = 1e14 the Bonferroni-scale thresholds are around
+    1e-16 and the observed p-values are unrepresentable, so a direct
+    implementation would compare two zeros.
+
+    Returns ``(cut, k)``: the -log10(p) threshold to keep at, and how many
+    tests are rejected. ``(inf, 0)`` when nothing is significant.
+
+    The sort makes this O(K log K) in the number of SURVIVORS, not in m -- the
+    screen has already discarded everything with a larger p-value, and those
+    can never be among the k smallest.
+    """
+    order = np.sort(np.asarray(neglog10p, dtype=np.float64))[::-1]
+    if order.size == 0:
+        return np.inf, 0
+    k = np.arange(1, order.size + 1, dtype=np.float64)
+    ok = order >= np.log10(m / (k * alpha))
+    if not ok.any():
+        return np.inf, 0
+    kmax = int(np.flatnonzero(ok)[-1]) + 1
+    return float(order[kmax - 1]), kmax
+
+
+def _apply_significance_filters(df, *, max_p, correction, alpha, m, screened,
+                                verbose):
+    """Post-scan p-value filtering. Accepts a pandas or a cudf frame.
+
+    Runs after the scan for two reasons. Under missingness N_OBS varies per
+    pair, so the r^2 pre-filter derived from max_p is only a conservative bound
+    and the exact cut has to be applied here. And BH-FDR is defined over the
+    whole set of p-values, so its threshold is not knowable before the scan.
+    """
+    if max_p is None and correction is None:
+        return df
+    col = df["NEG_LOG10_P"]
+    vals = col.to_numpy() if hasattr(col, "to_numpy") else np.asarray(col)
+    vals = np.asarray(vals, dtype=np.float64)
+
+    if correction == "fdr":
+        cut, k = _bh_threshold_neglog10p(vals, m, alpha)
+        if verbose:
+            print(f"cugen.ld: BH-FDR at alpha={alpha} over m={m:,} tests -> "
+                  f"{k:,} rejected, -log10(p) cut {cut:.4f}")
+        if screened and k == vals.size and k > 0:
+            raise ValueError(
+                f"BH-FDR rejected every one of the {k:,} pairs that survived "
+                f"the screen, so the true threshold may lie below it and real "
+                f"discoveries were discarded before FDR ran. Loosen or drop "
+                f"the min_r2/max_p screen and re-run.")
+    else:
+        # max_p, exact. -log10 so the comparison never meets an underflowed p.
+        cut = -math.log10(max_p)
+    keep = vals >= cut - 1e-12
+    if keep.all():
+        return df
+    if hasattr(df, "iloc"):
+        return df.iloc[np.flatnonzero(keep)].reset_index(drop=True)
+    return df[keep]
+
+
 def _empty_pairs(stats: Sequence[str]) -> pd.DataFrame:
     """Zero rows, full schema, correct dtypes. Callers break on bare
     pd.DataFrame() -- this is a real bug class, not a nicety."""
@@ -2942,6 +3010,9 @@ def ld_matrix(
     window: Optional[int] = None,
     window_kb: Optional[float] = None,
     min_r2: float = 0.0,
+    max_p: Optional[float] = None,
+    correction: Optional[str] = None,
+    alpha: float = 0.05,
     stats: Sequence[str] = _DEFAULT_STATS,
     dprime_method: str = "phased",
     sign_reference: str = "alt",
@@ -2988,9 +3059,26 @@ def ld_matrix(
         ``max_pairs`` catches the runaway case.
     min_r2
         Drop pairs below this r^2. PLINK's ``--ld-window-r2``.
+    max_p
+        Drop pairs whose p-value exceeds this. Requires ``'p'`` in ``stats``,
+        and is mutually exclusive with ``min_r2``: with N constant across pairs
+        the two are the same filter, so this is converted to the equivalent
+        ``min_r2`` and costs nothing.
+    correction
+        ``None`` (default), ``'bonferroni'``, or ``'fdr'`` (Benjamini-Hochberg).
+        Derives its own threshold from ``alpha`` and the number of tests, which
+        is the pair count and is known in closed form before the scan. Requires
+        ``'p'`` in ``stats``.
+    alpha
+        Family-wise error rate for ``'bonferroni'``, or the false discovery
+        rate for ``'fdr'``. Default 0.05.
     stats
-        Any of ``r, r2, r2_signed, d, dp``. Dropping ``d``/``dp`` skips the
-        cubic entirely.
+        Any of ``r, r2, r2_signed, d, dp`` (dosage), ``r_phased, r2_phased,
+        d_phased, dp_phased`` (true phase, hap2bit input), ``r2_phased_em`` (EM
+        haplotype estimate from unphased input), or ``chi2, p`` (significance;
+        valid on either encoding). Dropping ``d``/``dp`` skips the cubic
+        entirely. Defaults to the dosage set, so adding a statistic here never
+        changes an existing call's result.
     dprime_method
         ``'phased'`` (exact cubic, plink2 ``--r2-phased`` parity) or
         ``'composite'`` (Burrows' closed form; not a phase estimate).
@@ -3008,8 +3096,12 @@ def ld_matrix(
     Returns
     -------
     DataFrame with columns
-    ``CHR_A POS_A ID_A MAF_A CHR_B POS_B ID_B MAF_B N_OBS [R R2 R2_SIGNED D DP]
-    gidx_a gidx_b``, or an :class:`LDMatrix`.
+    ``CHR_A POS_A ID_A MAF_A CHR_B POS_B ID_B MAF_B N_OBS [R R2 R2_SIGNED D DP
+    R_PHASED R2_PHASED D_PHASED DP_PHASED R2_PHASED_EM CHI2 NEG_LOG10_P]
+    gidx_a gidx_b``, or an :class:`LDMatrix`. Which statistic columns appear is
+    exactly what ``stats`` asked for. ``NEG_LOG10_P`` carries -log10(p), not p:
+    p itself underflows float32 at chi2 = 170, i.e. r^2 = 0.034 at 1000 Genomes
+    sample size.
     """
     # ---- validation, all before any allocation --------------------------
     bad = [s for s in stats if s not in _STATS]
@@ -3027,6 +3119,27 @@ def ld_matrix(
             f"(complete-case) is available.")
     if backend not in ("auto", "gpu", "numpy"):
         raise ValueError(f"backend must be 'auto', 'gpu' or 'numpy', got {backend!r}")
+    if correction is not None and correction not in ("bonferroni", "fdr"):
+        raise ValueError(
+            f"correction must be None, 'bonferroni' or 'fdr', got {correction!r}")
+    if max_p is not None:
+        if not (0.0 < float(max_p) <= 1.0):
+            raise ValueError(f"max_p must be in (0, 1], got {max_p!r}")
+        if min_r2 > 0:
+            raise ValueError(
+                "pass max_p or min_r2, not both -- with N constant they are the "
+                "same filter, and two thresholds would silently take the "
+                "stricter one.")
+        if correction is not None:
+            raise ValueError(
+                f"pass max_p or correction={correction!r}, not both: a "
+                f"correction derives its own threshold.")
+    if (max_p is not None or correction is not None) and "p" not in stats:
+        raise ValueError(
+            "max_p/correction filter on the p-value, so 'p' must be in stats. "
+            "Add it: stats=(..., 'p').")
+    if not (0.0 < float(alpha) <= 1.0):
+        raise ValueError(f"alpha must be in (0, 1], got {alpha!r}")
 
     path = str(cugen)
     if os.path.isdir(path):
@@ -3120,6 +3233,34 @@ def ld_matrix(
     if n_pairs == 0:
         return _empty_pairs(stats)
 
+    # ---- significance thresholds ----------------------------------------
+    # n_pairs IS the number of tests. It comes from _count_pairs, in closed
+    # form from the row count and the window, so m is known without touching
+    # the data -- which is what makes correction affordable at genome scale.
+    m_tests = n_pairs
+    if correction == "bonferroni":
+        max_p = alpha / m_tests
+    if max_p is not None:
+        # With no missingness every pair shares one N, so chi2 = N*r^2 is
+        # strictly monotone in r^2 and the p-cut IS an r^2-cut: hand it to the
+        # filter the kernel already applies and the test costs nothing. With
+        # missingness N varies per pair and N <= n_eff, so the same conversion
+        # is a CONSERVATIVE pre-filter (a pair below it cannot reach the cut at
+        # any smaller N) and _apply_significance_filters applies the exact one.
+        from scipy.stats import chi2 as _chi2_dist  # noqa: PLC0415
+        n_eff = (2 * int(reader.n_samples) if want_phased
+                 else int(reader.n_samples))
+        min_r2 = float(_chi2_dist.isf(max_p, 1)) / n_eff
+        if verbose:
+            print(f"cugen.ld: max_p={max_p:.3g} over m={m_tests:,} tests -> "
+                  f"min_r2={min_r2:.6g} at N={n_eff}")
+    _screened = min_r2 > 0
+    _sig_kw = dict(max_p=max_p, correction=correction, alpha=alpha,
+                   m=m_tests, screened=_screened, verbose=verbose)
+    # FDR needs every p-value to find its threshold, so it must not pre-screen.
+    if correction == "fdr":
+        _sig_kw["max_p"] = None
+
     # ---- counts ----------------------------------------------------------
     # D and D' need the 3x3 table; r-family statistics do not, and skipping it
     # avoids ~9x the memory traffic per tile.
@@ -3207,6 +3348,7 @@ def ld_matrix(
         n_dev = cp.full(ii.size, float(n_obs), dtype=cp.float32)
         df = _assemble_device(pairs_local, (rr, n_dev), reader, rows, stats,
                               sign_reference, path, verbose, n_planned=n_pairs)
+        df = _apply_significance_filters(df, **_sig_kw)
         _write_df(df, str(output))
         if verbose:
             print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs "
@@ -3224,6 +3366,7 @@ def ld_matrix(
         if on_device:
             df = _assemble_device(pairs_local, payload, reader, rows, stats,
                                   sign_reference, path, verbose, n_planned=n_pairs)
+            df = _apply_significance_filters(df, **_sig_kw)
             _write_df(df, str(output))
             if verbose:
                 print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs "
@@ -3284,6 +3427,7 @@ def ld_matrix(
         chrom_fallback = int(m.group(1))
     df = _merge_annotation(df, ann, chrom_fallback)
     df = _finalize(df, stats)
+    df = _apply_significance_filters(df, **_sig_kw)
 
     if verbose:
         print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs planned, "

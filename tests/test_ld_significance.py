@@ -159,3 +159,193 @@ def test_chi2_arithmetic_is_float64_exact(small_cugen):
     direct = L._neglog10_chi2_1df(chi2, np)
     want = np.array([oracle_neglog10p(c) if c > 0 else 0.0 for c in chi2])
     np.testing.assert_allclose(direct, want, atol=1e-9)
+
+
+# ------------------------------------------------- filtering and correction
+
+def _bh_reject_count(neglog10p, m, alpha):
+    """Textbook Benjamini-Hochberg, done the slow obvious way in log space.
+
+    Independent of the production implementation: sorts descending, walks every
+    rank, takes the largest k that satisfies the BH inequality. O(K log K) and
+    allocates freely -- this is the oracle, not the shipping path.
+    """
+    order = np.sort(np.asarray(neglog10p, dtype=np.float64))[::-1]
+    best = 0
+    for k in range(1, order.size + 1):
+        if order[k - 1] >= math.log10(m / (k * alpha)):
+            best = k
+    return best
+
+
+def test_max_p_is_exactly_equivalent_to_the_matching_r2_threshold(small_cugen):
+    """The whole reason p-filtering is free.
+
+    With N constant across pairs, p is a strictly monotone function of r^2, so
+    a p-value cut IS an r^2 cut and the existing in-kernel min_r2 filter does
+    the work. If these two calls ever diverge, the filter is not free any more.
+    """
+    path, dos = small_cugen
+    n = dos.shape[1]
+    max_p = 1e-3
+    by_p = L.ld_matrix(path, stats=("r2", "p"), max_p=max_p, **CPU)
+    by_r2 = L.ld_matrix(path, stats=("r2", "p"),
+                        min_r2=_chi2.isf(max_p, 1) / n, **CPU)
+    assert len(by_p) == len(by_r2) > 0
+    np.testing.assert_array_equal(by_p["gidx_a"].to_numpy(),
+                                 by_r2["gidx_a"].to_numpy())
+    np.testing.assert_array_equal(by_p["gidx_b"].to_numpy(),
+                                 by_r2["gidx_b"].to_numpy())
+
+
+def test_max_p_actually_bounds_the_emitted_p_values(small_cugen):
+    df = L.ld_matrix(small_cugen[0], stats=("r2", "p"), max_p=1e-3, **CPU)
+    assert (df["NEG_LOG10_P"] >= 3.0 - 1e-6).all()
+
+
+def test_max_p_and_min_r2_together_are_refused(small_cugen):
+    with pytest.raises(ValueError, match="max_p.*min_r2|min_r2.*max_p"):
+        L.ld_matrix(small_cugen[0], stats=("r2",), max_p=1e-3, min_r2=0.2, **CPU)
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, 1.5])
+def test_max_p_out_of_range_is_refused(small_cugen, bad):
+    with pytest.raises(ValueError, match="max_p"):
+        L.ld_matrix(small_cugen[0], stats=("r2",), max_p=bad, **CPU)
+
+
+def test_bonferroni_threshold_is_alpha_over_the_number_of_tests(small_cugen):
+    path, dos = small_cugen
+    p_var = dos.shape[0]
+    m = p_var * (p_var - 1) // 2
+    got = L.ld_matrix(path, stats=("r2", "p"), correction="bonferroni",
+                      alpha=0.05, **CPU)
+    want = L.ld_matrix(path, stats=("r2", "p"), max_p=0.05 / m, **CPU)
+    assert len(got) == len(want)
+    np.testing.assert_array_equal(got["gidx_a"].to_numpy(),
+                                 want["gidx_a"].to_numpy())
+
+
+def test_fdr_matches_a_textbook_bh_over_the_same_tests(small_cugen):
+    path, dos = small_cugen
+    p_var = dos.shape[0]
+    m = p_var * (p_var - 1) // 2
+    every = L.ld_matrix(path, stats=("r2", "p"), **CPU)
+    assert len(every) == m, "fixture must emit every pair for the oracle to hold"
+    want_k = _bh_reject_count(every["NEG_LOG10_P"].to_numpy(np.float64), m, 0.05)
+    got = L.ld_matrix(path, stats=("r2", "p"), correction="fdr", alpha=0.05,
+                      **CPU)
+    assert len(got) == want_k
+
+
+def test_fdr_is_never_stricter_than_bonferroni(small_cugen):
+    path = small_cugen[0]
+    fdr = L.ld_matrix(path, stats=("r2", "p"), correction="fdr", alpha=0.05,
+                      **CPU)
+    bon = L.ld_matrix(path, stats=("r2", "p"), correction="bonferroni",
+                      alpha=0.05, **CPU)
+    assert len(fdr) >= len(bon)
+
+
+def test_unknown_correction_is_refused(small_cugen):
+    with pytest.raises(ValueError, match="correction"):
+        L.ld_matrix(small_cugen[0], stats=("r2",), correction="holm", **CPU)
+
+
+def test_correction_requires_the_p_statistic(small_cugen):
+    """Asking for FDR without asking for p is a mistake worth naming, not
+    something to silently paper over by adding the column."""
+    with pytest.raises(ValueError, match="correction.*'p'|'p'.*correction"):
+        L.ld_matrix(small_cugen[0], stats=("r2",), correction="fdr", **CPU)
+
+
+@pytest.fixture
+def linked_cugen(tmp_path):
+    """A panel with genuinely strong LD, so a tight r^2 screen keeps some pairs.
+
+    The `dosages` fixture is independent draws, where no pair reaches r^2 = 0.9
+    and a tight screen leaves nothing at all -- which exercises the empty-result
+    path rather than the guard under test.
+    """
+    rng = np.random.default_rng(11)
+    n, p_var = 100, 12
+    base = rng.integers(0, 3, size=n).astype(np.uint8)
+    dos = np.empty((n, p_var), dtype=np.uint8)
+    for v in range(p_var):
+        q = 0.02 + 0.10 * (v / (p_var - 1))     # 2%..12% of calls corrupted
+        noisy = rng.integers(0, 3, size=n).astype(np.uint8)
+        dos[:, v] = np.where(rng.random(n) < q, noisy, base)
+    path = tmp_path / "linked.cugen"
+    write_cugen(str(path), dos)
+    return str(path)
+
+
+def test_fdr_refuses_when_the_screen_may_have_truncated_discoveries(linked_cugen):
+    """A screen tight enough that BH rejects everything left is a trap.
+
+    BH's threshold depends on where the k-th smallest p-value sits. If every
+    survivor is rejected, the true cut may lie below the screen, and pairs that
+    BH would also have rejected were discarded before it ran. Returning the
+    truncated set would quietly under-report discoveries, so refuse instead.
+    """
+    unscreened = L.ld_matrix(linked_cugen, stats=("r2", "p"), **CPU)
+    assert (unscreened["R2"] >= 0.5).all(), "fixture has no strong LD to screen on"
+    with pytest.raises(ValueError, match="survived the screen"):
+        L.ld_matrix(linked_cugen, stats=("r2", "p"), min_r2=0.5,
+                    correction="fdr", alpha=0.5, **CPU)
+
+
+def test_fdr_with_a_harmless_screen_still_agrees_with_textbook_bh(small_cugen):
+    """A screen that keeps more pairs than BH rejects cannot change the answer,
+    because everything it dropped has a larger p than the cut."""
+    path, dos = small_cugen
+    p_var = dos.shape[0]
+    m = p_var * (p_var - 1) // 2
+    every = L.ld_matrix(path, stats=("r2", "p"), **CPU)
+    want_k = _bh_reject_count(every["NEG_LOG10_P"].to_numpy(np.float64), m, 0.05)
+    assert want_k > 0, "fixture must have some discoveries for this to mean anything"
+    screened = L.ld_matrix(path, stats=("r2", "p"), min_r2=1e-6,
+                           correction="fdr", alpha=0.05, **CPU)
+    assert len(screened) == want_k
+
+
+def test_max_p_converts_using_the_haplotype_count_on_a_phased_file(tmp_path):
+    """The factor-of-two trap again, this time in the THRESHOLD conversion.
+
+    max_p becomes min_r2 = chi2.isf(max_p, 1) / N. Using n_samples instead of
+    2*n_samples on a phased file doubles the required r^2 and silently drops
+    real pairs, which no internal-consistency check would notice.
+    """
+    hap = simulate_phased(n_samples=60, n_variants=10, seed=7)
+    path = tmp_path / "ph.cugen"
+    write_cugen_phased(str(path), hap)
+    max_p = 1e-4
+
+    by_p = L.ld_matrix(str(path), stats=("r2_phased", "p"), max_p=max_p, **CPU)
+    by_hap = L.ld_matrix(str(path), stats=("r2_phased", "p"),
+                         min_r2=_chi2.isf(max_p, 1) / 120, **CPU)
+    by_ind = L.ld_matrix(str(path), stats=("r2_phased", "p"),
+                         min_r2=_chi2.isf(max_p, 1) / 60, **CPU)
+    assert len(by_p) == len(by_hap)
+    assert len(by_hap) > len(by_ind), (
+        "fixture cannot tell the two conversions apart; pick a max_p where "
+        "some pair falls between the haplotype and individual thresholds")
+
+
+def test_fdr_uses_the_test_count_not_the_survivor_count(small_cugen):
+    """BH's threshold is m*t/alpha, and m is every test PLANNED, not every test
+    that survived the screen. Screening 66 pairs down to 43 must not make the
+    remaining 43 easier to call significant."""
+    path, dos = small_cugen
+    p_var = dos.shape[0]
+    m = p_var * (p_var - 1) // 2
+    every = L.ld_matrix(path, stats=("r2", "p"), **CPU)
+    survivors = int((every["R2"] >= 0.01).sum())
+    want_k = _bh_reject_count(every["NEG_LOG10_P"].to_numpy(np.float64), m, 0.05)
+    assert want_k < survivors < m, (
+        f"fixture must screen strictly and still keep more than BH rejects; "
+        f"got k={want_k}, survivors={survivors}, m={m}")
+
+    got = L.ld_matrix(path, stats=("r2", "p"), min_r2=0.01, correction="fdr",
+                      alpha=0.05, **CPU)
+    assert len(got) == want_k
