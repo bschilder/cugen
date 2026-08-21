@@ -18,6 +18,15 @@ ROOT = pathlib.Path("/Users/bschilder/code/cugen")
 
 MUTATIONS = [
     # ---- LD significance ----
+    ('nAB reconstruction truncates instead of rounding', 'cugen/ld.py',
+     """    return np.rint((r * den + nA * nB) / float(N)).astype(np.int64)""",
+     """    return np.floor((r * den + nA * nB) / float(N)).astype(np.int64)""", "tests/test_ld_significance.py"),
+    ('exact test gate never fires', 'cugen/ld.py',
+     """    return (a * b / xp.asarray(N, dtype=xp.float64)) < 5.0""",
+     """    return (a * b / xp.asarray(N, dtype=xp.float64)) < 0.0""", "tests/test_ld_significance.py"),
+    ('Fisher two-sided keeps only the observed table', 'cugen/ld.py',
+     """    tail = float(pmf[pmf <= obs * (1.0 + 1e-7)].sum())""",
+     """    tail = float(obs)""", "tests/test_ld_significance.py"),
     ('chi2 counts individuals, not gametes', 'cugen/ld.py',
      """    n_eff = (2 * int(reader.n_samples) if want_phased
                  else int(reader.n_samples))""",
@@ -26,8 +35,8 @@ MUTATIONS = [
     # mutation there is unreachable on a CPU box and would leave the sweep
     # permanently red. phased_from_haplotypes is the CPU-side equivalent.
     ('phased N counts individuals, not haplotypes', 'cugen/ld.py',
-     """            "n": np.full(pairs.shape[0], H)}""",
-     """            "n": np.full(pairs.shape[0], H / 2.0)}""", "tests/test_ld_significance.py"),
+     """            "n": np.full(pairs.shape[0], H),""",
+     """            "n": np.full(pairs.shape[0], H / 2.0),""", "tests/test_ld_significance.py"),
     ('asymptotic p-value branch taken far too early', 'cugen/ld.py',
      """_NLP_ASYMPTOTIC_FROM = 400.0""",
      """_NLP_ASYMPTOTIC_FROM = 30.0""", "tests/test_ld_significance.py"),

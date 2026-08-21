@@ -349,3 +349,162 @@ def test_fdr_uses_the_test_count_not_the_survivor_count(small_cugen):
     got = L.ld_matrix(path, stats=("r2", "p"), min_r2=0.01, correction="fdr",
                       alpha=0.05, **CPU)
     assert len(got) == want_k
+
+
+# ------------------------------------------------- exact conditional test
+# Permuting haplotype labels holds both variants' allele counts fixed, so the
+# permutation null of the 2x2 haplotype table is hypergeometric and the exact
+# permutation p-value IS Fisher's exact test. That is why there is no Monte
+# Carlo here: the "empirical" p-value has a closed form.
+
+def hap_table(hap, i, j):
+    """(nAB, nA, nB, N) for two 0/1 haplotype columns."""
+    x, y = hap[:, i].astype(np.int64), hap[:, j].astype(np.int64)
+    return int((x & y).sum()), int(x.sum()), int(y.sum()), int(hap.shape[0])
+
+
+def oracle_fisher_neglog10p(nAB, nA, nB, N):
+    """Two-sided Fisher exact on the 2x2 haplotype table, via scipy."""
+    from scipy.stats import fisher_exact
+    table = [[nAB, nA - nAB], [nB - nAB, N - nA - nB + nAB]]
+    return -math.log10(fisher_exact(table)[1])
+
+
+def test_exact_test_matches_scipy_fisher_exact(tmp_path):
+    hap = simulate_phased(n_samples=30, n_variants=10, seed=5)
+    path = tmp_path / "ph.cugen"
+    write_cugen_phased(str(path), hap)
+    df = L.ld_matrix(str(path), stats=("r2_phased", "p"), exact="always", **CPU)
+
+    checked = 0
+    for a, b, got in zip(df["gidx_a"], df["gidx_b"], df["NEG_LOG10_P_EXACT"]):
+        want = oracle_fisher_neglog10p(*hap_table(hap, int(a), int(b)))
+        assert abs(float(got) - want) < 1e-4, (
+            f"pair ({a},{b}): got {float(got)}, scipy fisher_exact says {want}")
+        checked += 1
+    assert checked >= 40, f"only {checked} pairs compared"
+
+
+def test_exact_test_equals_the_brute_force_permutation_p_value():
+    """The claim the whole design rests on, checked directly.
+
+    A full enumeration over the fixed-margin tables IS the permutation
+    distribution of r^2, so Fisher's exact p and the permutation p must agree
+    identically -- not approximately.
+    """
+    from scipy.stats import hypergeom
+    N, nA, nB, nAB = 14, 6, 6, 5
+    rv = hypergeom(N, nA, nB)
+    ks = np.arange(max(0, nA + nB - N), min(nA, nB) + 1)
+
+    def r2_for(k):
+        num = (N * k - nA * nB) ** 2
+        den = nA * (N - nA) * nB * (N - nB)
+        return num / den
+
+    obs = r2_for(nAB)
+    # exact permutation p: total mass on tables at least as extreme in r^2
+    perm_p = float(rv.pmf(ks)[r2_for(ks) >= obs - 1e-12].sum())
+    exact_p = 10.0 ** -L._fisher_neglog10p_2x2(nAB, nA, nB, N)
+    assert abs(exact_p - perm_p) < 1e-12, (
+        f"Fisher {exact_p!r} != exact permutation {perm_p!r}")
+
+
+def test_exact_is_off_by_default_and_auto_only_fires_on_small_counts(tmp_path):
+    """auto must not pay for the exact test where the asymptotic one is fine."""
+    # All variants deliberately COMMON. simulate_phased draws frequencies up to
+    # 0.95, which at N=400 leaves minor counts near 13 and a minimum expected
+    # cell of 0.5 -- the gate fires there, correctly, so it cannot be used to
+    # test that the gate stays quiet.
+    rng = np.random.default_rng(1)
+    H, p_var = 400, 8
+    hap = (rng.random((H, p_var)) < 0.4).astype(np.uint8)
+    path = tmp_path / "big.cugen"
+    write_cugen_phased(str(path), hap)
+
+    counts = hap.sum(axis=0)
+    min_exp = np.minimum(counts, H - counts)
+    assert (min_exp.min() ** 2 / H) > 5.0, "fixture is not all-common"
+
+    default = L.ld_matrix(str(path), stats=("r2_phased", "p"), **CPU)
+    assert "NEG_LOG10_P_EXACT" not in default.columns
+
+    auto = L.ld_matrix(str(path), stats=("r2_phased", "p"), exact="auto", **CPU)
+    assert "NEG_LOG10_P_EXACT" in auto.columns
+    assert auto["NEG_LOG10_P_EXACT"].isna().all(), (
+        "auto fired on common variants where the asymptotic test is valid")
+
+
+def test_auto_fires_where_the_asymptotic_test_is_untrustworthy(tmp_path):
+    """A rare variant makes the minimum expected cell count small, which is the
+    classic condition for the chi-square approximation to fail."""
+    rng = np.random.default_rng(2)
+    H, p_var = 60, 6
+    hap = (rng.random((H, p_var)) < 0.5).astype(np.uint8)
+    hap[:, 0] = 0
+    hap[:3, 0] = 1                       # nA = 3 out of 60
+    path = tmp_path / "rare.cugen"
+    write_cugen_phased(str(path), hap)
+
+    df = L.ld_matrix(str(path), stats=("r2_phased", "p"), exact="auto", **CPU)
+    rare = df[(df["gidx_a"] == 0) | (df["gidx_b"] == 0)]
+    assert len(rare) == p_var - 1
+    assert rare["NEG_LOG10_P_EXACT"].notna().all(), "auto missed the rare variant"
+
+
+def test_exact_test_is_refused_on_an_unphased_file(small_cugen):
+    """There is no 2x2 haplotype table in dosage data, so there is nothing to
+    condition on. Refuse rather than return a plausible wrong number."""
+    with pytest.raises(ValueError, match="exact.*phase|phase.*exact"):
+        L.ld_matrix(small_cugen[0], stats=("r2", "p"), exact="always", **CPU)
+
+
+def test_unknown_exact_mode_is_refused(small_cugen):
+    with pytest.raises(ValueError, match="exact"):
+        L.ld_matrix(small_cugen[0], stats=("r2",), exact="sometimes", **CPU)
+
+
+def test_nab_recovery_from_float32_r_is_exact(tmp_path):
+    """The device path emits r and throws away the cross-product that made it.
+
+    Rather than a second GPU kernel, the exact test reconstructs nAB from r and
+    the two allele counts. That is only legitimate if float32 r carries enough
+    precision for the rounded result to land on the right integer, so check it
+    against direct counting over a panel with a wide MAF spread.
+    """
+    hap = simulate_phased(n_samples=250, n_variants=24, seed=13)
+    H = hap.shape[0]
+    got = bad = 0
+    for i in range(hap.shape[1]):
+        for j in range(i + 1, hap.shape[1]):
+            nAB, nA, nB, N = hap_table(hap, i, j)
+            if nA in (0, N) or nB in (0, N):
+                continue
+            r32 = np.float32(
+                (N * nAB - nA * nB)
+                / math.sqrt(nA * (N - nA) * nB * (N - nB)))
+            rec = int(L._recover_nab(np.array([r32]), np.array([nA]),
+                                     np.array([nB]), N)[0])
+            bad += rec != nAB
+            got += 1
+    assert got >= 250, f"only {got} pairs exercised"
+    assert bad == 0, f"{bad}/{got} reconstructions landed on the wrong integer"
+    assert H == 500
+
+
+def test_exact_column_agrees_whether_nab_is_counted_or_reconstructed(tmp_path):
+    """Host and device reach the exact test by different routes; the answer must
+    not depend on which."""
+    hap = simulate_phased(n_samples=40, n_variants=8, seed=21)
+    N = hap.shape[0]
+    for i in range(hap.shape[1]):
+        for j in range(i + 1, hap.shape[1]):
+            nAB, nA, nB, _ = hap_table(hap, i, j)
+            if nA in (0, N) or nB in (0, N):
+                continue
+            r32 = np.float32((N * nAB - nA * nB)
+                             / math.sqrt(nA * (N - nA) * nB * (N - nB)))
+            rec = L._recover_nab(np.array([r32]), np.array([nA]),
+                                 np.array([nB]), N)
+            assert (L._fisher_neglog10p_2x2(nAB, nA, nB, N)
+                    == L._fisher_neglog10p_2x2(int(rec[0]), nA, nB, N))

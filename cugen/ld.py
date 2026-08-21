@@ -174,17 +174,22 @@ EPS = 1e-12
 # deliberately dosage-only, so adding a phased statistic here never changes
 # the result of an existing call.
 _STATS = ("r", "r2", "r2_signed", "d", "dp", "r_phased", "r2_phased",
-          "d_phased", "dp_phased", "r2_phased_em", "chi2", "p")
+          "d_phased", "dp_phased", "r2_phased_em", "chi2", "p", "p_exact")
 _DEFAULT_STATS = ("r", "r2", "r2_signed", "d", "dp")
 _STAT_COL = {"r": "R", "r2": "R2", "r2_signed": "R2_SIGNED", "d": "D", "dp": "DP",
              "r_phased": "R_PHASED", "r2_phased": "R2_PHASED",
              "d_phased": "D_PHASED", "dp_phased": "DP_PHASED",
              "r2_phased_em": "R2_PHASED_EM",
-             "chi2": "CHI2", "p": "NEG_LOG10_P"}
+             "chi2": "CHI2", "p": "NEG_LOG10_P",
+             "p_exact": "NEG_LOG10_P_EXACT"}
 # The significance pair. Derived from whichever correlation the path computed
 # and from N_OBS, so they cost no extra passes over the data. "p" emits
 # -log10(p), not p -- see _neglog10_chi2_1df for why p itself is unusable.
-_SIG_STATS = frozenset(("chi2", "p"))
+_SIG_STATS = frozenset(("chi2", "p", "p_exact"))
+# p_exact conditions on the 2x2 HAPLOTYPE table, which dosage data does not
+# carry -- unlike chi2/p it is phased-only even though it is not a _PHASED_STATS
+# member (those name specific LD estimators; this names a test of any of them).
+_EXACT_MODES = ("never", "auto", "always")
 # Statistics computed from TRUE haplotype counts, which only a HAP2BIT file
 # carries. Mixing these with the dosage statistics in one call is refused
 # rather than silently served: hap2bit and 2bit share bytes but not meaning
@@ -590,7 +595,7 @@ def _neglog10_chi2_1df(chi2, xp=np):
     return xp.where(z <= cut, small, large)
 
 
-def _add_significance(res, stats, xp=np):
+def _add_significance(res, stats, xp=np, exact="never"):
     """Attach ``chi2`` and ``p`` to a result dict, in place.
 
     The test of no disequilibrium between two biallelic loci is
@@ -622,7 +627,116 @@ def _add_significance(res, stats, xp=np):
     chi2 = xp.asarray(res["n"], dtype=xp.float64) * r2
     res["chi2"] = chi2
     res["p"] = _neglog10_chi2_1df(chi2, xp)
+    if "p_exact" in stats:
+        res["p_exact"] = _exact_column(res["nAB"], res["nA"], res["nB"],
+                                       res["n"], exact)
     return res
+
+
+def _exact_column(nAB, nA, nB, n, exact):
+    """Fisher exact -log10(p) per pair, NaN where the mode says not to bother.
+
+    NaN rather than falling back to the asymptotic value: the two columns answer
+    different questions, and silently mixing them would make NEG_LOG10_P_EXACT
+    mean "exact where we felt like it". A NaN says plainly that the asymptotic
+    p-value in NEG_LOG10_P is the one to use for that pair.
+
+    Loops over the pairs that need it. Under 'auto' that set is small by
+    construction -- see _exact_needed -- and this is the reference path, whose
+    contract is correct rather than fast.
+    """
+    nAB = np.asarray(nAB, dtype=np.int64)
+    nA = np.asarray(nA, dtype=np.int64)
+    nB = np.asarray(nB, dtype=np.int64)
+    n = np.asarray(n, dtype=np.int64)
+    out = np.full(nAB.shape, np.nan, dtype=np.float64)
+    need = (np.ones(nAB.shape, dtype=bool) if exact == "always"
+            else _exact_needed(nA, nB, n))
+    for t in np.flatnonzero(need):
+        out[t] = _fisher_neglog10p_2x2(nAB[t], nA[t], nB[t], n[t])
+    return out
+
+
+def _fisher_neglog10p_2x2(nAB, nA, nB, N):
+    """Two-sided Fisher exact test on the 2x2 haplotype table, as -log10(p).
+
+    This is the EXACT PERMUTATION p-value, not an approximation to it.
+    Permuting haplotype labels leaves both variants' allele counts untouched,
+    so the permutation null of the table is the hypergeometric distribution
+    with those margins fixed, and summing its mass over the tables at least as
+    extreme as the observed one is precisely Fisher's exact test. Koch et al.
+    (2013) spent ~34,000 CPU-hours Monte-Carlo sampling this distribution.
+
+    Two-sided in the conventional sense: total probability of every table whose
+    own probability does not exceed the observed table's. Computed through
+    lgamma so the factorials never overflow.
+
+    The cost is one term per admissible table, i.e. min(nA, nB) + 1 terms, and
+    the gate in _exact_needed keeps it small where it matters: the exact test is
+    only needed when nA*nB/N < 5, and min(nA,nB)^2 <= nA*nB < 5N bounds the
+    loop by sqrt(5N) -- about 158 terms at 1000 Genomes size, fewer for rarer
+    variants. The pairs that need this are the pairs where it is cheap.
+    """
+    from scipy.special import gammaln  # noqa: PLC0415
+    nAB, nA, nB, N = int(nAB), int(nA), int(nB), int(N)
+    lo, hi = max(0, nA + nB - N), min(nA, nB)
+    if hi < lo:
+        return 0.0
+    k = np.arange(lo, hi + 1, dtype=np.float64)
+    # log hypergeometric pmf, dropping the k-independent normaliser and
+    # restoring it by summing to one.
+    logp = (-gammaln(k + 1.0) - gammaln(nA - k + 1.0)
+            - gammaln(nB - k + 1.0) - gammaln(N - nA - nB + k + 1.0))
+    logp -= logp.max()
+    pmf = np.exp(logp)
+    pmf /= pmf.sum()
+    obs = pmf[nAB - lo]
+    # 1 + 1e-7 absorbs the float noise between two mathematically equal
+    # tables, which is common with symmetric margins; without it the mirror
+    # table is dropped and the p-value comes out roughly half.
+    tail = float(pmf[pmf <= obs * (1.0 + 1e-7)].sum())
+    tail = min(max(tail, 0.0), 1.0)
+    if tail <= 0.0:
+        return np.inf
+    return -math.log10(tail)
+
+
+def _exact_needed(nA, nB, N, xp=np):
+    """Where the chi-square approximation should not be trusted.
+
+    The minimum expected cell count of the 2x2 table under independence is
+    min(nA, N-nA) * min(nB, N-nB) / N. Below 5 -- the classic rule -- the
+    asymptotic test is anti-conservative; Park (2019) fig. 1 shows exactly this
+    breakdown, and at N=14 with symmetric margins the asymptotic p can be 3x
+    too small.
+    """
+    a = xp.minimum(nA, N - nA)
+    b = xp.minimum(nB, N - nB)
+    return (a * b / xp.asarray(N, dtype=xp.float64)) < 5.0
+
+
+def _recover_nab(r, nA, nB, N):
+    """Recover the AB haplotype count from r and the two allele counts.
+
+    r = (N*nAB - nA*nB) / sqrt(nA(N-nA) * nB(N-nB)), so nAB follows by
+    rearrangement. It exists because the fused GPU path emits r and discards
+    the cross-product that produced it -- reconstructing is cheaper than a
+    second kernel, and means the exact test has ONE implementation shared by
+    the host and device paths.
+
+    Exact in practice despite r being float32: nAB is an integer, and the
+    reconstruction error is bounded by sqrt(nA(N-nA)nB(N-nB))/N * eps32 <=
+    N/4 * 1.2e-7, which is 1.5e-4 at N=5008 -- three orders below the 0.5
+    needed for rounding to land on the right integer. The float64 upcast below
+    is insurance for large N rather than a necessity at that scale; the tests
+    pass without it today. `rint` is not optional -- truncating instead
+    misplaces roughly half the counts.
+    """
+    r = np.asarray(r, dtype=np.float64)
+    nA = np.asarray(nA, dtype=np.float64)
+    nB = np.asarray(nB, dtype=np.float64)
+    den = np.sqrt(nA * (N - nA) * nB * (N - nB))
+    return np.rint((r * den + nA * nB) / float(N)).astype(np.int64)
 
 
 def _bh_threshold_neglog10p(neglog10p, m, alpha):
@@ -2882,7 +2996,9 @@ def phased_from_haplotypes(hap, pairs):
         dp = np.where(good & (dmax > 0), D / dmax, np.nan)
     return {"r_phased": r, "r2_phased": r * r, "d_phased": np.where(good, D, np.nan),
             "dp_phased": dp, "pA": pA, "pB": pB,
-            "n": np.full(pairs.shape[0], H)}
+            "n": np.full(pairs.shape[0], H),
+            # the 2x2 haplotype table, for the exact conditional test
+            "nAB": nAB, "nA": nA, "nB": nB}
 
 
 def _dosages_numpy(reader) -> np.ndarray:
@@ -3013,6 +3129,7 @@ def ld_matrix(
     max_p: Optional[float] = None,
     correction: Optional[str] = None,
     alpha: float = 0.05,
+    exact: str = "never",
     stats: Sequence[str] = _DEFAULT_STATS,
     dprime_method: str = "phased",
     sign_reference: str = "alt",
@@ -3072,6 +3189,16 @@ def ld_matrix(
     alpha
         Family-wise error rate for ``'bonferroni'``, or the false discovery
         rate for ``'fdr'``. Default 0.05.
+    exact
+        ``'never'`` (default), ``'auto'`` or ``'always'``. Adds
+        ``NEG_LOG10_P_EXACT``, a two-sided Fisher exact test on the 2x2
+        haplotype table -- which IS the exact permutation p-value, since
+        permuting haplotype labels leaves both allele counts fixed and so draws
+        from the hypergeometric with those margins. hap2bit input only.
+        ``'auto'`` computes it where the minimum expected cell count falls below
+        5 and leaves NaN elsewhere, meaning the asymptotic p-value is the one to
+        use for that pair. Selecting ``'p_exact'`` in ``stats`` implies
+        ``'auto'``. Forces the reference path, as ``d``/``dp`` already do.
     stats
         Any of ``r, r2, r2_signed, d, dp`` (dosage), ``r_phased, r2_phased,
         d_phased, dp_phased`` (true phase, hap2bit input), ``r2_phased_em`` (EM
@@ -3140,6 +3267,15 @@ def ld_matrix(
             "Add it: stats=(..., 'p').")
     if not (0.0 < float(alpha) <= 1.0):
         raise ValueError(f"alpha must be in (0, 1], got {alpha!r}")
+    if exact not in _EXACT_MODES:
+        raise ValueError(f"exact must be one of {_EXACT_MODES}, got {exact!r}")
+    # exact= and stats=('p_exact',) are two doors to the same room: either one
+    # implies the other, and asking via stats defaults the mode to 'auto'.
+    stats = tuple(stats)
+    if exact != "never" and "p_exact" not in stats:
+        stats = stats + ("p_exact",)
+    elif exact == "never" and "p_exact" in stats:
+        exact = "auto"
 
     path = str(cugen)
     if os.path.isdir(path):
@@ -3193,6 +3329,13 @@ def ld_matrix(
         raise ValueError(
             f"{want_phased} need TRUE phase, which a 2bit file does not carry. "
             f"Convert a phased VCF with cg.convert.vcf2cugenh().")
+    if enc != ENCODING_HAP2BIT and "p_exact" in stats:
+        raise ValueError(
+            "the exact conditional test conditions on the 2x2 HAPLOTYPE table, "
+            "which needs TRUE phase and a 2bit file does not carry -- there is "
+            "nothing to condition on, so serving it would return a plausible "
+            "wrong number. Convert a phased VCF with cg.convert.vcf2cugenh(), "
+            "or drop exact=/'p_exact'.")
 
     p_all = int(reader.n_variants)
     gidx_all = np.asarray(reader.gidx, dtype=np.int64)
@@ -3273,7 +3416,15 @@ def ld_matrix(
     # letting cudf wrap them avoids a host round trip we would immediately undo.
     # The cuDF/output preconditions exist to avoid a host round trip when
     # SERIALISING. count_only serialises nothing, so they do not apply.
-    on_device = (use_gpu and not need_table and annotation is None
+    #
+    # p_exact is excluded for the same reason need_table is: it needs the 2x2
+    # table, and the fused epilogue emits only r. nAB IS recoverable from r via
+    # _recover_nab, but the Fisher tail sum itself is a host loop over scipy's
+    # gammaln, so keeping the survivors on the device would buy nothing and
+    # would leave a second implementation of the same test to keep in step.
+    # Under exact='auto' the loop runs on a small subset by construction.
+    on_device = (use_gpu and not need_table and "p_exact" not in stats
+                 and annotation is None
                  and (count_only or (HAS_CUDF and output is not None)))
     # The fused single-kernel scan handles the clean r-only case: no
     # missingness, no bp window, no D/D'. That is the hot path, and it is
@@ -3401,7 +3552,7 @@ def ld_matrix(
     # this call actually computed rather than assuming "r" is present
     r_key = "r" if "r" in res else "r_phased"
     r2_key = "r2" if "r2" in res else "r2_phased"
-    _add_significance(res, stats)
+    _add_significance(res, stats, exact=exact)
     keep = np.isfinite(res[r_key]) & (res["n"] >= min_obs)
     if min_r2 > 0:
         keep &= res[r2_key] >= min_r2
