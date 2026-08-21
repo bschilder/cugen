@@ -1,6 +1,9 @@
 """cugen.ld - GPU linkage disequilibrium from packed genotypes.
 
-    ld_matrix(...)    signed r, r^2, signed r^2, D, D'     (alias: cg.r2)
+    ld_matrix(...)    signed r, r^2, signed r^2, D, D', phased variants,
+                      and significance: chi2, -log10(p), an exact conditional
+                      test, Bonferroni/BH-FDR filtering and inflation control
+                      (alias: cg.r2; CLI: cugen ld)
     ld_prune(...)     prune to approximate linkage equilibrium  (alias:
                       cg.prune). plink2 --indep-pairwise parity. Same greedy
                       algorithm as ld_clump, ranked by allele frequency rather
@@ -64,6 +67,42 @@ does not build on read_to_gpu(), which maps missing -> dosage 0; that is the
 failure mode fixed in 85ff1b0 (complete-case association kernel, session 52).
 Verified: plink2 --r2-unphased is also pairwise-complete, not mean-imputing.
 
+SIGNIFICANCE
+------------
+The test of no disequilibrium between two biallelic loci is chi2 = N * r^2 with
+1 df -- Park (2019) eq. 1 writes it as 2n D^2 / (pA qA pB qB), the same thing.
+N counts GAMETES for the phased statistics and INDIVIDUALS for the composite
+ones, which is the factor of two between gametic and composite LD; N_OBS
+already carries the right one on every path.
+
+Emitted as -log10(p), never p. p underflows float64 at chi2 ~ 1450 and float32
+at chi2 ~ 170, and chi2 = N_OBS * r^2, so at 1000 Genomes size (N_hap = 5008)
+float32 dies at r^2 = 0.034 and float64 at r^2 = 0.29. A P column would read as
+a flat zero for essentially every linked pair genome-wide.
+
+Filtering by p costs nothing. With no missingness every pair shares one N, so
+chi2 is strictly monotone in r^2 and a p-cut IS an r^2-cut: max_p is converted
+to min_r2 and handed to the filter the kernel already applies. The number of
+tests likewise needs no pass over the data -- it is _count_pairs, closed form
+from the row count and the window -- so Bonferroni and BH-FDR are affordable at
+genome scale. BH runs in -log10(p) space because at m = 1e14 the thresholds are
+around 1e-16 and the p-values are unrepresentable.
+
+exact= adds a two-sided Fisher test on the 2x2 haplotype table (hap2bit only).
+This IS the exact permutation p-value, not an approximation to it: permuting
+haplotype labels leaves both allele counts fixed, so the permutation null of the
+table is the hypergeometric with those margins. Koch (2013) Monte-Carlo sampled
+that distribution for ~34,000 CPU-hours. exact='auto' fires only where the
+minimum expected cell count is under 5, which bounds the tail sum by
+sqrt(5N) ~ 158 terms at 1000 Genomes size -- the pairs that need it are the
+pairs where it is cheap.
+
+lambda_gc is off by default and matters on real cohorts. Per-pair p assumes
+independent haplotypes, so structure and cryptic relatedness make it
+anti-conservative. Measured here on two subpopulations differing by dAF = 0.6
+with no gametic LD anywhere in the data: lambda = 920, and all 7,140 pairs look
+genome-wide significant on raw p. See the lambda_gc tests.
+
 SIGN
 ----
 r is signed relative to the ALT allele at both variants, consistent with
@@ -109,6 +148,23 @@ open discrepancy rather than a fault on either side. If you need
 plink2-identical D', treat this as a known 0.005% divergence; r and r^2 carry
 no such caveat. See test_cubic_picks_the_global_maximum_likelihood_root.
 
+The significance layer has NO plink2 counterpart to compare against: plink2
+emits no LD p-values (the author planned {chi-square, df, p-value} columns for
+--r2 and never shipped them). It is validated against scipy instead, which is a
+genuinely different implementation:
+
+    -log10(p) vs log(2) + log_ndtr(-sqrt(chi2))     < 1e-6 over chi2 in
+                                                      [0.5, 1e7]
+    exact test vs scipy.stats.fisher_exact          < 1e-4, 40+ pairs
+    exact test vs enumerated permutation null       < 1e-12
+    BH-FDR vs a textbook rank-walk implementation   exact agreement
+    lambda_gc on 1e5 true chi2_1df draws            1.0022
+    nAB recovered from float32 r                    0 wrong of 250+ at N=500
+
+Note that scipy.stats.chi2.logsf is NOT usable as an oracle: it computes
+log(sf()) and returns inf above chi2 ~ 1450, which is the regime the p-value
+helper exists to serve.
+
 References
 ----------
 Each was checked against the paper before the method went into the code.
@@ -127,6 +183,28 @@ Gaunt, Rodriguez & Day (2007) BMC Bioinf 8:428  CubeX exact cubic (production)
     https://doi.org/10.1186/1471-2105-8-428
 Chang et al. (2015) GigaScience 4:7             PLINK, behavioural reference
     https://pubmed.ncbi.nlm.nih.gov/25722852/
+Park (2019) Sci Rep 9:11380                     chi2 = 2n D^2/(pA qA pB qB),
+    https://doi.org/10.1038/s41598-019-47832-y  1 df; FDR < 0.05; and the
+                                                argument for chi2 over Fisher
+                                                on both calibration and cost
+Koch, Ristroph & Kirkpatrick (2013)             permutation LRLD -- the method
+    PLoS ONE 8:e80754                           the exact test replaces
+    https://doi.org/10.1371/journal.pone.0080754
+Zaykin, Meng & Weir (2008) Genetics 180:533     n(k-1)(m-1)/(km) R^2 ~ chi2;
+    https://pmc.ncbi.nlm.nih.gov/articles/PMC2535703/  composite LD is robust
+                                                to single-locus HWE departure
+Devlin & Roeder (1999) Biometrics 55(4):997     genomic control; lambda =
+    https://pubmed.ncbi.nlm.nih.gov/11315092/   median(chi2)/0.4549364
+Yang et al. (2011) AJHG 88(1):76-82             GCTA standardised GRM
+    https://doi.org/10.1016/j.ajhg.2010.11.011  (cugen.popstruct.grm)
+
+NOT read, and so NOT implemented: Mangin et al. (2012) Heredity 108:285-291,
+r^2_S / r^2_V / r^2_VS -- LD corrected for structure and relatedness. Paywalled
+and unavailable at the time of writing. The LDcorSV signature
+Measure.R2V(biloci, V, na.presence, V_inv) suggests a V^-1-weighted GLS
+correlation, which would reduce to whitening the planes once and reusing this
+module's epilogue unchanged -- but that is a hypothesis, not a finding, and the
+rule at the head of this list applies.
 """
 from __future__ import annotations
 
