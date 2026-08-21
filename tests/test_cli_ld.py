@@ -96,3 +96,12 @@ def test_ld_help_does_not_import_cupy():
     r = subprocess.run([sys.executable, "-c", code], capture_output=True,
                        text=True)
     assert r.stdout.strip().endswith("False"), r.stdout + r.stderr
+
+
+def test_ld_lambda_gc_flag_reports_the_inflation_factor(panel, tmp_path, capsys):
+    out = tmp_path / "lam.tsv"
+    main(["ld", panel, "--out", str(out), "--stats", "r2,p",
+          "--lambda-gc"] + CPU)
+    assert "lambda_gc" in capsys.readouterr().out
+    df = pd.read_csv(out, sep="\t")
+    assert "NEG_LOG10_P_ADJ" in df.columns

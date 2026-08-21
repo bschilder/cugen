@@ -68,6 +68,9 @@ def _add_ld(sp):
     p.add_argument("--exact", choices=("never", "auto", "always"),
                    default="never",
                    help="Fisher exact conditional test; hap2bit input only")
+    p.add_argument("--lambda-gc", action="store_true",
+                   help="estimate the inflation factor and add adjusted "
+                        "columns; structure makes raw p anti-conservative")
     p.add_argument("--maf-min", type=float, default=0.0)
     p.add_argument("--annotation", default=None,
                    help="variant annotation table, for POS/ID and --window-kb")
@@ -179,6 +182,7 @@ def _run_ld(args):
         correction=args.correction,
         alpha=args.alpha,
         exact=args.exact,
+        lambda_gc=args.lambda_gc,
         maf_min=args.maf_min,
         annotation=args.annotation,
         tile_size=args.tile_size,

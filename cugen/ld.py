@@ -174,18 +174,22 @@ EPS = 1e-12
 # deliberately dosage-only, so adding a phased statistic here never changes
 # the result of an existing call.
 _STATS = ("r", "r2", "r2_signed", "d", "dp", "r_phased", "r2_phased",
-          "d_phased", "dp_phased", "r2_phased_em", "chi2", "p", "p_exact")
+          "d_phased", "dp_phased", "r2_phased_em",
+          "chi2", "p", "p_exact", "chi2_adj", "p_adj")
 _DEFAULT_STATS = ("r", "r2", "r2_signed", "d", "dp")
 _STAT_COL = {"r": "R", "r2": "R2", "r2_signed": "R2_SIGNED", "d": "D", "dp": "DP",
              "r_phased": "R_PHASED", "r2_phased": "R2_PHASED",
              "d_phased": "D_PHASED", "dp_phased": "DP_PHASED",
              "r2_phased_em": "R2_PHASED_EM",
              "chi2": "CHI2", "p": "NEG_LOG10_P",
-             "p_exact": "NEG_LOG10_P_EXACT"}
+             "p_exact": "NEG_LOG10_P_EXACT",
+             "chi2_adj": "CHI2_ADJ", "p_adj": "NEG_LOG10_P_ADJ"}
 # The significance pair. Derived from whichever correlation the path computed
 # and from N_OBS, so they cost no extra passes over the data. "p" emits
 # -log10(p), not p -- see _neglog10_chi2_1df for why p itself is unusable.
-_SIG_STATS = frozenset(("chi2", "p", "p_exact"))
+_SIG_STATS = frozenset(("chi2", "p", "p_exact", "chi2_adj", "p_adj"))
+# median of chi-square with 1 df; the denominator of the genomic-control ratio
+_CHI2_1DF_MEDIAN = 0.4549364
 # p_exact conditions on the 2x2 HAPLOTYPE table, which dosage data does not
 # carry -- unlike chi2/p it is phased-only even though it is not a _PHASED_STATS
 # member (those name specific LD estimators; this names a test of any of them).
@@ -737,6 +741,46 @@ def _recover_nab(r, nA, nB, N):
     nB = np.asarray(nB, dtype=np.float64)
     den = np.sqrt(nA * (N - nA) * nB * (N - nB))
     return np.rint((r * den + nA * nB) / float(N)).astype(np.int64)
+
+
+def _lambda_gc(chi2, separation=None, min_null=100):
+    """Genomic-control inflation factor for the LD test statistic.
+
+    lambda = median(chi2) / median(chi2_1df), the genomic-control ratio (Devlin
+    & Roeder 1999) applied to an LD test rather than an association test. Above
+    1 means the per-pair test is anti-conservative, which is what population
+    structure and cryptic relatedness do to LD: they correlate variants that are
+    in no gametic disequilibrium at all. Park (2019) fig. 1C/D models the
+    effect and Koch (2013) flags it; neither offers a correction, and I could
+    not find lambda applied to LD statistics anywhere in the literature.
+
+    Assumes most of the tests it is given are null. For an unwindowed scan that
+    is reasonable -- almost every pair on a chromosome is far apart -- but false
+    for a tight window, where every pair is expected to be linked. So the median
+    is taken over the more DISTANT half of the pairs by index separation
+    whenever that leaves at least ``min_null`` of them, keeping the close,
+    genuinely-linked pairs out of it.
+
+    Separation in variant index is a deliberately crude proxy for distance. The
+    point is to prefer far pairs to near ones, not to model recombination.
+
+    MUST be called before any significance filtering. Filtering selects the
+    tail, and the median of a selected tail says nothing about the null.
+    """
+    chi2 = np.asarray(chi2, dtype=np.float64)
+    ok = np.isfinite(chi2)
+    if separation is not None and len(separation) == chi2.size:
+        sep = np.asarray(separation)[ok]
+    else:
+        sep = None
+    chi2 = chi2[ok]
+    if chi2.size == 0:
+        return float("nan")
+    if sep is not None:
+        far = sep >= np.median(sep)
+        if far.sum() >= min_null:
+            chi2 = chi2[far]
+    return float(np.median(chi2) / _CHI2_1DF_MEDIAN)
 
 
 def _bh_threshold_neglog10p(neglog10p, m, alpha):
@@ -3130,6 +3174,7 @@ def ld_matrix(
     correction: Optional[str] = None,
     alpha: float = 0.05,
     exact: str = "never",
+    lambda_gc: bool = False,
     stats: Sequence[str] = _DEFAULT_STATS,
     dprime_method: str = "phased",
     sign_reference: str = "alt",
@@ -3199,6 +3244,16 @@ def ld_matrix(
         5 and leaves NaN elsewhere, meaning the asymptotic p-value is the one to
         use for that pair. Selecting ``'p_exact'`` in ``stats`` implies
         ``'auto'``. Forces the reference path, as ``d``/``dp`` already do.
+    lambda_gc
+        Estimate the genomic-control inflation factor and add ``CHI2_ADJ`` /
+        ``NEG_LOG10_P_ADJ`` beside the raw columns, with lambda itself in
+        ``df.attrs['lambda_gc']``. Off by default. Per-pair p-values assume
+        independent haplotypes, so population structure and cryptic relatedness
+        make them anti-conservative: on two subpopulations differing by
+        dAF = 0.6, lambda reaches ~920 and every pair looks genome-wide
+        significant despite no gametic LD existing at all. Estimated over the
+        more distant half of pairs and always before any filtering, since
+        filtering selects the tail. Forces the reference path.
     stats
         Any of ``r, r2, r2_signed, d, dp`` (dosage), ``r_phased, r2_phased,
         d_phased, dp_phased`` (true phase, hap2bit input), ``r2_phased_em`` (EM
@@ -3267,6 +3322,10 @@ def ld_matrix(
             "Add it: stats=(..., 'p').")
     if not (0.0 < float(alpha) <= 1.0):
         raise ValueError(f"alpha must be in (0, 1], got {alpha!r}")
+    if lambda_gc and "p" not in stats:
+        raise ValueError(
+            "lambda_gc adjusts the p-value, so 'p' must be in stats. "
+            "Add it: stats=(..., 'p').")
     if exact not in _EXACT_MODES:
         raise ValueError(f"exact must be one of {_EXACT_MODES}, got {exact!r}")
     # exact= and stats=('p_exact',) are two doors to the same room: either one
@@ -3274,6 +3333,9 @@ def ld_matrix(
     stats = tuple(stats)
     if exact != "never" and "p_exact" not in stats:
         stats = stats + ("p_exact",)
+    if lambda_gc:
+        stats = stats + tuple(c for c in ("chi2_adj", "p_adj")
+                              if c not in stats)
     elif exact == "never" and "p_exact" in stats:
         exact = "auto"
 
@@ -3424,7 +3486,7 @@ def ld_matrix(
     # would leave a second implementation of the same test to keep in step.
     # Under exact='auto' the loop runs on a small subset by construction.
     on_device = (use_gpu and not need_table and "p_exact" not in stats
-                 and annotation is None
+                 and not lambda_gc and annotation is None
                  and (count_only or (HAS_CUDF and output is not None)))
     # The fused single-kernel scan handles the clean r-only case: no
     # missingness, no bp window, no D/D'. That is the hot path, and it is
@@ -3553,6 +3615,17 @@ def ld_matrix(
     r_key = "r" if "r" in res else "r_phased"
     r2_key = "r2" if "r2" in res else "r2_phased"
     _add_significance(res, stats, exact=exact)
+    lam = None
+    if lambda_gc:
+        # Before `keep` is applied: filtering selects the tail, and the median
+        # of a selected tail carries no information about the null.
+        lam = _lambda_gc(res["chi2"],
+                         pairs_local[:, 1] - pairs_local[:, 0])
+        res["chi2_adj"] = res["chi2"] / lam
+        res["p_adj"] = _neglog10_chi2_1df(res["chi2_adj"])
+        if verbose:
+            print(f"cugen.ld: lambda_gc = {lam:.4f} over "
+                  f"{len(res['chi2']):,} pairs")
     keep = np.isfinite(res[r_key]) & (res["n"] >= min_obs)
     if min_r2 > 0:
         keep &= res[r2_key] >= min_r2
@@ -3584,6 +3657,9 @@ def ld_matrix(
         print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs planned, "
               f"{len(df):,} emitted  (backend={'gpu' if use_gpu else 'numpy'}, "
               f"dprime={dprime_method}, sign={sign_reference})")
+    if lam is not None:
+        # last, because iloc/astype/concat do not reliably carry attrs
+        df.attrs["lambda_gc"] = lam
     if output is not None:
         _write_df(df, str(output))
     return df

@@ -508,3 +508,89 @@ def test_exact_column_agrees_whether_nab_is_counted_or_reconstructed(tmp_path):
                                  np.array([nB]), N)
             assert (L._fisher_neglog10p_2x2(nAB, nA, nB, N)
                     == L._fisher_neglog10p_2x2(int(rec[0]), nA, nB, N))
+
+
+# ------------------------------------------------------- inflation control
+# Per-pair p assumes independent haplotypes. Population structure and cryptic
+# relatedness inflate LD genome-wide, so raw p is anti-conservative on real
+# cohorts -- both Park (2019) and Koch (2013) flag this. lambda_gc is the LD
+# analogue of GWAS genomic control: median(chi2) / 0.4549364 over a null set.
+
+def test_lambda_gc_is_about_one_on_unlinked_data(tmp_path):
+    """Independent variants ARE the null, so the estimate must land near 1.
+
+    This is the calibration check: if it does not, every inflation-adjusted
+    p-value downstream is scaled by a wrong constant.
+    """
+    rng = np.random.default_rng(31)
+    n, p_var = 4000, 120
+    dos = rng.integers(0, 3, size=(n, p_var)).astype(np.uint8)
+    path = tmp_path / "null.cugen"
+    write_cugen(str(path), dos)
+    df = L.ld_matrix(str(path), stats=("r2", "p"), lambda_gc=True, **CPU)
+    lam = df.attrs["lambda_gc"]
+    assert 0.9 < lam < 1.1, f"lambda on unlinked data is {lam}, expected ~1"
+
+
+def test_lambda_gc_detects_inflation_from_structure(tmp_path):
+    """Two diverged subpopulations pooled together inflate LD everywhere.
+
+    This is exactly the confound Park (2019) fig. 1C/D models, and the reason
+    raw per-pair p-values cannot be trusted on a structured cohort.
+    """
+    rng = np.random.default_rng(32)
+    n, p_var = 2000, 120
+    half = n // 2
+    dos = np.empty((n, p_var), dtype=np.uint8)
+    for v in range(p_var):
+        f1, f2 = 0.15, 0.75              # large allele-frequency divergence
+        dos[:half, v] = (rng.random(half) < f1) + (rng.random(half) < f1)
+        dos[half:, v] = (rng.random(n - half) < f2) + (rng.random(n - half) < f2)
+    path = tmp_path / "struct.cugen"
+    write_cugen(str(path), dos)
+    df = L.ld_matrix(str(path), stats=("r2", "p"), lambda_gc=True, **CPU)
+    lam = df.attrs["lambda_gc"]
+    assert lam > 100.0, f"structure went undetected: lambda={lam}"
+
+    # Ground truth: every variant was drawn independently within each
+    # subpopulation, so there is NO gametic LD anywhere here. Every pair the
+    # raw test calls significant is a false positive, and the count is the
+    # whole argument for having inflation control at all.
+    raw = df["NEG_LOG10_P"].to_numpy(np.float64)
+    adj = df["NEG_LOG10_P_ADJ"].to_numpy(np.float64)
+    gws = 7.3                                    # p < 5e-8
+    assert (raw > gws).all(), (
+        "fixture is not confounded enough to be worth correcting")
+    assert (adj > gws).sum() == 0, (
+        f"{(adj > gws).sum()} false positives survived the lambda adjustment")
+
+
+def test_lambda_gc_adds_adjusted_columns_and_keeps_the_raw_ones(tmp_path):
+    rng = np.random.default_rng(33)
+    dos = rng.integers(0, 3, size=(500, 40)).astype(np.uint8)
+    path = tmp_path / "x.cugen"
+    write_cugen(str(path), dos)
+    df = L.ld_matrix(str(path), stats=("r2", "chi2", "p"), lambda_gc=True, **CPU)
+    for col in ("CHI2", "NEG_LOG10_P", "CHI2_ADJ", "NEG_LOG10_P_ADJ"):
+        assert col in df.columns, f"missing {col}"
+    lam = df.attrs["lambda_gc"]
+    np.testing.assert_allclose(df["CHI2_ADJ"].to_numpy(np.float64),
+                               df["CHI2"].to_numpy(np.float64) / lam, rtol=1e-5)
+    # adjustment can only ever make a p-value less significant when lambda > 1
+    if lam > 1.0:
+        assert (df["NEG_LOG10_P_ADJ"] <= df["NEG_LOG10_P"] + 1e-6).all()
+
+
+def test_lambda_gc_is_off_by_default(tmp_path):
+    rng = np.random.default_rng(34)
+    dos = rng.integers(0, 3, size=(300, 20)).astype(np.uint8)
+    path = tmp_path / "y.cugen"
+    write_cugen(str(path), dos)
+    df = L.ld_matrix(str(path), stats=("r2", "p"), **CPU)
+    assert "CHI2_ADJ" not in df.columns
+    assert "lambda_gc" not in df.attrs
+
+
+def test_lambda_gc_requires_the_p_statistic(small_cugen):
+    with pytest.raises(ValueError, match="lambda_gc"):
+        L.ld_matrix(small_cugen[0], stats=("r2",), lambda_gc=True, **CPU)
