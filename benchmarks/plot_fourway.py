@@ -40,6 +40,12 @@ SERIES = {
  "qldgpu":    ("qLD-GPU — phased r² — 1×A100 (OpenCL)",                           "qLD-GPU\n1×A100",     "#5b2d8e", "d-"),
  "qldblis8":  ("qLD-BLIS — phased r² — c7a.32xlarge, 8 thr",                      "qLD-BLIS\n8thr",      "#a07cc9", "v-"),
  "qldblis128":("qLD-BLIS — phased r² — c7a.32xlarge, 128 thr",                    "qLD-BLIS\n128thr",    "#a07cc9", "v--"),
+ # Ratio series describe CUGEN's advantage, so they are green like every other
+ # cugen series; the denominator is carried by marker and linestyle, not hue.
+ "r_ph13":    ("cugen ÷ plink2 — phased r² — 13.6-core cap",                      "",                    "#0b6b3a", "o-"),
+ "r_un13":    ("cugen ÷ plink2 — unphased r² — 13.6-core cap",                    "",                    "#3fae6d", "^--"),
+ "r_un128":   ("cugen ÷ plink2 — unphased r² — c7a (128c), 128 thr",              "",                    "#8ed6a8", "s-."),
+ "r_un32":    ("cugen ÷ plink2 — unphased r² — c7a (128c), 32 thr",               "",                    "#5fbf85", "D:"),
 }
 lab  = lambda k: SERIES[k][0]
 tick = lambda k: SERIES[k][1]
@@ -66,21 +72,36 @@ D_pl32t  = [0.023, 0.036, 0.107, 0.342, 1.260, 10.355, 31.177, 75.825]
 D_pl13   = [0.070, 0.111, 0.318, 1.048, 5.951, 59.095, 230.022, 550.081]
 D_qldgpu = [0.416, 0.471, 0.945, 2.329, 9.849, 34.995, 27.895, 73.644]
 
-fig, ax = plt.subplots(figsize=(8.8, 5.4))
+D_qblis = [0.040, 0.109, 0.493, 1.934, 8.195, 35.545, 72.575, 86.143]
+
+fig, (ax, ax2) = plt.subplots(1, 2, figsize=(13.2, 5.4))
 for k, d in (("cugen", D_cugen), ("pl128", D_pl128), ("pl32t", D_pl32t),
-             ("pl13", D_pl13), ("qldgpu", D_qldgpu)):
+             ("pl13", D_pl13), ("qldgpu", D_qldgpu), ("qldblis8", D_qblis)):
     draw(ax, k, P, d)
 draw(ax, "pl32box", [170949], [89.41], ms=8)
-draw(ax, "qldblis8", [170949], [85.77], ms=8)
 ax.set(xscale="log", yscale="log", xlabel="variants (p), all-pairs",
        ylabel="wall time (s)",
        title="Variant axis — 1000G chr22 MAF≥0.01, n=2,504, r²≥0.2")
-box(ax, "full chr22 = 1.46e10 pairs\n"
-        "cugen 1.734 s  vs  plink2 128c 41.47 s  = 23.9×\n"
-        "all three emit 10,517,635 rows\n"
-        "(plink2 128c measured twice: 41.47 / 42.21 s)")
-ax.legend(fontsize=7.2, loc="upper center", bbox_to_anchor=(0.5, -0.13),
-          ncol=2, frameon=False)
+ax.annotate("full chr22 = 1.46e10 pairs\n"
+            "cugen 1.734 s  vs  plink2 128c 41.47 s  = 23.9×\n"
+            "both emit 10,517,635 rows",
+            xy=(0.98, 0.03), xycoords="axes fraction", va="bottom", ha="right",
+            fontsize=7.6, bbox=dict(boxstyle="round,pad=0.4", fc="white",
+                                    ec="0.75", alpha=0.95))
+ax.legend(fontsize=6.8, loc="upper left")
+
+# speedup panel -- the thing the wall-time panel does not show directly
+for k, d in (("r_un128", D_pl128), ("r_un32", D_pl32t), ("r_un13", D_pl13)):
+    draw(ax2, k, P, [a / b for a, b in zip(d, D_cugen)], ms=5)
+ax2.axhline(1, color="0.6", ls=":", lw=1)
+ax2.text(1050, 1.12, "parity", fontsize=7, color="0.45")
+for x, y in zip(P, [a / b for a, b in zip(D_pl128, D_cugen)]):
+    ax2.annotate(f"{y:.1f}×", (x, y), textcoords="offset points", xytext=(0, 7),
+                 ha="center", fontsize=7)
+ax2.set(xscale="log", yscale="log", xlabel="variants (p), all-pairs",
+        ylabel="cugen speedup  (plink2 ÷ cugen)",
+        title="cugen speedup vs each plink2 configuration")
+ax2.legend(fontsize=6.8, loc="upper left")
 fig.tight_layout(); fig.savefig(f"{OUT}/fig1_variant_axis.png",
                                 bbox_inches="tight", pad_inches=0.3); plt.close(fig)
 
@@ -128,12 +149,9 @@ draw(b1, "pl13_ph", PP, P_ph, ms=6)
 b1.set(xscale="log", yscale="log", xlabel="variants (p)", ylabel="wall time (s)",
        title="Phased LD — 19,888/19,888 pairs agree")
 b1.legend(fontsize=7.2, loc="upper left")
-b2.plot(PP, [p / c for p, c in zip(P_ph, C_ph)], "o-", color=col("cugen_ph"),
-        lw=2, ms=6, label="cugen ÷ plink2 — phased r² — 13.6-core cap")
-b2.plot(P, [p / c for p, c in zip(D_pl13, D_cugen)], "^-", color=col("pl13"),
-        lw=1.7, ms=5, label="cugen ÷ plink2 — unphased r² — 13.6-core cap")
-b2.plot(P, [p / c for p, c in zip(D_pl128, D_cugen)], "s-", color=col("pl128"),
-        lw=1.7, ms=5, label="cugen ÷ plink2 — unphased r² — 128c, 128 thr")
+draw(b2, "r_ph13",  PP, [p / c for p, c in zip(P_ph, C_ph)], ms=6)
+draw(b2, "r_un13",  P,  [p / c for p, c in zip(D_pl13, D_cugen)], ms=5)
+draw(b2, "r_un128", P,  [p / c for p, c in zip(D_pl128, D_cugen)], ms=5)
 b2.set(xscale="log", yscale="log", xlabel="variants (p)", ylabel="cugen speedup",
        title="plink2 pays per pair for phase")
 b2.legend(fontsize=6.9, loc="upper left")
