@@ -217,9 +217,16 @@ locus without scanning unrelated variants.
 | `--freq`        |                               | `freq`             |
 | `--glm`         | `linear_regression_rows`      | `glm`              |
 | `--score`       |                               | `score`            |
-| `--clump`       |                               | `clump` *(v0.2)*   |
-| `--king`        | `realized_relationship_matrix`| `make_king` *(v0.2)* |
+| `--r2` / `--ld` |                               | `r2` / `ld_matrix` |
+| `--clump`       |                               | `clump`            |
+| `--indep-pairwise` |                            | `prune`            |
+| `--make-grm`    | `realized_relationship_matrix`| `make_grm` / `grm` |
+| `--king`        |                               | `make_king` *(v0.2)* |
 |                 | `hwe_normalized_pca`          | `pca` *(v0.2)*     |
+
+LD significance testing (`chi2`, `p`, exact conditional, Bonferroni/BH-FDR,
+inflation control) has no PLINK equivalent -- plink2 emits no LD p-values.
+See `ld_matrix` and `cugen ld --help`.
 
 ## Workflow JSON
 

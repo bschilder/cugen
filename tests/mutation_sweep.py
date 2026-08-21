@@ -9,6 +9,7 @@ an equivalent mutant -- d[0] is already 0, so tau[0] is already 0 and the line
 cannot change any output. Listing it would make the sweep permanently red for a
 behaviour that does not exist.
 """
+import os
 import pathlib
 import shutil
 import subprocess
@@ -17,6 +18,16 @@ import sys
 ROOT = pathlib.Path("/Users/bschilder/code/cugen")
 
 MUTATIONS = [
+    # ---- GRM ----
+    ('GRM standardises by p(1-p), not 2p(1-p)', 'cugen/popstruct.py',
+     """        z = xp.where(obs, (x - two_p) / xp.sqrt(two_p * (1.0 - freq[:, None])),""",
+     """        z = xp.where(obs, (x - two_p) / xp.sqrt(freq[:, None] * (1.0 - freq[:, None])),""", "tests/test_popstruct.py"),
+    ('GRM allele freq forgets the factor of two', 'cugen/popstruct.py',
+     """            freq = x.sum(axis=1) / (2.0 * xp.maximum(n_obs, 1))""",
+     """            freq = x.sum(axis=1) / xp.maximum(n_obs, 1)""", "tests/test_popstruct.py"),
+    ('GRM 2-bit unpack loses the big-endian order', 'cugen/popstruct.py',
+     """_SHIFTS = np.array([6, 4, 2, 0], dtype=np.uint8)""",
+     """_SHIFTS = np.array([0, 2, 4, 6], dtype=np.uint8)""", "tests/test_popstruct.py"),
     # ---- LD significance ----
     ('nAB reconstruction truncates instead of rounding', 'cugen/ld.py',
      """    return np.rint((r * den + nA * nB) / float(N)).astype(np.int64)""",
@@ -103,10 +114,23 @@ DEFAULT_TARGET = "tests/test_impute.py"
 
 
 def run(target=DEFAULT_TARGET):
+    # PYTHONDONTWRITEBYTECODE is load-bearing, not tidiness. Several mutations
+    # here swap a string for one of the SAME LENGTH (e.g. [6, 4, 2, 0] ->
+    # [0, 2, 4, 6]). Restoring the original then leaves a file with identical
+    # size and a near-identical mtime, so CPython happily reuses the .pyc it
+    # compiled from the MUTATED source -- and the next ordinary `pytest` run
+    # reports failures that are not in the working tree. That cost real
+    # debugging time once; do not remove this.
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     r = subprocess.run([".venv/bin/python", "-m", "pytest", target,
                         "-q", "--no-header", "-p", "no:cacheprovider"],
-                       cwd=ROOT, capture_output=True, text=True)
+                       cwd=ROOT, capture_output=True, text=True, env=env)
     return (r.stdout + r.stderr).strip().splitlines()[-1]
+
+
+def _drop_pycache():
+    for d in ROOT.rglob("__pycache__"):
+        shutil.rmtree(d, ignore_errors=True)
 
 
 caught = missed = 0
@@ -119,8 +143,10 @@ for entry in MUTATIONS:
         print(f"  {desc:48s} !! PATTERN NOT FOUND")
         continue
     f.write_text(bak.replace(frm, to, 1))
+    _drop_pycache()
     line = run(target)
     f.write_text(bak)
+    _drop_pycache()
     ok = "failed" in line
     caught += ok
     missed += not ok
