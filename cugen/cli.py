@@ -4,6 +4,7 @@ Behaviour:
   cugen config.json                run ultra_workflow on the JSON
   cugen info chr22.cugen           print file metadata
   cugen freq chr22.cugen --out X   dump per-variant (mu_x, sxx, maf)
+  cugen ld chr22.cugen --out X     pairwise LD, with significance filtering
   cugen prep --pheno height ...     build a residualised cohort NPZ
   cugen workflow --example out.json   write a fully-populated example JSON
   cugen gwas --cugen-dir … --pheno …  shortcut: ultralasso_gwas one-shot
@@ -38,6 +39,43 @@ def _add_freq(sp):
     p.add_argument("cugen_file")
     p.add_argument("--out", required=False,
                    help="write TSV here; default = stdout")
+    return p
+
+
+def _add_ld(sp):
+    p = sp.add_parser(
+        "ld", help="pairwise LD with optional significance filtering")
+    p.add_argument("cugen_file")
+    p.add_argument("--out", required=True,
+                   help="write here; .tsv/.csv/.parquet/.feather by extension")
+    p.add_argument("--stats", default="r2,p",
+                   help="comma-separated (default: r2,p). Any of r,r2,"
+                        "r2_signed,d,dp,r_phased,r2_phased,d_phased,dp_phased,"
+                        "r2_phased_em,chi2,p,p_exact")
+    p.add_argument("--window", type=int, default=None,
+                   help="max distance in VARIANT index between paired variants")
+    p.add_argument("--window-kb", type=float, default=None,
+                   help="max distance in kb; needs --annotation")
+    p.add_argument("--min-r2", type=float, default=0.0,
+                   help="drop pairs below this r^2 (plink --ld-window-r2)")
+    p.add_argument("--max-p", type=float, default=None,
+                   help="drop pairs above this p-value; mutually exclusive "
+                        "with --min-r2")
+    p.add_argument("--correction", choices=("bonferroni", "fdr"), default=None,
+                   help="derive the threshold from --alpha and the test count")
+    p.add_argument("--alpha", type=float, default=0.05,
+                   help="FWER for bonferroni, or FDR for fdr (default 0.05)")
+    p.add_argument("--exact", choices=("never", "auto", "always"),
+                   default="never",
+                   help="Fisher exact conditional test; hap2bit input only")
+    p.add_argument("--maf-min", type=float, default=0.0)
+    p.add_argument("--annotation", default=None,
+                   help="variant annotation table, for POS/ID and --window-kb")
+    p.add_argument("--tile-size", type=int, default=None)
+    p.add_argument("--backend", choices=("auto", "gpu", "numpy"),
+                   default="auto")
+    p.add_argument("--device", type=int, default=0)
+    p.add_argument("--quiet", action="store_true")
     return p
 
 
@@ -127,6 +165,30 @@ def _run_freq(args):
               f"min={res['sxx'].min():.2f}  max={res['sxx'].max():.2f}")
 
 
+def _run_ld(args):
+    # ld_matrix pulls in CuPy, so import it here rather than at module scope --
+    # `cugen ld --help` must not need a GPU stack to print usage.
+    from .ld import ld_matrix  # noqa: PLC0415
+    ld_matrix(
+        args.cugen_file,
+        stats=tuple(s.strip() for s in args.stats.split(",") if s.strip()),
+        window=args.window,
+        window_kb=args.window_kb,
+        min_r2=args.min_r2,
+        max_p=args.max_p,
+        correction=args.correction,
+        alpha=args.alpha,
+        exact=args.exact,
+        maf_min=args.maf_min,
+        annotation=args.annotation,
+        tile_size=args.tile_size,
+        backend=args.backend,
+        device=args.device,
+        output=args.out,
+        verbose=not args.quiet,
+    )
+
+
 def _run_workflow(args):
     from .config import (load_and_validate_config, write_example_config)
     from .workflow import ultra_workflow
@@ -192,6 +254,7 @@ def main(argv=None):
     _add_prep(subparsers)
     _add_info(subparsers)
     _add_freq(subparsers)
+    _add_ld(subparsers)
     _add_workflow(subparsers)
     _add_gwas(subparsers)
     _add_qc(subparsers)
@@ -214,6 +277,7 @@ def main(argv=None):
         "prep": _run_prep,
         "info": _run_info,
         "freq": _run_freq,
+        "ld": _run_ld,
         "workflow": _run_workflow,
         "gwas": _run_gwas,
         "qc": _run_qc,
