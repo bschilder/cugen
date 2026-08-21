@@ -130,6 +130,7 @@ Chang et al. (2015) GigaScience 4:7             PLINK, behavioural reference
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
@@ -173,12 +174,17 @@ EPS = 1e-12
 # deliberately dosage-only, so adding a phased statistic here never changes
 # the result of an existing call.
 _STATS = ("r", "r2", "r2_signed", "d", "dp", "r_phased", "r2_phased",
-          "d_phased", "dp_phased", "r2_phased_em")
+          "d_phased", "dp_phased", "r2_phased_em", "chi2", "p")
 _DEFAULT_STATS = ("r", "r2", "r2_signed", "d", "dp")
 _STAT_COL = {"r": "R", "r2": "R2", "r2_signed": "R2_SIGNED", "d": "D", "dp": "DP",
              "r_phased": "R_PHASED", "r2_phased": "R2_PHASED",
              "d_phased": "D_PHASED", "dp_phased": "DP_PHASED",
-             "r2_phased_em": "R2_PHASED_EM"}
+             "r2_phased_em": "R2_PHASED_EM",
+             "chi2": "CHI2", "p": "NEG_LOG10_P"}
+# The significance pair. Derived from whichever correlation the path computed
+# and from N_OBS, so they cost no extra passes over the data. "p" emits
+# -log10(p), not p -- see _neglog10_chi2_1df for why p itself is unusable.
+_SIG_STATS = frozenset(("chi2", "p"))
 # Statistics computed from TRUE haplotype counts, which only a HAP2BIT file
 # carries. Mixing these with the dosage statistics in one call is refused
 # rather than silently served: hap2bit and 2bit share bytes but not meaning
@@ -525,6 +531,98 @@ def _plan_pairs(n_rows: int, positions: Optional[np.ndarray],
         np.concatenate([[0], np.cumsum(counts)[:-1]]), counts)
     j = np.repeat(starts, counts) + offs
     return np.stack([i, j], axis=1), total
+
+
+# chi2 above which the closed-form tail expansion replaces erfc. Below it erfc
+# is exact; above chi2 ~ 1450 erfc underflows to 0 in float64 and -log10 of that
+# is +inf, which is the bug this constant exists to avoid. 400 is chosen well
+# clear of that ceiling (erfc(sqrt(200)) ~ 1e-88) and high enough that the
+# truncated expansion is already accurate to 1e-7 where it takes over -- at a
+# cut of 30 the expansion is only good to 2e-4.
+_NLP_ASYMPTOTIC_FROM = 400.0
+_LN10 = math.log(10.0)
+_HALF_LN_PI = 0.5 * math.log(math.pi)
+
+
+def _erfc_for(xp):
+    """erfc for either numpy or cupy arrays. numpy has no erfc of its own."""
+    if xp is np:
+        from scipy.special import erfc
+        return erfc
+    from cupyx.scipy.special import erfc
+    return erfc
+
+
+def _neglog10_chi2_1df(chi2, xp=np):
+    """``-log10(P(X > chi2))`` for X ~ chi-square with 1 df.
+
+    Returns -log10(p) rather than p because p is not representable. The
+    right-tail p-value underflows float64 at chi2 ~ 1450 and float32 at
+    chi2 ~ 170 -- and chi2 = N_OBS * r^2, so at 1000 Genomes size
+    (N_hap = 5008) float32 dies at r^2 = 0.034 and float64 at r^2 = 0.29. A
+    ``P`` column would therefore read as a flat zero for essentially every
+    linked pair genome-wide. -log10(p) tops out around 8.7e5 and fits float32
+    comfortably.
+
+    Two branches, both evaluated on clamped inputs so neither can produce an
+    inf that ``where`` would then have to discard:
+
+      chi2 <= 400:  -log10(erfc(sqrt(chi2/2))), exact.
+      chi2 >  400:  the asymptotic expansion of erfc. With z = chi2/2,
+                   erfc(sqrt(z)) ~ exp(-z)/sqrt(pi*z) * (1 - 1/(2z) + 3/(4z^2)),
+                   so -ln p ~ z + ln(sqrt(pi*z)) - log1p(-1/(2z) + 3/(4z^2)).
+
+    Measured against log(2) + scipy.special.log_ndtr(-sqrt(chi2)), which is
+    genuinely log-space: max error 1e-7 in -log10(p) units over chi2 in
+    [0.5, 1e7]. Note that scipy.stats.chi2.logsf is NOT a usable oracle here --
+    it computes log(sf()) and so returns inf above chi2 ~ 1450, the very regime
+    this helper exists to serve. Do not use ``1.0 - erf(...)`` instead -- it
+    cancels catastrophically in the tail (see cugen.qc._chi2_p_1df, and the
+    same failure documented for the inverse direction in cugen.assoc).
+    """
+    z = xp.maximum(xp.asarray(chi2, dtype=xp.float64) * 0.5, 0.0)
+    cut = _NLP_ASYMPTOTIC_FROM * 0.5
+    erfc = _erfc_for(xp)
+    small = -xp.log10(erfc(xp.sqrt(xp.minimum(z, cut))))
+    zl = xp.maximum(z, cut)
+    large = (zl + 0.5 * xp.log(zl) + _HALF_LN_PI
+             - xp.log1p(-1.0 / (2.0 * zl) + 3.0 / (4.0 * zl * zl))) / _LN10
+    return xp.where(z <= cut, small, large)
+
+
+def _add_significance(res, stats, xp=np):
+    """Attach ``chi2`` and ``p`` to a result dict, in place.
+
+    The test of no disequilibrium between two biallelic loci is
+
+        chi2 = N * r^2,   1 df
+
+    (Park 2019 eq. 1, which writes it as 2n D^2 / (pA qA pB qB); Weir, Genetic
+    Data Analysis II.) N is the number of sampled GAMETES for phased data and
+    the number of INDIVIDUALS for the composite (unphased) statistic -- the
+    factor of two between gametic and composite LD. ``res["n"]`` already
+    carries the right one on every path: 2*n_samples for hap2bit input,
+    n_samples (or the per-pair co-observed count) for 2bit.
+
+    r^2 is taken from whichever correlation this path computed, matching the
+    resolution the caller does for filtering: dosage ``r2`` if present, else
+    haplotype ``r2_phased``. A call that asks for r2_phased_em gets the dosage
+    r2 and the individual count, which are consistent with each other; the EM
+    haplotype estimate is a different estimator and is not tested here.
+    """
+    if not (_SIG_STATS & set(stats)):
+        return res
+    for key in ("r2", "r2_phased"):
+        if key in res:
+            r2 = res[key]
+            break
+    else:
+        r_key = "r" if "r" in res else "r_phased"
+        r2 = res[r_key] ** 2
+    chi2 = xp.asarray(res["n"], dtype=xp.float64) * r2
+    res["chi2"] = chi2
+    res["p"] = _neglog10_chi2_1df(chi2, xp)
+    return res
 
 
 def _empty_pairs(stats: Sequence[str]) -> pd.DataFrame:
@@ -2658,6 +2756,14 @@ def _assemble_device(pairs_dev, payload, reader, rows, stats, sign_reference,
         g["R_PHASED"] = r.astype(cp.float32)
     if "r2_phased" in stats:
         g["R2_PHASED"] = r2.astype(cp.float32)
+    # chi2 = N_OBS * r2, 1 df. n_dev already holds haplotypes for a phased scan
+    # and individuals for a dosage one (see ld_matrix, where it is built).
+    if _SIG_STATS & set(stats):
+        chi2 = n_dev.astype(cp.float64) * r2
+        if "chi2" in stats:
+            g["CHI2"] = chi2.astype(cp.float32)
+        if "p" in stats:
+            g["NEG_LOG10_P"] = _neglog10_chi2_1df(chi2, cp).astype(cp.float32)
     g["gidx_a"] = gidx_dev[ia]
     g["gidx_b"] = gidx_dev[ib]
     return g
@@ -2952,7 +3058,12 @@ def ld_matrix(
 
     reader = read_cugen(path, device=device)
     want_phased = [s for s in stats if s in _PHASED_STATS]
-    want_dosage = [s for s in stats if s not in _PHASED_STATS]
+    # chi2/p are ENCODING-NEUTRAL: the test is N_OBS * r^2 either way, and the
+    # encoding only decides whether N_OBS counts gametes or individuals. They
+    # must not fall into want_dosage, or asking for them on a hap2bit file
+    # trips the cross-guard below.
+    want_dosage = [s for s in stats
+                   if s not in _PHASED_STATS and s not in _SIG_STATS]
     enc = int(reader.encoding)
     if enc == ENCODING_HAP2BIT:
         if want_dosage:
@@ -3147,6 +3258,7 @@ def ld_matrix(
     # this call actually computed rather than assuming "r" is present
     r_key = "r" if "r" in res else "r_phased"
     r2_key = "r2" if "r2" in res else "r2_phased"
+    _add_significance(res, stats)
     keep = np.isfinite(res[r_key]) & (res["n"] >= min_obs)
     if min_r2 > 0:
         keep &= res[r2_key] >= min_r2
