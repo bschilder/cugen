@@ -50,6 +50,10 @@ def plink2_parity(vcf, cugen_path, out_prefix, n_hap):
     if not shutil_which("plink2"):
         print("  plink2 not on PATH -- skipped")
         return
+    # --make-pgen from a PHASED VCF, never from a .bed. A .bed cannot store
+    # phase, so plink2 --r-phased on bed input EM-estimates haplotype
+    # frequencies and answers a different question -- measured deviation 0.616
+    # against 5.71e-07 for a phased PGEN.
     subprocess.run(["plink2", "--vcf", vcf, "--make-pgen", "--out", out_prefix,
                     "--silent"], check=True)
     subprocess.run(["plink2", "--pfile", out_prefix, "--r-phased",
@@ -68,6 +72,15 @@ def plink2_parity(vcf, cugen_path, out_prefix, n_hap):
     # trap from the other direction (there every ID was ".").
     pl["key"] = list(zip(pl["ID_A"], pl["ID_B"]))
     assert pl["key"].is_unique, "plink2 keys are not unique"
+    # 1000G phase3 IDs are almost all "." -- joining on them there would match
+    # everything and report a spurious agreement rather than an error. The
+    # high-coverage panel used here carries real chr:pos:ref:alt IDs, but that
+    # is a property of the fixture, not of the code, so check it.
+    placeholder = (pl["ID_A"] == ".").mean()
+    assert placeholder < 0.01, (
+        f"{placeholder:.1%} of plink2 variant IDs are '.'; this join would "
+        f"match indiscriminately. Rebuild the PGEN with "
+        f"--set-all-var-ids '@:#:$r:$a'.")
 
     df = L.ld_matrix(cugen_path, stats=("r2_phased", "chi2", "p"), **CPU)
     vid = variant_ids(vcf)
