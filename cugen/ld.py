@@ -659,42 +659,140 @@ def _parse_region(region: str) -> Tuple[str, Optional[int], Optional[int]]:
     return chrom, start, end
 
 
-def _pair_bounds(n_rows: int, positions: Optional[np.ndarray],
-                 window: Optional[int], window_kb: Optional[float]):
-    """Per-row exclusive upper column bound for the upper-triangle scan.
+SCOPES = ("all", "cis", "trans")
 
-    Both window predicates AND together, matching PLINK. Banding by position
-    uses searchsorted so the column extent is O(band), not O(p). Returns
-    (starts, hi) so the pair COUNT can be taken without materialising pairs --
-    at p = 1.1M the materialised list would be ~6e11 entries.
+
+def _chrom_runs(chrom_codes) -> np.ndarray:
+    """Row-block boundaries per chromosome, as an (n_blocks + 1,) edge array.
+
+    cis/trans banding stays a CONTIGUOUS column range only because each
+    chromosome occupies one contiguous run of rows -- which is what a
+    position-sorted .cugen (and merge_cugen's output) gives. If a chromosome
+    appears in two runs the contiguous form would silently drop pairs, so this
+    refuses rather than banding wrongly.
     """
-    if window_kb is not None and positions is None:
-        raise ValueError("window_kb requires variant positions; pass annotation=")
-    if positions is not None and len(positions):
-        if np.any(np.diff(positions) < 0):
-            raise ValueError("positions are not non-decreasing along file rows; "
-                             "banding would be silently wrong. Sort the .cugen "
-                             "or drop window_kb.")
+    a = np.asarray(chrom_codes)
+    if a.size == 0:
+        return np.zeros(1, dtype=np.int64)
+    edges = np.concatenate([[0], np.flatnonzero(a[1:] != a[:-1]) + 1, [a.size]])
+    seen = a[edges[:-1]]
+    if len(np.unique(seen)) != len(seen):
+        dup = [int(c) for c in np.unique(seen) if (seen == c).sum() > 1]
+        raise ValueError(
+            f"chromosome code(s) {dup} appear in more than one row run, so "
+            f"chromosomes are not contiguous blocks of rows. cis/trans banding "
+            f"needs contiguous blocks; sort the .cugen by (chrom, pos) first.")
+    return edges.astype(np.int64)
+
+
+def _pair_bounds(n_rows: int, positions: Optional[np.ndarray],
+                 window: Optional[int], window_kb: Optional[float],
+                 min_dist_kb: Optional[float] = None,
+                 max_dist_kb: Optional[float] = None,
+                 scope: str = "all", chrom_codes=None):
+    """Per-row half-open column range ``[starts, hi)`` for the upper triangle.
+
+    Every test-space predicate collapses to this one contiguous range, which is
+    what keeps the pair COUNT closed-form -- at p = 1.1M a materialised pair
+    list would be ~6e11 entries, and m is needed before any data is read.
+    Predicates AND together, matching PLINK:
+
+        window        hi <- i + window + 1
+        max_dist_kb   hi <- last j with pos[j] - pos[i] <= span   (== window_kb)
+        scope="cis"   hi <- end of i's chromosome block
+        min_dist_kb   starts <- first j with pos[j] - pos[i] >= span
+        scope="trans" starts <- end of i's chromosome block
+
+    Two raise ``hi``-side bounds down and two push ``starts`` up, so the
+    intersection is still one range and no predicate needs a mask.
+
+    A bp predicate is implicitly WITHIN-chromosome (plink2's --ld-window-kb
+    semantic): base-pair distance between chromosomes is not a number, so the
+    span search runs per chromosome block and never reaches across one.
+    """
+    if scope not in SCOPES:
+        raise ValueError(f"unknown scope {scope!r}; valid are {list(SCOPES)}")
+    bp = {"window_kb": window_kb, "min_dist_kb": min_dist_kb,
+          "max_dist_kb": max_dist_kb}
+    set_bp = [k for k, v in bp.items() if v is not None]
+    if set_bp and positions is None:
+        raise ValueError(f"{set_bp[0]} requires variant positions; pass "
+                         f"annotation=")
+    if scope == "trans" and set_bp:
+        raise ValueError(
+            f"scope='trans' cannot be combined with {set_bp[0]}: base-pair "
+            f"distance between two chromosomes is not defined, so the "
+            f"combination has no pairs by construction. Drop one of them.")
+    if (min_dist_kb is not None and max_dist_kb is not None
+            and float(min_dist_kb) > float(max_dist_kb)):
+        raise ValueError(
+            f"min_dist_kb={min_dist_kb} exceeds max_dist_kb={max_dist_kb}, "
+            f"which selects no pairs at all.")
+    if scope != "all" and chrom_codes is None:
+        raise ValueError(f"scope={scope!r} requires chromosomes; pass "
+                         f"annotation=")
+
     lo = np.arange(n_rows, dtype=np.int64)
+    starts = lo + 1
     hi = np.full(n_rows, n_rows, dtype=np.int64)
     if window is not None:
         hi = np.minimum(hi, lo + int(window) + 1)
-    if window_kb is not None:
-        span = int(round(float(window_kb) * 1000))
-        hi = np.minimum(hi, np.searchsorted(positions, positions + span,
-                                            side="right").astype(np.int64))
-    return lo + 1, hi
+
+    # A bp predicate confines the scan to one chromosome, so it needs the block
+    # structure even when scope was left at "all".
+    need_blocks = scope != "all" or bool(set_bp)
+    if need_blocks and chrom_codes is not None:
+        edges = _chrom_runs(chrom_codes)
+        blk_start = np.repeat(edges[:-1], np.diff(edges))
+        blk_end = np.repeat(edges[1:], np.diff(edges))
+    elif need_blocks:
+        # bp predicate with no chromosome labels: one implicit block, and the
+        # old global monotonicity rule is the only guard available.
+        edges = np.array([0, n_rows], dtype=np.int64)
+        blk_start = np.zeros(n_rows, dtype=np.int64)
+        blk_end = np.full(n_rows, n_rows, dtype=np.int64)
+    if scope == "cis" or set_bp:
+        hi = np.minimum(hi, blk_end)
+    if scope == "trans":
+        starts = np.maximum(starts, blk_end)
+
+    if set_bp and positions is not None and n_rows:
+        pos = np.asarray(positions, dtype=np.int64)
+        for b0, b1 in zip(edges[:-1], edges[1:]):
+            pb = pos[b0:b1]
+            if pb.size > 1 and np.any(np.diff(pb) < 0):
+                raise ValueError(
+                    "positions are not non-decreasing within a chromosome "
+                    "block, so banding would be silently wrong. Sort the "
+                    ".cugen by (chrom, pos) or drop the bp predicate.")
+            for key, side, comb in (("window_kb", "right", "hi"),
+                                    ("max_dist_kb", "right", "hi"),
+                                    ("min_dist_kb", "left", "starts")):
+                v = bp[key]
+                if v is None:
+                    continue
+                span = int(round(float(v) * 1000))
+                edge = b0 + np.searchsorted(pb, pb + span,
+                                            side=side).astype(np.int64)
+                if comb == "hi":
+                    hi[b0:b1] = np.minimum(hi[b0:b1], edge)
+                else:
+                    starts[b0:b1] = np.maximum(starts[b0:b1], edge)
+    # With no bp predicate nothing bands by position, so position order is
+    # irrelevant and the old global monotonicity check would only reject files
+    # it never actually mis-banded.
+    return starts, hi
 
 
-def _count_pairs(n_rows: int, positions, window, window_kb) -> int:
-    starts, hi = _pair_bounds(n_rows, positions, window, window_kb)
+def _count_pairs(n_rows: int, positions, window, window_kb, **kw) -> int:
+    starts, hi = _pair_bounds(n_rows, positions, window, window_kb, **kw)
     return int(np.maximum(hi - starts, 0).sum())
 
 
 def _plan_pairs(n_rows: int, positions: Optional[np.ndarray],
-                window: Optional[int], window_kb: Optional[float]):
+                window: Optional[int], window_kb: Optional[float], **kw):
     """Materialised upper-triangle pair list, for the NumPy reference path."""
-    starts, hi = _pair_bounds(n_rows, positions, window, window_kb)
+    starts, hi = _pair_bounds(n_rows, positions, window, window_kb, **kw)
     lo = np.arange(n_rows, dtype=np.int64)
     counts = np.maximum(hi - starts, 0)
     total = int(counts.sum())
@@ -1095,6 +1193,49 @@ def _bh_threshold_neglog10p(neglog10p, m, alpha):
         return np.inf, 0
     kmax = int(np.flatnonzero(ok)[-1]) + 1
     return float(order[kmax - 1]), kmax
+
+
+def _apply_top_k(df, k):
+    """Keep each variant's K strongest partners by |r|. Retention, not testing.
+
+    SYMMETRIC by construction: a pair survives if it is in the top K of EITHER
+    endpoint. The asymmetric alternative -- rank within gidx_a only -- makes a
+    pair's survival depend on which side of the upper triangle it landed on,
+    so a variant near the end of the file would keep almost nothing. This is
+    the honest form of the fix for a random per-variant subsample, where most
+    strong pairs lose an endpoint and the survivors are not the strong ones.
+
+    Row count is bounded by k * n_variants, and no variant is dropped
+    entirely, which is the property a downstream degree-based prune needs.
+    """
+    if k is None or df is None or len(df) == 0:
+        return df
+    k = int(k)
+
+    def host(col):
+        # cudf on the device write path, pandas everywhere else
+        v = df[col]
+        return np.asarray(v.to_numpy() if hasattr(v, "to_numpy") else v)
+
+    a = host("gidx_a").astype(np.int64)
+    b = host("gidx_b").astype(np.int64)
+    absr = np.abs(host("R").astype(np.float64))
+
+    # Both orientations stacked, so ONE ranking pass covers both endpoints.
+    owner = np.concatenate([a, b])
+    strength = np.concatenate([absr, absr])
+    row = np.concatenate([np.arange(len(a)), np.arange(len(a))])
+
+    # sort by (owner asc, |r| desc), then take the first k of each owner run
+    order = np.lexsort((-strength, owner))
+    owner_s, row_s = owner[order], row[order]
+    starts = np.concatenate(
+        [[0], np.flatnonzero(owner_s[1:] != owner_s[:-1]) + 1])
+    rank = np.arange(len(owner_s)) - np.repeat(
+        starts, np.diff(np.append(starts, len(owner_s))))
+
+    keep = np.sort(np.unique(row_s[rank < k]))
+    return df.iloc[keep].reset_index(drop=True)
 
 
 def _apply_significance_filters(df, *, max_p, correction, alpha, m, screened,
@@ -3357,7 +3498,7 @@ def _dosages_numpy(reader) -> np.ndarray:
 
 def _scan_gpu(reader, rows, window, window_kb, positions, min_r2, min_obs,
               tile_size=None, verbose=False, need_table=True,
-              keep_device=False):
+              keep_device=False, bounds=None):
     """Tiled upper-triangle scan. Returns (pairs_local, tables) for survivors.
 
     Peak device memory is a function of tile size and sample count only, never
@@ -3378,19 +3519,24 @@ def _scan_gpu(reader, rows, window, window_kb, positions, min_r2, min_obs,
 
     packed = _load_packed_rows(reader, rows, bpv, verbose)
 
+    if bounds is None:
+        bounds = _pair_bounds(p, positions, window, window_kb)
+    starts_all, hi_all = bounds
+    st_d = cp.asarray(starts_all)
+    hi_d = cp.asarray(hi_all)
+
     out_pairs, out_tabs, out_r, out_n = [], [], [], []
     for i0 in range(0, p, B):
         i1 = min(i0 + B, p)
         pl_a = build(packed, cp.arange(i0, i1), ns, bpv)
-        # column extent: upper triangle, bounded by whichever windows are set
-        hi = p
-        if window is not None:
-            hi = min(hi, i1 - 1 + int(window) + 1)
-        if window_kb is not None:
-            hi = min(hi, int(np.searchsorted(
-                positions, positions[i1 - 1] + int(round(window_kb * 1000)),
-                side="right")))
-        for j0 in range(i0, hi, B):
+        # Column extent from the SAME (starts, hi) the pair count used, so the
+        # emitted set cannot disagree with m. Tile bounds are the widest over
+        # the row block; the per-pair mask below is what is exact.
+        hi = int(hi_all[i0:i1].max()) if i1 > i0 else i0
+        j_lo = int(starts_all[i0:i1].min()) if i1 > i0 else i0
+        # skip whole tiles below the first legal column (long-range / trans)
+        j_first = max(i0, (j_lo // B) * B)
+        for j0 in range(j_first, hi, B):
             j1 = min(j0 + B, hi)
             pl_b = pl_a if j0 == i0 else build(
                 packed, cp.arange(j0, j1), ns, bpv)
@@ -3403,12 +3549,13 @@ def _scan_gpu(reader, rows, window, window_kb, positions, min_r2, min_obs,
 
             ii = cp.arange(i0, i1)[:, None]
             jj = cp.arange(j0, j1)[None, :]
-            keep = (jj > ii) & cp.isfinite(r) & (n >= min_obs)
-            if window is not None:
-                keep &= (jj - ii) <= int(window)
-            if window_kb is not None:
-                pos = cp.asarray(positions)
-                keep &= (pos[jj] - pos[ii]) <= int(round(window_kb * 1000))
+            # One predicate, not five: every test-space bound already lives in
+            # (starts, hi), so window / window_kb / min_dist_kb / max_dist_kb /
+            # cis / trans all reduce to a range check here. That is what makes
+            # the GPU path agree with the reference BY CONSTRUCTION rather than
+            # by a parity test.
+            keep = ((jj >= st_d[ii]) & (jj < hi_d[ii])
+                    & cp.isfinite(r) & (n >= min_obs))
             if min_r2 > 0:
                 keep &= (r * r) >= min_r2
 
@@ -3467,6 +3614,11 @@ def ld_matrix(
     variants=None,
     region: Optional[str] = None,
     maf_min: float = 0.0,
+    maf_max: Optional[float] = None,
+    min_dist_kb: Optional[float] = None,
+    max_dist_kb: Optional[float] = None,
+    scope: str = "all",
+    top_k: Optional[int] = None,
     window: Optional[int] = None,
     window_kb: Optional[float] = None,
     min_r2: float = 0.0,
@@ -3753,17 +3905,35 @@ def ld_matrix(
         rows = rows[np.isin(gidx_all[rows], np.asarray(sub["gidx"], dtype=np.int64))]
     if maf_min > 0:
         rows = rows[maf_all[rows] >= maf_min]
+    if maf_max is not None:
+        if maf_max < maf_min:
+            raise ValueError(
+                f"maf_max={maf_max} is below maf_min={maf_min}, which selects "
+                f"no variants at all.")
+        rows = rows[maf_all[rows] <= float(maf_max)]
+    if top_k is not None and int(top_k) < 1:
+        raise ValueError(f"top_k={top_k} must be >= 1, or None to keep every "
+                         f"pair above the retention threshold.")
     if rows.size == 0:
         return _empty_pairs(stats)
 
     positions = None
+    chrom_codes = None
     if ann is not None:
         pos_map = dict(zip(np.asarray(ann["gidx"], dtype=np.int64),
                            np.asarray(ann["POS"], dtype=np.int64)))
         positions = np.array([pos_map.get(int(g), 0) for g in gidx_all[rows]],
                              dtype=np.int64)
+        # Integer codes, not strings: the scan compares these per pair on the
+        # device, and "1" vs "chr1" vs 1 would all have to agree there.
+        chr_map = dict(zip(np.asarray(ann["gidx"], dtype=np.int64),
+                           [str(c) for c in np.asarray(ann["CHR"])]))
+        labels = [chr_map.get(int(g), "") for g in gidx_all[rows]]
+        chrom_codes = np.unique(labels, return_inverse=True)[1].astype(np.int64)
 
-    n_pairs = _count_pairs(len(rows), positions, window, window_kb)
+    _space = dict(min_dist_kb=min_dist_kb, max_dist_kb=max_dist_kb,
+                  scope=scope, chrom_codes=chrom_codes)
+    n_pairs = _count_pairs(len(rows), positions, window, window_kb, **_space)
     if n_pairs > max_pairs and not count_only:
         raise ValueError(
             f"plan would emit {n_pairs:,} pairs, above max_pairs={max_pairs:,}. "
@@ -3798,11 +3968,15 @@ def ld_matrix(
     # reader is allowed to be asked about. A run is only reproducible if both
     # travel with the file.
     _ld_params = {
-        "maf_min": float(maf_min), "maf_max": None,
+        "maf_min": float(maf_min),
+        "maf_max": None if maf_max is None else float(maf_max),
         "window": window, "window_kb": window_kb,
-        "min_dist_kb": None, "max_dist_kb": None, "scope": "all",
+        "min_dist_kb": None if min_dist_kb is None else float(min_dist_kb),
+        "max_dist_kb": None if max_dist_kb is None else float(max_dist_kb),
+        "scope": scope,
         "min_r2": float(min_r2), "max_p": max_p, "correction": correction,
-        "alpha": float(alpha), "top_k": None,
+        "alpha": float(alpha),
+        "top_k": None if top_k is None else int(top_k),
         "n_obs": (2 * int(reader.n_samples) if want_phased
                   else int(reader.n_samples)),
         "m_tests": int(m_tests),
@@ -3852,7 +4026,13 @@ def ld_matrix(
     # precondition is structural there rather than a property of this file.
     fused_ok_phased = (not want_phased
                        or set(want_phased) <= {"r_phased", "r2_phased"})
-    fused = (on_device and not reader.has_missing and window_kb is None
+    # The fused kernel takes `window` as a SCALAR, so any predicate needing
+    # per-row bounds (bp distance, cis/trans) falls to the tiled path -- the
+    # same way window_kb already does. Lifting this means giving the kernel the
+    # starts/hi arrays; see the handoff note in benchmarks/results/STORAGE.md.
+    _needs_row_bounds = (window_kb is not None or min_dist_kb is not None
+                         or max_dist_kb is not None or scope != "all")
+    fused = (on_device and not reader.has_missing and not _needs_row_bounds
              and min_obs <= reader.n_samples and fused_ok_phased)
 
     if stream and output is None:
@@ -3961,7 +4141,7 @@ def ld_matrix(
         n_dev = cp.full(ii.size, float(n_obs), dtype=cp.float32)
         df = _assemble_device(pairs_local, (rr, n_dev), reader, rows, stats,
                               sign_reference, path, verbose, n_planned=n_pairs)
-        df = _apply_significance_filters(df, **_sig_kw)
+        df = _apply_top_k(_apply_significance_filters(df, **_sig_kw), top_k)
         _write_df(df, str(output), params=_ld_params)
         if verbose:
             print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs "
@@ -3973,13 +4153,14 @@ def ld_matrix(
         pairs_local, payload = _scan_gpu(
             reader, rows, window, window_kb, positions, min_r2, min_obs,
             tile_size=tile_size, verbose=verbose, need_table=need_table,
-            keep_device=on_device)
+            keep_device=on_device, bounds=_pair_bounds(
+                len(rows), positions, window, window_kb, **_space))
         if len(pairs_local) == 0:
             return _empty_pairs(stats)
         if on_device:
             df = _assemble_device(pairs_local, payload, reader, rows, stats,
                                   sign_reference, path, verbose, n_planned=n_pairs)
-            df = _apply_significance_filters(df, **_sig_kw)
+            df = _apply_top_k(_apply_significance_filters(df, **_sig_kw), top_k)
             _write_df(df, str(output), params=_ld_params)
             if verbose:
                 print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs "
@@ -3991,7 +4172,8 @@ def ld_matrix(
             r_arr, n_arr = payload
             res = _r_only_result(r_arr, n_arr, reader, rows, pairs_local)
     else:
-        pairs_local, _ = _plan_pairs(len(rows), positions, window, window_kb)
+        pairs_local, _ = _plan_pairs(len(rows), positions, window,
+                                     window_kb, **_space)
         if want_phased:
             hap = _haplotypes_numpy(reader)[rows]
             res = phased_from_haplotypes(hap, pairs_local)
@@ -4068,7 +4250,7 @@ def ld_matrix(
         chrom_fallback = int(m.group(1))
     df = _merge_annotation(df, ann, chrom_fallback)
     df = _finalize(df, stats)
-    df = _apply_significance_filters(df, **_sig_kw)
+    df = _apply_top_k(_apply_significance_filters(df, **_sig_kw), top_k)
 
     if verbose:
         print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs planned, "

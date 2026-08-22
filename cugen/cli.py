@@ -78,7 +78,22 @@ def _add_ld(sp):
     p.add_argument("--lambda-gc", action="store_true",
                    help="estimate the inflation factor and add adjusted "
                         "columns; structure makes raw p anti-conservative")
+    # ---- test space: which pairs are computed, and so the denominator m ----
     p.add_argument("--maf-min", type=float, default=0.0)
+    p.add_argument("--maf-max", type=float, default=None,
+                   help="upper MAF bound; the partner to --maf-min")
+    p.add_argument("--min-dist-kb", type=float, default=None,
+                   help="exclude pairs closer than this, for long-range scans")
+    p.add_argument("--max-dist-kb", type=float, default=None,
+                   help="band limit; the same predicate as --window-kb")
+    p.add_argument("--scope", choices=("all", "cis", "trans"), default="all",
+                   help="cis = same chromosome only, trans = different "
+                        "chromosomes only (needs --annotation)")
+    # ---- retention: which computed pairs are written ----
+    p.add_argument("--top-k", type=int, default=None,
+                   help="keep each variant's K strongest partners by |r|; "
+                        "symmetric, so a pair survives if it is in the top K "
+                        "of either endpoint")
     p.add_argument("--annotation", default=None,
                    help="variant annotation table, for POS/ID and --window-kb")
     p.add_argument("--tile-size", type=int, default=None)
@@ -200,6 +215,11 @@ def _run_ld(args):
         kinship=_matrix(args.kinship),
         structure=_matrix(args.structure),
         maf_min=args.maf_min,
+        maf_max=args.maf_max,
+        min_dist_kb=args.min_dist_kb,
+        max_dist_kb=args.max_dist_kb,
+        scope=args.scope,
+        top_k=args.top_k,
         annotation=args.annotation,
         tile_size=args.tile_size,
         backend=args.backend,

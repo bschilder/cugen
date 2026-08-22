@@ -120,6 +120,30 @@ _ENC_NAME = {v: k for k, v in _ENC_CODE.items()}
 _ENC_DTYPE = {"int16": np.int16, "float32": np.float32, "int8": np.int8}
 _ENC_SCALE = {"int16": 32767.0, "float32": 1.0, "int8": 127.0}
 
+# Header flag: this shard carries a per-pair N alongside r.
+#
+# -log10 p is a closed form in N * r^2, so storing it would be 4-8 redundant
+# bytes against a 2.0 B/pair budget. Deriving it needs N. Without missingness
+# every pair shares one N and the scalar in params is exact; under
+# missing="pairwise" each pair rests on its own sample set, and a scalar N
+# gives a WRONG p in the direction that overstates significance. So N is
+# stored per pair, but only when it varies, as a small DEFICIT
+# (n_samples - n_obs) whose width is chosen like the delta width.
+#
+# Measured, 500 samples x 400 variants, uniform missingness:
+#
+#     missing   per-pair N   B/pair   vs no-N
+#          0%        False     2.34     1.00x
+#          1%         True     2.87     1.23x
+#          5%         True     3.07     1.31x
+#         20%         True     3.24     1.38x
+#
+# So a constant-N file pays exactly nothing, and a varying-N file pays
+# 0.5-0.9 B/pair -- under the 2 bytes the raw uint16 would take, because the
+# deficits are repetitive enough for zstd, but NOT the "near free" an earlier
+# version of this comment claimed. 23-38% is the real price of an exact p.
+FLAG_PER_PAIR_N = 1 << 0
+
 PAYLOADS = ("banded", "scatter")
 _PAY_CODE = {"banded": 0, "scatter": 1}
 _PAY_NAME = {v: k for k, v in _PAY_CODE.items()}
@@ -305,7 +329,8 @@ def delta_decode(deltas, first: int, width: int) -> np.ndarray:
 # threshold query can skip a block without touching its bytes at all.
 # ---------------------------------------------------------------------------
 def encode_block(j, r, *, encoding: str = DEFAULT_ENCODING,
-                 payload: str = "banded", row_starts=None) -> Tuple[bytes, dict]:
+                 payload: str = "banded", row_starts=None,
+                 n_deficit=None) -> Tuple[bytes, dict]:
     """One block of (partner index, r) into a compressed blob plus metadata.
 
     A block spans several ROW variants, and j restarts at each one, so the
@@ -349,10 +374,35 @@ def encode_block(j, r, *, encoding: str = DEFAULT_ENCODING,
         width, first_len = 8, 0
         idx_bytes = ja.tobytes()
 
-    raw = idx_bytes + q.tobytes()
+    # Optional third section: the per-pair N deficit, narrowest width that
+    # holds it. Placed after the values so a reader that ignores it can still
+    # find r by idx_len alone.
+    n_width, n_bytes = 0, b""
+    if n_deficit is not None:
+        nd = np.asarray(n_deficit, dtype=np.int64).ravel()
+        if nd.size != ja.size:
+            raise ValueError(
+                f"n_deficit has {nd.size} entries but the block holds "
+                f"{ja.size} pairs")
+        if nd.size and nd.min() < 0:
+            raise ValueError(
+                "n_deficit is negative, so n_obs exceeded n_samples; the "
+                "deficit encoding assumes n_obs <= n_samples")
+        mx = int(nd.max()) if nd.size else 0
+        n_width = next((w for w in (1, 2, 4)
+                        if mx <= np.iinfo(_DELTA_DTYPE[w]).max), 8)
+        if n_width == 8:
+            raise ValueError(
+                f"n deficit {mx} exceeds the 4-byte encoding; n_samples and "
+                f"n_obs are implausibly far apart")
+        n_bytes = nd.astype(_DELTA_DTYPE[n_width]).tobytes()
+
+    raw = idx_bytes + q.tobytes() + n_bytes
     comp = pa.compress(raw, codec=_CODEC)
     rr = dequantize_r(q, encoding)
     meta = {
+        "n_width": int(n_width),
+        "val_len": int(q.nbytes),
         "n": int(ja.size),
         "payload": payload,
         "delta_width": int(width),
@@ -369,9 +419,13 @@ def encode_block(j, r, *, encoding: str = DEFAULT_ENCODING,
 
 
 def decode_block(blob: bytes, meta: dict, *,
-                 encoding: str = DEFAULT_ENCODING) -> Tuple[np.ndarray,
-                                                            np.ndarray]:
-    """Inverse of encode_block. Raises on a truncated or corrupt blob."""
+                 encoding: str = DEFAULT_ENCODING, with_n: bool = False):
+    """Inverse of encode_block. Raises on a truncated or corrupt blob.
+
+    Returns ``(j, r)``, or ``(j, r, n_deficit)`` when ``with_n`` -- the third
+    element is None for a block written without a per-pair N. The default
+    arity is unchanged so existing callers keep working.
+    """
     import pyarrow as pa                                    # noqa: PLC0415
 
     _check_encoding(encoding)
@@ -396,12 +450,24 @@ def decode_block(blob: bytes, meta: dict, *,
             j = np.zeros(0, dtype=np.int64)
     else:
         j = np.frombuffer(raw[:idx_len], dtype=np.int64)
-    q = np.frombuffer(raw[idx_len:], dtype=_ENC_DTYPE[encoding])
+    val_len = meta.get("val_len", len(raw) - idx_len)
+    q = np.frombuffer(raw[idx_len:idx_len + val_len],
+                      dtype=_ENC_DTYPE[encoding])
     if j.size != n or q.size != n:
         raise ValueError(
             f"block holds {j.size} indices and {q.size} values but declares "
             f"n={n}")
-    return np.asarray(j, dtype=np.int64), dequantize_r(q, encoding)
+    if not with_n:
+        return np.asarray(j, dtype=np.int64), dequantize_r(q, encoding)
+    nd = None
+    nw = int(meta.get("n_width", 0))
+    if nw:
+        nd = np.frombuffer(raw[idx_len + val_len:],
+                           dtype=_DELTA_DTYPE[nw]).astype(np.int64)
+        if nd.size != n:
+            raise ValueError(
+                f"block declares n={n} but carries {nd.size} N deficits")
+    return np.asarray(j, dtype=np.int64), dequantize_r(q, encoding), nd
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +535,8 @@ class LDShardWriter:
     def __init__(self, path: str, *, encoding: str = DEFAULT_ENCODING,
                  block_variants: int = 4096, params: Optional[dict] = None,
                  block_a: int = 0, block_b: int = 0, tiers=DEFAULT_TIERS,
-                 max_block_pairs: int = MAX_BLOCK_PAIRS):
+                 max_block_pairs: int = MAX_BLOCK_PAIRS,
+                 n_samples: Optional[int] = None):
         _check_encoding(encoding)
         self.tiers = tuple(sorted((float(t) for t in tiers), reverse=True))
         self.path = str(path)
@@ -484,6 +551,13 @@ class LDShardWriter:
         self._buf_i: list = []
         self._buf_j: list = []
         self._buf_r: list = []
+        self._buf_n: list = []
+        # Reference for the deficit encoding. Falls back to the scalar n_obs so
+        # a caller that only sets params still gets a valid reference.
+        self.n_samples = (int(n_samples) if n_samples is not None
+                          else (int(self.params["n_obs"])
+                                if self.params.get("n_obs") else None))
+        self._has_n = False
         self._buf_rows = 0
         self._block_lo = None                    # first row variant in buffer
         self._last_i = -1
@@ -492,7 +566,7 @@ class LDShardWriter:
         self._payload_banded = 0
 
     # -- writing ------------------------------------------------------------
-    def append(self, i, j, r, presorted: bool = False) -> None:
+    def append(self, i, j, r, n=None, presorted: bool = False) -> None:
         """One tile's survivors. Any order within the chunk; row variants must
         not go backwards across chunks.
 
@@ -513,6 +587,22 @@ class LDShardWriter:
         if not (ia.size == ja.size == ra.size):
             raise ValueError(
                 f"append got {ia.size} i, {ja.size} j and {ra.size} r values")
+        na = None
+        if n is not None:
+            na = np.asarray(n, dtype=np.int64).ravel()
+            if na.size != ia.size:
+                raise ValueError(
+                    f"append got {na.size} n values for {ia.size} pairs")
+            if self.n_samples is None:
+                raise ValueError(
+                    "per-pair n needs a reference n_samples for the deficit "
+                    "encoding; pass n_samples= or set params['n_obs']")
+            self._has_n = True
+        elif self._has_n:
+            raise ValueError(
+                "this shard already holds per-pair n, so every append must "
+                "supply it -- a partial column would silently mean 'no "
+                "missingness' for the pairs that lack it")
         lo = int(ia.min())
         if lo < self._last_i:
             raise ValueError(
@@ -525,6 +615,8 @@ class LDShardWriter:
         self._buf_i.append(ia)
         self._buf_j.append(ja)
         self._buf_r.append(ra)
+        if na is not None:
+            self._buf_n.append(na)
         self._buf_rows += ia.size
         self._presorted = getattr(self, "_presorted", True) and presorted
         self._last_i = max(self._last_i, int(ia.max()))
@@ -549,11 +641,14 @@ class LDShardWriter:
         i = np.concatenate(self._buf_i)
         j = np.concatenate(self._buf_j)
         r = np.concatenate(self._buf_r)
+        nn = np.concatenate(self._buf_n) if self._buf_n else None
         # A single pre-sorted append needs no re-sort. More than one does: the
         # concatenation of two sorted runs is not sorted.
         if not (getattr(self, "_presorted", False) and len(self._buf_i) == 1):
             order = np.lexsort((j, i))
             i, j, r = i[order], j[order], r[order]
+            if nn is not None:
+                nn = nn[order]
 
         starts = _run_starts(i)
         uniq = i[starts]
@@ -561,6 +656,7 @@ class LDShardWriter:
         n_emit = uniq.size if final else uniq.size - 1
         if n_emit <= 0:
             self._buf_i, self._buf_j, self._buf_r = [i], [j], [r]
+            self._buf_n = [nn] if nn is not None else []
             self._buf_rows = i.size
             return
 
@@ -569,7 +665,10 @@ class LDShardWriter:
         # a block must hold a variant's partners entirely.
         cut = int(starts[n_emit]) if n_emit < uniq.size else int(i.size)
         tail_i, tail_j, tail_r = i[cut:], j[cut:], r[cut:]
+        tail_n = nn[cut:] if nn is not None else None
         i, j, r = i[:cut], j[:cut], r[:cut]
+        if nn is not None:
+            nn = nn[:cut]
 
         # Partition each variant group into r^2 tiers with ONE permutation and
         # three gathers, instead of five boolean masks and fifteen fancy-indexed
@@ -596,6 +695,7 @@ class LDShardWriter:
             parts = [np.flatnonzero(tl == k) for k in range(ntier)]
             perm = np.concatenate(parts) if ntier > 1 else parts[0]
             pi, pj, pr = i[s0:s1][perm], j[s0:s1][perm], gr[perm]
+            pn = nn[s0:s1][perm] if nn is not None else None
 
             off = 0
             for k, part in enumerate(parts):
@@ -605,6 +705,7 @@ class LDShardWriter:
                 ti = pi[off:off + m]
                 tj = pj[off:off + m]
                 tr = pr[off:off + m]
+                tn = pn[off:off + m] if pn is not None else None
                 off += m
                 # split on row-variant boundaries so a variant's partners never
                 # straddle two blocks within a tier
@@ -617,29 +718,36 @@ class LDShardWriter:
                     cutp.append(m)
                     for a, b in zip(cutp[:-1], cutp[1:]):
                         if b > a:
-                            self._write_block(ti[a:b], tj[a:b], tr[a:b],
-                                              tier_lo=tier_lo[k])
+                            self._write_block(
+                                ti[a:b], tj[a:b], tr[a:b],
+                                n=None if tn is None else tn[a:b],
+                                tier_lo=tier_lo[k])
                 else:
-                    self._write_block(ti, tj, tr, tier_lo=tier_lo[k])
+                    self._write_block(ti, tj, tr, n=tn, tier_lo=tier_lo[k])
 
         if tail_i.size:
             self._buf_i, self._buf_j, self._buf_r = (
                 [tail_i], [tail_j], [tail_r])
+            self._buf_n = [tail_n] if tail_n is not None else []
             self._buf_rows = int(tail_i.size)
             self._block_lo = int(tail_i[0])
             self._presorted = True          # the tail is still (i, j) ordered
         else:
             self._buf_i, self._buf_j, self._buf_r = [], [], []
+            self._buf_n = []
             self._buf_rows = 0
             self._block_lo = None
 
-    def _write_block(self, i, j, r, *, tier_lo: float) -> None:
+    def _write_block(self, i, j, r, *, tier_lo: float, n=None) -> None:
         """One compressed block for one (row-variant group, r^2 tier)."""
         starts = _run_starts(i)
         uniq = i[starts]
         counts = np.diff(np.append(starts, i.size))
+        deficit = None if n is None else (int(self.n_samples)
+                                          - np.asarray(n, dtype=np.int64))
         blob, meta = encode_block(j, r, encoding=self.encoding,
-                                  row_starts=starts.astype(np.int64))
+                                  row_starts=starts.astype(np.int64),
+                                  n_deficit=deficit)
         if meta["payload"] == "scatter":
             self._payload_scatter += 1
         else:
@@ -665,6 +773,8 @@ class LDShardWriter:
             "block_variants": self.block_variants,
             "payload_mix": {"banded": self._payload_banded,
                             "scatter": self._payload_scatter},
+            "has_per_pair_n": bool(self._has_n),
+            "n_samples": self.n_samples,
         }, separators=(",", ":")).encode()
         self._f.write(footer)
         n_rv = sum(len(b["row_variants"]) for b in self._blocks)
@@ -675,7 +785,8 @@ class LDShardWriter:
             n_row_variants=n_rv, n_pairs=self.n_pairs,
             index_offset=footer_off, blocks_offset=HEADER_SIZE,
             footer_offset=footer_off, r_scale=r_scale_for(self.encoding),
-            block_a=self.block_a, block_b=self.block_b))
+            block_a=self.block_a, block_b=self.block_b,
+            flags=(FLAG_PER_PAIR_N if self._has_n else 0)))
         self._f.close()
 
     def __enter__(self):
@@ -710,6 +821,11 @@ class LDReader:
         self.payload_mix = foot["payload_mix"]
         self.n_pairs = self.header["n_pairs"]
         self.blocks_read = 0
+        # Per-pair N: the flag is authoritative, the footer carries the
+        # reference the deficits were taken against.
+        self.has_per_pair_n = bool(
+            self.header.get("flags", 0) & FLAG_PER_PAIR_N)
+        self.n_samples = foot.get("n_samples")
         # row variant -> [(block index, slot)]. Built once, because scanning
         # every block's row_variants list per lookup made variant() cost 367 ms
         # on a 66-block file -- linear in blocks and in Python. A variant's
@@ -724,12 +840,41 @@ class LDReader:
         self.blocks_read = 0
 
     # -- internals ----------------------------------------------------------
-    def _block(self, b: dict):
+    def _block(self, b: dict, with_n: bool = False):
         with open(self.path, "rb") as f:
             f.seek(b["offset"])
             blob = f.read(b["comp_len"])
         self.blocks_read += 1
-        return decode_block(blob, b, encoding=self.encoding)
+        if not with_n:
+            return decode_block(blob, b, encoding=self.encoding)
+        j, r, nd = decode_block(blob, b, encoding=self.encoding, with_n=True)
+        n = None if nd is None else (int(self.n_samples) - nd)
+        return j, r, n
+
+    # -- derived statistics -------------------------------------------------
+    def n_obs_for(self, n_stored):
+        """Per-pair N: the stored column when present, else the scalar.
+
+        Refuses rather than substituting a wrong N. Under missingness a scalar
+        N overstates significance for the pairs that lost the most samples, and
+        that error is invisible in the output.
+        """
+        if n_stored is not None:
+            return n_stored
+        scalar = self.params.get("n_obs")
+        if not scalar:
+            raise ValueError(
+                "cannot derive p: this file records neither a per-pair N nor a "
+                "scalar params['n_obs']. -log10 p is a function of N * r^2, so "
+                "there is nothing to derive it from.")
+        return float(scalar)
+
+    def neglog10p(self, r, n_stored=None):
+        """-log10 p for a 1-df chi-square of N * r^2."""
+        from cugen.ld import _neglog10_chi2_1df              # noqa: PLC0415
+        n = self.n_obs_for(n_stored)
+        return _neglog10_chi2_1df(np.asarray(n, dtype=np.float64)
+                                  * np.asarray(r, dtype=np.float64) ** 2)
 
     def _stored_min_r2(self) -> float:
         v = self.params.get("min_r2")
@@ -756,12 +901,12 @@ class LDReader:
         return t
 
     # -- queries ------------------------------------------------------------
-    def rows(self):
-        """Every stored pair, as (i, j, r)."""
-        return self.above(min_r2=None)
+    def rows(self, with_p: bool = False):
+        """Every stored pair, as (i, j, r), or (i, j, r, n_obs, -log10 p)."""
+        return self.above(min_r2=None, with_p=with_p)
 
     def above(self, min_r2: Optional[float] = None,
-              max_p: Optional[float] = None):
+              max_p: Optional[float] = None, with_p: bool = False):
         """Pairs at or above a threshold, skipping blocks by their zone map.
 
         p is monotone in r^2 at fixed N, so a p-value cut is the same skip: it
@@ -775,27 +920,48 @@ class LDReader:
             from scipy.stats import chi2 as _c                # noqa: PLC0415
             min_r2 = max(min_r2 or 0.0, float(_c.isf(max_p, 1)) / float(n))
         t = self._check_threshold(min_r2)
-        oi, oj, orr = [], [], []
+        if with_p:
+            # Fail before reading a single block if p is not derivable at all.
+            self.n_obs_for(np.zeros(0) if self.has_per_pair_n else None)
+        oi, oj, orr, on = [], [], [], []
         for b in self.blocks:
             # zone map: nothing in this block can clear the cut, so its bytes
             # are never touched. Blocks are cut by tier as well as position, so
             # this actually skips instead of being decorative.
             if t is not None and t > 0.0 and b["max_abs_r"] ** 2 < t:
                 continue
-            j, r = self._block(b)
+            if with_p and self.has_per_pair_n:
+                j, r, nb = self._block(b, with_n=True)
+            else:
+                j, r = self._block(b)
+                nb = None
             i = np.repeat(np.asarray(b["row_variants"], dtype=np.int64),
                           np.asarray(b["row_counts"], dtype=np.int64))
             # a whole tier at or above the cut needs no per-pair filter
             if t is not None and t > 0.0 and b.get("tier_lo", -1.0) < t:
                 keep = r ** 2 >= t
                 i, j, r = i[keep], j[keep], r[keep]
+                if nb is not None:
+                    nb = nb[keep]
             oi.append(i)
             oj.append(j)
             orr.append(r)
+            if nb is not None:
+                on.append(nb)
         if not oi:
             e = np.zeros(0, dtype=np.int64)
+            if with_p:
+                return e, e.copy(), np.zeros(0), np.zeros(0), np.zeros(0)
             return e, e.copy(), np.zeros(0)
-        return np.concatenate(oi), np.concatenate(oj), np.concatenate(orr)
+        ci, cj, cr = (np.concatenate(oi), np.concatenate(oj),
+                      np.concatenate(orr))
+        if not with_p:
+            return ci, cj, cr
+        n_col = np.concatenate(on) if on else None
+        n_out = self.n_obs_for(n_col)
+        if np.ndim(n_out) == 0:
+            n_out = np.full(cr.size, float(n_out))
+        return ci, cj, cr, n_out, self.neglog10p(cr, n_col)
 
     def variant(self, gidx: int):
         """One variant's partners, as (j, r), ascending in j.
@@ -935,13 +1101,28 @@ def _r_column(h):
 def _write_cugenld(df, path, *, params, encoding, block_variants, tiers):
     h = _to_pandas(df)
     rc = _r_column(h)
-    w = LDShardWriter(path, encoding=encoding, block_variants=block_variants,
-                      params=params, tiers=tiers)
     i = h["gidx_a"].to_numpy(np.int64)
     j = h["gidx_b"].to_numpy(np.int64)
     r = h[rc].to_numpy(np.float64)
+
+    # Per-pair N only when it actually varies. Constant N is already the scalar
+    # in params, so storing a column of it would be pure waste; a VARYING N is
+    # the only thing a scalar cannot represent, and dropping it would make
+    # every derived p wrong in the anti-conservative direction.
+    n = None
+    n_ref = params.get("n_obs") if params else None
+    if "N_OBS" in h.columns:
+        col = h["N_OBS"].to_numpy(np.float64)
+        if col.size and np.ptp(col) > 0:
+            n = col
+            n_ref = max(float(col.max()), float(n_ref or 0.0))
+
+    w = LDShardWriter(path, encoding=encoding, block_variants=block_variants,
+                      params=params, tiers=tiers,
+                      n_samples=None if n_ref is None else int(n_ref))
     order = np.lexsort((j, i))
-    w.append(i[order], j[order], r[order])
+    w.append(i[order], j[order], r[order],
+             n=None if n is None else n[order])
     w.close()
 
 
@@ -1021,8 +1202,14 @@ def read_pairs(path: str):
     p = str(path)
     if p.endswith(".cugenld"):
         rd = read_ld(p)
-        i, j, r = rd.rows()
-        return pd.DataFrame({"gidx_a": i, "gidx_b": j, "R": r})
+        try:
+            i, j, r, n, nlp = rd.rows(with_p=True)
+        except ValueError:
+            # no N recorded: r is all this file can answer for
+            i, j, r = rd.rows()
+            return pd.DataFrame({"gidx_a": i, "gidx_b": j, "R": r})
+        return pd.DataFrame({"gidx_a": i, "gidx_b": j, "R": r,
+                             "R2": r ** 2, "N_OBS": n, "NEG_LOG10_P": nlp})
     if p.endswith(".npz"):
         z = np.load(p, allow_pickle=False)
         return pd.DataFrame({k: z[k] for k in z.files

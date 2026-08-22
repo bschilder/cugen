@@ -20,6 +20,49 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 MUTATIONS = [
+    # ---- test space: the params that set the denominator m ----
+    ('maf_max never filters', 'cugen/ld.py',
+     """        rows = rows[maf_all[rows] <= float(maf_max)]""",
+     """        pass""", "tests/test_ld_testspace.py"),
+    ('cis does not stop at the chromosome boundary', 'cugen/ld.py',
+     """    if scope == "cis" or set_bp:
+        hi = np.minimum(hi, blk_end)""",
+     """    if False:
+        hi = np.minimum(hi, blk_end)""", "tests/test_ld_testspace.py"),
+    ('trans does not skip its own chromosome', 'cugen/ld.py',
+     """    if scope == "trans":
+        starts = np.maximum(starts, blk_end)""",
+     """    if False:
+        starts = np.maximum(starts, blk_end)""", "tests/test_ld_testspace.py"),
+    ('min_dist_kb raises hi instead of starts', 'cugen/ld.py',
+     """                if comb == "hi":""",
+     """                if True:""", "tests/test_ld_testspace.py"),
+    ('interleaved chromosomes are banded anyway', 'cugen/ld.py',
+     """    if len(np.unique(seen)) != len(seen):""",
+     """    if False:""", "tests/test_ld_testspace.py"),
+    ('top_k ranks only gidx_a, so it is asymmetric', 'cugen/ld.py',
+     """    owner = np.concatenate([a, b])""",
+     """    owner = np.concatenate([a, a])""", "tests/test_ld_testspace.py"),
+    ('the GPU mask ignores the shared lower bound', 'cugen/ld.py',
+     """            keep = ((jj >= st_d[ii]) & (jj < hi_d[ii])""",
+     """            keep = ((jj > ii) & (jj < hi_d[ii])""",
+     "tests/test_ld_testspace.py"),
+    # ---- p-value recovery ----
+    ('per-pair N is dropped, so p falls back to the scalar', 'cugen/ldio.py',
+     """        if col.size and np.ptp(col) > 0:""",
+     """        if False:""", "tests/test_ld_pvalue_recovery.py"),
+    ('a constant N is stored anyway, wasting the column', 'cugen/ldio.py',
+     """        if col.size and np.ptp(col) > 0:
+            n = col""",
+     """        if True:
+            n = col""", "tests/test_ld_pvalue_recovery.py"),
+    ('the N deficit is decoded without the reference', 'cugen/ldio.py',
+     """        n = None if nd is None else (int(self.n_samples) - nd)""",
+     """        n = None if nd is None else nd""",
+     "tests/test_ld_pvalue_recovery.py"),
+    ('p is invented when no N is recorded', 'cugen/ldio.py',
+     "        if not scalar:", "        if False:",
+     "tests/test_ld_pvalue_recovery.py"),
     # ---- fine-mapping from a stored LD panel ----
     ('from_ld accepts z and R of different lengths',
      'cugen/_step5b_finemapping.py',
