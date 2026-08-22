@@ -214,13 +214,47 @@ Devlin & Roeder (1999) Biometrics 55(4):997     genomic control; lambda =
 Yang et al. (2011) AJHG 88(1):76-82             GCTA standardised GRM
     https://doi.org/10.1016/j.ajhg.2010.11.011  (cugen.popstruct.grm)
 
-NOT read, and so NOT implemented: Mangin et al. (2012) Heredity 108:285-291,
-r^2_S / r^2_V / r^2_VS -- LD corrected for structure and relatedness. Paywalled
-and unavailable at the time of writing. The LDcorSV signature
-Measure.R2V(biloci, V, na.presence, V_inv) suggests a V^-1-weighted GLS
-correlation, which would reduce to whitening the planes once and reusing this
-module's epilogue unchanged -- but that is a hypothesis, not a finding, and the
-rule at the head of this list applies.
+Read but NOT implemented, and the reason is worth recording:
+
+Mangin, Siberchicot, Nicolas, Doligez, This & Cierco-Ayrolles (2012)
+    Heredity 108(3):285-291        r^2_S / r^2_V / r^2_VS -- LD corrected for
+    https://doi.org/10.1038/hdy.2011.73   population structure and relatedness
+
+Their eqs (1)-(3), cross-checked against the authors' own R implementation
+(LDcorSV 1.3.3, CRAN archive), are:
+
+    r^2_S   partial correlation -- the Schur complement of the joint
+            covariance of the two loci and the structure matrix S, i.e. the
+            residual covariance after regressing both loci on S.
+    r^2_V   GLS-centred, V^-1-weighted correlation. With
+            F = 1 1' V^-1 / (1' V^-1 1), the paper premultiplies by V^-1/2 and
+            forms Sigma^V = (X - FX)' V^-1 (X - FX).
+    r^2_VS  the Schur complement of eq (1), taken in the V^-1 metric.
+
+All three reduce to ONE linear map applied to the genotype planes once, after
+which an ordinary UNCENTERED r^2 is the answer -- and ld_epilogue_compact
+already computes that if it is handed zero sum vectors, since
+(n*S - sA*sB)/sqrt(...) collapses to S/sqrt(qA*qB). So the compute would be
+nearly free here. V is only positive SEMI-definite in practice (the paper uses
+the Moore-Penrose inverse V^-, and builds a PSD matrix by zeroing negative
+eigenvalues of an SVD), so the whitening must come from the eigendecomposition,
+V^-1/2 = U Lambda^-1/2 U'; there is no Cholesky factor.
+
+What stops it is the STATISTICS, not the code. The paper establishes that these
+measures are unbiased for unlinked loci (Appendix A, and Tables 1-3 by
+simulation) and that r^2_S is the factor by which sample size must grow to hold
+power at a linked marker -- a POWER result. It derives no null sampling
+distribution for the corrected measures. So chi2 = N * r^2 does not transfer to
+them: after GLS centring and rank-K residualisation the effective sample size is
+not N, and nothing here says what it is. Shipping p_adj on an r^2_V column would
+mean inventing a degrees-of-freedom, which is research, not implementation.
+
+Two further cautions the authors state themselves: which V to use "remains an
+open question", and inverting V "drastically slowed down the computation" at
+their scale (183 accessions). The n x n eigendecomposition puts r^2_V at
+cohort, not biobank, sample sizes. r^2_S is rank-K and has no such limit.
+
+(Main text only; the appendices are in Supplementary Information, unread.)
 """
 from __future__ import annotations
 
