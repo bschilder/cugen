@@ -165,6 +165,22 @@ Note that scipy.stats.chi2.logsf is NOT usable as an oracle: it computes
 log(sf()) and returns inf above chi2 ~ 1450, which is the regime the p-value
 helper exists to serve.
 
+Those are simulated panels. On REAL data (1kGP high-coverage phased chr22
+20-21Mb, 503 EUR samples, no frequency filter):
+
+    chi2 vs N_hap * plink2's own r^2, 319,600 pairs   9.98e-06 relative,
+                                                     plink2's 6-sig-fig floor
+    exact test vs scipy.stats.fisher_exact           1.16e-06, 400 real pairs
+
+and the rare-variant tail behaves very differently from a simulated one:
+exact='auto' fires on 82% of real pairs against 32% simulated, the asymptotic
+test overstates significance on 97.9% of those, and at p < 5e-8 it makes 644
+calls where the exact test makes 387 -- 40% false positives. The worst real pair
+has r^2 = 1.0000 at N = 1,006 with asymptotic -log10(p) = 220.0 against an exact
+3.0, because chi2 = N * r^2 peaks whenever r^2 = 1 no matter how few copies of
+the allele produced it. See benchmarks/results/SIGNIFICANCE.md and
+tests/data/README.md.
+
 References
 ----------
 Each was checked against the paper before the method went into the code.

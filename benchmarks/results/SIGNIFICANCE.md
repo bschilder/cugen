@@ -4,6 +4,14 @@ All numbers measured on the CPU reference path (`backend="numpy"`,
 Apple M-series, Python 3.13, scipy 1.16) on this branch. Every figure below was
 produced by a run; nothing is modelled.
 
+**Two kinds of data appear below and they are labelled.** The unit tests and the
+timings use **simulated** panels, which is the right instrument for pinning
+arithmetic and for constructing a specific confound on demand. The section
+"Real 1000 Genomes chr22" uses **real** data, because a simulated frequency
+spectrum cannot tell you how the layer behaves on the rare-variant tail that
+dominates real cohorts — and that turns out to be where the interesting
+behaviour is.
+
 There is **no plink2 comparison in this document, and that is not an omission**.
 plink2 emits no LD p-values. Christopher Chang planned `{chi-square, df,
 p-value}` columns for `--r2` and never shipped them
@@ -51,7 +59,7 @@ far from its 1450 underflow there.
 
 ## Cost — the asymptotic layer is free
 
-400 variants x 2,000 samples, 79,800 pairs, median of 5 runs:
+*Simulated panel.* 400 variants x 2,000 samples, 79,800 pairs, median of 5 runs:
 
     r2 only                       352.4 ms   (baseline)
     + chi2, p                     350.3 ms    0.99x
@@ -70,7 +78,7 @@ unrepresentable, so the textbook form compares two zeros.
 
 ## Cost — the exact conditional test
 
-200 variants x 500 samples (1,000 haplotypes), 18,915 pairs, 20% of variants
+*Simulated panel.* 200 variants x 500 samples (1,000 haplotypes), 18,915 pairs, 20% of variants
 rare (f = 0.03), median of 3:
 
     asymptotic only                24.7 ms   (baseline)
@@ -82,7 +90,7 @@ self-limiting: `min(nA,nB)^2 <= nA*nB < 5N`, so the hypergeometric tail sum is
 bounded by `sqrt(5N)` terms — about 158 at 1000 Genomes size, fewer for rarer
 variants. The pairs that need the exact test are the pairs where it is cheap.
 
-## What the exact test changes
+## What the exact test changes (simulated)
 
 Over the 6,032 pairs where `auto` fired, comparing the two p-values:
 
@@ -104,9 +112,9 @@ single copy of each allele a perfect table has probability 1/N. This is the
 `r^2 >= 0.8` trap in one line — a hard r^2 threshold cannot distinguish real
 disequilibrium from a singleton coincidence, and neither can chi2.
 
-## What inflation control changes
+## What inflation control changes (simulated)
 
-Two subpopulations differing by dAF = 0.60, pooled, n = 2,000, 120 variants,
+*A confound built on purpose.* Two subpopulations differing by dAF = 0.60, pooled, n = 2,000, 120 variants,
 each variant drawn **independently within each subpopulation** — so there is no
 gametic LD anywhere in the fixture and every significant call is a false
 positive:
@@ -138,6 +146,95 @@ The conventional cut is not conservative; it is answering a different question.
 Emitted row counts on that run: 1,770 unfiltered, 1,347 at BH-FDR 0.05, 967 at
 Bonferroni 0.05 — the expected ordering.
 
+## Real 1000 Genomes chr22
+
+1kGP high-coverage phased panel (`20220422_3202_phased_SNV_INDEL_SV`),
+chr22:20–21 Mb, biallelic SNVs, streamed with `bcftools` rather than downloaded.
+Reproduce with `uv run --with cyvcf2 python benchmarks/significance_1kg.py --dir DIR`;
+the fixture commands are in `tests/data/README.md`.
+
+    EUR       503 samples, 800 variants, MAF >= 0.01 within EUR
+    EAS       504 samples, 800 variants, MAF >= 0.01 within EAS
+    EUR+EAS  1007 samples, 800 variants, MAF >= 0.01 in the pooled sample
+    EURrare   503 samples, 800 variants, NO frequency filter
+
+### chi2 against plink2's own r^2, 319,600 real pairs
+
+plink2 emits no p-value, so this validates the **statistic** against an
+independent LD implementation and leaves the tail to scipy.
+
+    pairs joined                    319,600 of 319,600 / 319,600   (identical sets)
+    |chi2_cugen - N_hap * r2_plink|  max 9.997e-04   median 7.255e-06
+    relative                         max 9.977e-06
+    -log10(p) from plink2's r2       max 2.145e-04
+
+9.98e-06 relative is plink2's six-significant-figure text floor, the same limit
+`PHASED.md` reports for r^2 itself — not a difference in arithmetic.
+
+Join on **variant ID, not position**. Split multi-allelic sites share a POS, so a
+`(POS_A, POS_B)` key is not unique, the merge silently becomes many-to-many
+(322,796 rows out of 319,600 × 319,600) and the max error comes out as 954
+instead of 1e-3. `compare_plink.py` documents the same trap from the other
+direction, where every 1KG chr22 ID was `.`.
+
+### The exact test on a real frequency spectrum — EUR, no MAF filter
+
+    pairs 32,640      auto fired on 26,844  (82.2%)
+    vs scipy.stats.fisher_exact, 400 real pairs:   max |diff| 1.161e-06
+
+**`auto` fires on 82% of real pairs, against 32% on the simulated panel.** Real
+1KG is dominated by rare variants, so the regime where the asymptotic test is
+untrustworthy is the common case, not a corner.
+
+    asymptotic OVERSTATES significance on 97.9% of them
+    log10(p_exact / p_asym)   median +0.110   p95 +0.539   max +217.0
+    called significant at p < 5e-8:   asymptotic 644     exact 387
+
+**257 of 644 genome-wide-significant calls — 40% — are false positives the exact
+test removes, on real data.** The worst pair is the singleton trap in the wild:
+
+    real pair, r^2 = 1.0000, N = 1,006 haplotypes
+    asymptotic  -log10 p = 220.0
+    exact       -log10 p =   3.0
+
+r^2 = 1 with a single copy of each allele. `chi2 = N * r^2` hits its maximum
+regardless of how few copies produced it, so the asymptotic test reads p = 1e-220
+where the honest answer is p = 1e-3. This pair exists in 1000 Genomes chr22.
+
+### lambda_gc across real populations
+
+    population   n      pairs      lambda    p<5e-8 raw -> adjusted
+    EUR          503    319,600     13.97      30.5%  ->   5.3%
+    EAS          504    319,600     15.11      32.4%  ->   5.1%
+    EUR+EAS     1007    319,600     29.24      43.2%  ->   4.3%
+
+Read this carefully, because it does **not** say what the simulated
+lambda = 920 said. Within a single population lambda is already ~14 — and that is
+mostly **real LD**, not confounding: every pair here sits inside a 1 Mb window,
+so the "most tests are null" assumption behind genomic control is violated by
+construction. The structure signal is the **ratio**: pooling two populations
+takes lambda from ~14 to 29.2, a 2.1x inflation on top of whatever the
+within-population baseline is.
+
+So on real windowed data lambda is a **diagnostic, not a correction to apply
+blindly** — it cannot separate pervasive true LD from stratification. It is
+opt-in for exactly this reason. The clean use is an unwindowed or
+trans-chromosome scan, where the null assumption holds.
+
+### Multiple testing on real chr22 LD, m = 319,600
+
+    none              319,600 pairs (100.0%)    min r2 retained  0.00000
+    Bonferroni 0.05   101,380 pairs ( 31.7%)    min r2 retained  0.02735
+    BH-FDR 0.05       208,415 pairs ( 65.2%)    min r2 retained  0.00454
+    r2 >= 0.8 (convention)  8,523 pairs (2.667%)
+
+The conventional cut keeps **2.7%** of pairs; a family-wise-controlled threshold
+keeps **31.7%**, and its actual r^2 boundary is **0.027**. So `r2 >= 0.8` is not a
+conservative version of a significance test — it is roughly 12x stricter in what
+it retains while providing no error control at all, and it simultaneously admits
+the singleton pairs above that no error rate would tolerate. It is strict in the
+wrong place and permissive in the wrong place.
+
 ## Caveats that travel with these numbers
 
 - All timings are the **CPU reference path**. The asymptotic statistics also run
@@ -148,7 +245,12 @@ Bonferroni 0.05 — the expected ordering.
   `@requires_cudf` tests skip rather than fail.
 - `lambda_gc` assumes most tested pairs are null. That holds for an unwindowed
   chromosome scan; inside a tight window it is false, which is why the estimate
-  uses the distant half and why the flag is opt-in.
+  uses the distant half and why the flag is opt-in. The real-data numbers above
+  show this concretely: lambda ~ 14 within one population at 1 Mb is mostly true
+  LD, so only the pooled/single ratio is interpretable as structure.
+- The real-data section is one 1 Mb window of chr22 in two populations. It is
+  enough to show the rare-variant behaviour and the pooling effect; it is not a
+  genome-wide or multi-cohort characterisation.
 - The exact test is hap2bit only. Dosage data carries no 2x2 haplotype table, so
   there is nothing to condition on, and asking for it there raises.
 - Missing calls make N vary per pair, which breaks the monotone p<->r^2
@@ -159,3 +261,6 @@ Bonferroni 0.05 — the expected ordering.
 
     uv run pytest tests/test_ld_significance.py tests/test_popstruct.py -q
     uv run python tests/mutation_sweep.py        # 28 mutations, 0 missed
+
+    # real data (streams ~1 Mb of chr22 from EBI; needs bcftools + plink2)
+    uv run --with cyvcf2 python benchmarks/significance_1kg.py --dir DIR

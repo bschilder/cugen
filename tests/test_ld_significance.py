@@ -16,6 +16,7 @@ Two facts drive the design and are pinned by tests here:
      scipy's own `chi2.sf` returns a flat zero.
 """
 import math
+import pathlib
 
 import numpy as np
 import pytest
@@ -136,7 +137,7 @@ def test_chi2_counts_individuals_on_an_unphased_file(tmp_path):
     assert (df["N_OBS"] == 50).all(), "expected 50 individuals"
 
 
-def test_neg_log10_p_matches_scipy_on_real_fixture_data(small_cugen):
+def test_neg_log10_p_matches_scipy_on_simulated_dosages(small_cugen):
     df = L.ld_matrix(small_cugen[0], stats=("r2", "chi2", "p"), **CPU)
     want = np.array([oracle_neglog10p(c) for c in df["CHI2"].to_numpy(np.float64)])
     np.testing.assert_allclose(
@@ -594,3 +595,119 @@ def test_lambda_gc_is_off_by_default(tmp_path):
 def test_lambda_gc_requires_the_p_statistic(small_cugen):
     with pytest.raises(ValueError, match="lambda_gc"):
         L.ld_matrix(small_cugen[0], stats=("r2",), lambda_gc=True, **CPU)
+
+
+# ------------------------------------------------------- real 1000 Genomes
+# Everything above is simulated, which is right for pinning arithmetic but says
+# nothing about a real minor-allele frequency spectrum. tests/data/README.md
+# records exactly how this fixture was built: 1kGP high-coverage phased panel,
+# chr22:20-21Mb, biallelic SNVs, the 503 EUR samples, NO frequency filter, first
+# 150 variants. Real 1KG is dominated by rare variants, which is precisely the
+# regime where the asymptotic test fails.
+
+DATA = pathlib.Path(__file__).parent / "data"
+KG = str(DATA / "ld_1kg_chr22_eur.cugen")
+
+
+def test_the_real_1kg_fixture_still_has_the_maf_spectrum_these_tests_need():
+    """A guard, not a check of production code.
+
+    If this fixture is ever regenerated with a MAF filter the tests below stop
+    testing anything -- they would silently pass on common variants where the
+    asymptotic test is perfectly fine. Assert the spectrum up front.
+    """
+    from cugen.io import read_cugen
+    hap = L._haplotypes_numpy(read_cugen(KG))
+    H = hap.shape[1]
+    ac = hap.sum(axis=1)
+    assert H == 1006, f"expected 2 x 503 EUR haplotypes, got {H}"
+    assert (ac == 1).sum() >= 5, "no singletons -- fixture was frequency-filtered"
+    assert (ac <= 5).sum() >= 100, "too few rare variants to exercise the gate"
+    assert ((np.minimum(ac, H - ac) / H) >= 0.05).sum() >= 10, "no common variants"
+
+
+def test_chi2_on_real_1kg_data_counts_haplotypes():
+    df = L.ld_matrix(KG, stats=("r2_phased", "chi2"), **CPU)
+    assert len(df) > 500
+    assert (df["N_OBS"] == 1006).all(), "real phased data must be counted in gametes"
+    np.testing.assert_allclose(df["CHI2"].to_numpy(np.float64),
+                               1006.0 * df["R2_PHASED"].to_numpy(np.float64),
+                               rtol=1e-5)
+
+
+def test_exact_test_matches_scipy_on_real_1kg_rare_variants():
+    """The exact test against scipy on real allele-count distributions.
+
+    The simulated version of this test uses frequencies drawn from a uniform;
+    real 1KG has singletons, doubletons and monomorphic-within-EUR variants, and
+    the hypergeometric tail behaves differently out there.
+    """
+    from cugen.io import read_cugen
+    from scipy.stats import fisher_exact
+
+    hap = L._haplotypes_numpy(read_cugen(KG)).T          # (H, n_variants)
+    N = hap.shape[0]
+    df = L.ld_matrix(KG, stats=("r2_phased", "p"), exact="auto", **CPU)
+    fired = df.loc[df["NEG_LOG10_P_EXACT"].notna()]
+    assert len(fired) >= 300, f"auto only fired on {len(fired)} real pairs"
+
+    worst, checked = 0.0, 0
+    for ga, gb, got in zip(fired["gidx_a"], fired["gidx_b"],
+                           fired["NEG_LOG10_P_EXACT"]):
+        nAB, nA, nB, _ = hap_table(hap, int(ga), int(gb))
+        table = [[nAB, nA - nAB], [nB - nAB, N - nA - nB + nAB]]
+        worst = max(worst, abs(float(got)
+                               + math.log10(fisher_exact(table)[1])))
+        checked += 1
+        if checked >= 300:
+            break
+    assert worst < 1e-4, f"max |diff| vs scipy on real data: {worst:.3e}"
+
+
+def test_asymptotic_test_overstates_significance_on_real_1kg_rare_variants():
+    """The reason the exact test is not optional, on real data.
+
+    Documented in benchmarks/results/SIGNIFICANCE.md. The bound here is loose on
+    purpose -- the claim under test is the DIRECTION and rough magnitude of the
+    bias, which must not silently reverse, not an exact count that would churn
+    whenever the fixture changes.
+    """
+    df = L.ld_matrix(KG, stats=("r2_phased", "p"), exact="auto", **CPU)
+    a = df.loc[df["NEG_LOG10_P_EXACT"].notna()]
+    nl_as = a["NEG_LOG10_P"].to_numpy(np.float64)
+    nl_ex = a["NEG_LOG10_P_EXACT"].to_numpy(np.float64)
+
+    overstated = (nl_as > nl_ex + 1e-9).mean()
+    assert overstated > 0.75, (
+        f"asymptotic overstates on only {overstated:.1%} of real rare pairs")
+
+    gws = 7.3                                            # p < 5e-8
+    assert (nl_as > gws).sum() > (nl_ex > gws).sum(), (
+        "the exact test removed no genome-wide-significant calls on real data")
+
+
+def test_the_singleton_trap_is_present_in_real_1kg_data():
+    """A real pair at r^2 = 1.0000 that the asymptotic test wildly overcalls.
+
+    chi2 = N * r^2 reaches its maximum whenever r^2 = 1, however few copies of
+    the allele produced it -- so a low-count pair in perfect LD is read as
+    overwhelming evidence. This is the concrete failure mode behind the
+    'r2 >= 0.8' convention, and it is present in real 1000 Genomes chr22.
+    """
+    df = L.ld_matrix(KG, stats=("r2_phased", "p"), exact="auto", **CPU)
+    perfect = df[(df["R2_PHASED"] > 0.999) & df["NEG_LOG10_P_EXACT"].notna()]
+    assert len(perfect) >= 1, "fixture no longer contains a perfect-LD rare pair"
+    w = perfect.iloc[int(perfect["NEG_LOG10_P"].to_numpy().argmax())]
+    assert w["NEG_LOG10_P"] > 200, "asymptotic value is not the extreme one"
+    assert w["NEG_LOG10_P"] - w["NEG_LOG10_P_EXACT"] > 100, (
+        "the exact test barely moved a perfect-LD low-count pair: "
+        f"asym {w['NEG_LOG10_P']:.1f} vs exact {w['NEG_LOG10_P_EXACT']:.1f}")
+
+
+def test_corrections_run_on_real_1kg_data_and_order_correctly():
+    every = L.ld_matrix(KG, stats=("r2_phased", "p"), **CPU)
+    bon = L.ld_matrix(KG, stats=("r2_phased", "p"), correction="bonferroni",
+                      alpha=0.05, **CPU)
+    fdr = L.ld_matrix(KG, stats=("r2_phased", "p"), correction="fdr",
+                      alpha=0.05, **CPU)
+    assert 0 < len(bon) <= len(fdr) < len(every)
