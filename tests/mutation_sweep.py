@@ -9,14 +9,187 @@ an equivalent mutant -- d[0] is already 0, so tau[0] is already 0 and the line
 cannot change any output. Listing it would make the sweep permanently red for a
 behaviour that does not exist.
 """
+import os
 import pathlib
 import shutil
 import subprocess
 import sys
 
-ROOT = pathlib.Path("/Users/bschilder/code/cugen")
+# Derived, not hardcoded: the sweep has to run wherever the GPU is, and an
+# absolute developer path made it unrunnable on a pod.
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 MUTATIONS = [
+    # ---- test space: the params that set the denominator m ----
+    ('maf_max never filters', 'cugen/ld.py',
+     """        rows = rows[maf_all[rows] <= float(maf_max)]""",
+     """        pass""", "tests/test_ld_testspace.py"),
+    ('cis does not stop at the chromosome boundary', 'cugen/ld.py',
+     """    if scope == "cis" or set_bp:
+        hi = np.minimum(hi, blk_end)""",
+     """    if False:
+        hi = np.minimum(hi, blk_end)""", "tests/test_ld_testspace.py"),
+    ('trans does not skip its own chromosome', 'cugen/ld.py',
+     """    if scope == "trans":
+        starts = np.maximum(starts, blk_end)""",
+     """    if False:
+        starts = np.maximum(starts, blk_end)""", "tests/test_ld_testspace.py"),
+    ('min_dist_kb raises hi instead of starts', 'cugen/ld.py',
+     """                if comb == "hi":""",
+     """                if True:""", "tests/test_ld_testspace.py"),
+    ('interleaved chromosomes are banded anyway', 'cugen/ld.py',
+     """    if len(np.unique(seen)) != len(seen):""",
+     """    if False:""", "tests/test_ld_testspace.py"),
+    ('top_k ranks only gidx_a, so it is asymmetric', 'cugen/ld.py',
+     """    owner = np.concatenate([a, b])""",
+     """    owner = np.concatenate([a, a])""", "tests/test_ld_testspace.py"),
+    ('the GPU mask ignores the shared lower bound', 'cugen/ld.py',
+     """            keep = ((jj >= st_d[ii]) & (jj < hi_d[ii])""",
+     """            keep = ((jj > ii) & (jj < hi_d[ii])""",
+     "tests/test_ld_testspace.py"),
+    # ---- p-value recovery ----
+    ('per-pair N is dropped, so p falls back to the scalar', 'cugen/ldio.py',
+     """        if col.size and np.ptp(col) > 0:""",
+     """        if False:""", "tests/test_ld_pvalue_recovery.py"),
+    ('a constant N is stored anyway, wasting the column', 'cugen/ldio.py',
+     """        if col.size and np.ptp(col) > 0:
+            n = col""",
+     """        if True:
+            n = col""", "tests/test_ld_pvalue_recovery.py"),
+    ('the N deficit is decoded without the reference', 'cugen/ldio.py',
+     """        n = None if nd is None else (int(self.n_samples) - nd)""",
+     """        n = None if nd is None else nd""",
+     "tests/test_ld_pvalue_recovery.py"),
+    ('p is invented when no N is recorded', 'cugen/ldio.py',
+     "        if not scalar:", "        if False:",
+     "tests/test_ld_pvalue_recovery.py"),
+    # ---- fine-mapping from a stored LD panel ----
+    ('from_ld accepts z and R of different lengths',
+     'cugen/_step5b_finemapping.py',
+     """    if z.size != R.shape[0]:""",
+     """    if False:""", "tests/test_finemap_from_ld.py"),
+    ('from_ld adds the ridge in place, mutating the caller\'s R',
+     'cugen/_step5b_finemapping.py',
+     """    R = R.astype(cp.float32, copy=True)""",
+     """    R = R.astype(cp.float32, copy=False)""", "tests/test_finemap_from_ld.py"),
+    # ---- LD result storage (.cugenld) ----
+    ('matrix output silently returns pairs', 'cugen/ld.py',
+     """    if output_format == \"matrix\":""",
+     """    if False:""", "tests/test_ldio.py"),
+    ('matrix output accepts a threshold', 'cugen/ld.py',
+     """    if output_format == \"matrix\" and (min_r2 > 0 or max_p is not None""",
+     """    if False and (min_r2 > 0 or max_p is not None""", "tests/test_ldio.py"),
+    # Deliberately NOT included: replacing os.replace() with copy+remove.
+    # Both complete identically in the absence of a crash, so it is an
+    # equivalent mutant -- atomicity is only observable under fault
+    # injection, and listing it would keep the sweep permanently red.
+    ('resume trusts a manifest entry whose file is gone', 'cugen/ldio.py',
+     """                            if os.path.exists(os.path.join(self.path,""",
+     """                            if True or os.path.exists(os.path.join(self.path,""", "tests/test_ldio.py"),
+    ('resume ignores a params mismatch', 'cugen/ldio.py',
+     """            if man.get(\"params\") != self.params:""",
+     """            if False:""", "tests/test_ldio.py"),
+    ('manifest shard skip ignores max_abs_r', 'cugen/ldio.py',
+     """            return sh[\"max_abs_r\"] ** 2 >= min_r2""",
+     """            return True""", "tests/test_ldio.py"),
+    ('variant() opens every shard', 'cugen/ldio.py',
+     """            if not (sh[\"min_i\"] <= v <= sh[\"max_i\"]):""",
+     """            if False:""", "tests/test_ldio.py"),
+    ('block pair cap is ignored', 'cugen/ldio.py',
+     """                if m > self.max_block_pairs:""",
+     """                if False:""", "tests/test_ldio.py"),
+    ('r quantisation truncates instead of rounding', 'cugen/ldio.py',
+     """    return np.clip(np.rint(a * scale), -lim, lim).astype(_ENC_DTYPE[encoding])""",
+     """    return np.clip(np.trunc(a * scale), -lim, lim).astype(_ENC_DTYPE[encoding])""", "tests/test_ldio.py"),
+    ('delta coding does not reset at row boundaries', 'cugen/ldio.py',
+     """        d[rs] = 0                                # reset at each row start""",
+     """        pass""", "tests/test_ldio.py"),
+    ('delta decode drops the running sum', 'cugen/ldio.py',
+     """            c = np.cumsum(d.astype(np.int64))""",
+     """            c = d.astype(np.int64)""", "tests/test_ldio.py"),
+    ('zone map ignores max_abs_r and never skips', 'cugen/ldio.py',
+     """            if t is not None and t > 0.0 and b[\"max_abs_r\"] ** 2 < t:""",
+     """            if False:""", "tests/test_ldio.py"),
+    ('reader answers a too-loose threshold instead of raising', 'cugen/ldio.py',
+     """        if t < stored - 1e-12:""",
+     """        if False:""", "tests/test_ldio.py"),
+    ('rows() re-applies the stored cut to quantised r', 'cugen/ldio.py',
+     """        if min_r2 is None:
+            return None""",
+     """        if min_r2 is None:
+            return stored""", "tests/test_ldio.py"),
+    ('dense() fills a thresholded file with zeros', 'cugen/ldio.py',
+     """        if stored > 0.0:""",
+     """        if False:""", "tests/test_ldio.py"),
+    # ---- GRM ----
+    ('GRM standardises by p(1-p), not 2p(1-p)', 'cugen/popstruct.py',
+     """        z = xp.where(obs, (x - two_p) / xp.sqrt(two_p * (1.0 - freq[:, None])),""",
+     """        z = xp.where(obs, (x - two_p) / xp.sqrt(freq[:, None] * (1.0 - freq[:, None])),""", "tests/test_popstruct.py"),
+    ('GRM allele freq forgets the factor of two', 'cugen/popstruct.py',
+     """            freq = x.sum(axis=1) / (2.0 * xp.maximum(n_obs, 1))""",
+     """            freq = x.sum(axis=1) / xp.maximum(n_obs, 1)""", "tests/test_popstruct.py"),
+    ('GRM 2-bit unpack loses the big-endian order', 'cugen/popstruct.py',
+     """_SHIFTS = np.array([6, 4, 2, 0], dtype=np.uint8)""",
+     """_SHIFTS = np.array([0, 2, 4, 6], dtype=np.uint8)""", "tests/test_popstruct.py"),
+    # ---- Mangin corrected r^2 ----
+    ('r2_v skips the GLS centring', 'cugen/ld.py',
+     """    P = W @ (eye - np.outer(one, one @ V_inv) / denom)""",
+     """    P = W @ eye""", "tests/test_ld_corrected.py"),
+    ('r2_v centres on the ordinary mean, not the GLS one', 'cugen/ld.py',
+     """    P = W @ (eye - np.outer(one, one @ V_inv) / denom)""",
+     """    P = W @ (eye - np.full((n, n), 1.0 / n))""", "tests/test_ld_corrected.py"),
+    ('r2_v whitens with V instead of its inverse root', 'cugen/ld.py',
+     """    W = (U * np.sqrt(inv)) @ U.T""",
+     """    W = (U * np.sqrt(np.abs(w))) @ U.T""", "tests/test_ld_corrected.py"),
+    ('r2_s forgets to residualise on the structure', 'cugen/ld.py',
+     """        return (eye - H) @ (eye - np.full((n, n), 1.0 / n))""",
+     """        return (eye - np.full((n, n), 1.0 / n))""", "tests/test_ld_corrected.py"),
+    ('r2_vs drops the Schur complement', 'cugen/ld.py',
+     """    return (eye - Hz) @ P""",
+     """    return P""", "tests/test_ld_corrected.py"),
+    ('pseudo-inverse keeps the null eigenvalues', 'cugen/ld.py',
+     """    inv = np.where(dead, 0.0, 1.0 / np.where(dead, 1.0, w))""",
+     """    inv = 1.0 / np.where(np.abs(w) < 1e-300, 1e-300, w)""", "tests/test_ld_corrected.py"),
+    # ---- LD significance ----
+    ('exact test just returns the asymptotic value', 'cugen/ld.py',
+     """    for t in np.flatnonzero(need):
+        out[t] = _fisher_neglog10p_2x2(nAB[t], nA[t], nB[t], n[t])""",
+     """    for t in np.flatnonzero(need):
+        out[t] = _neglog10_chi2_1df(np.array([float(n[t]) * 0.5]), np)[0]""", "tests/test_ld_significance.py"),
+    ('nAB reconstruction truncates instead of rounding', 'cugen/ld.py',
+     """    return np.rint((r * den + nA * nB) / float(N)).astype(np.int64)""",
+     """    return np.floor((r * den + nA * nB) / float(N)).astype(np.int64)""", "tests/test_ld_significance.py"),
+    ('exact test gate never fires', 'cugen/ld.py',
+     """    return (a * b / xp.asarray(N, dtype=xp.float64)) < 5.0""",
+     """    return (a * b / xp.asarray(N, dtype=xp.float64)) < 0.0""", "tests/test_ld_significance.py"),
+    ('Fisher two-sided keeps only the observed table', 'cugen/ld.py',
+     """    tail = float(pmf[pmf <= obs * (1.0 + 1e-7)].sum())""",
+     """    tail = float(obs)""", "tests/test_ld_significance.py"),
+    ('chi2 counts individuals, not gametes', 'cugen/ld.py',
+     """    n_eff = (2 * int(reader.n_samples) if want_phased
+                 else int(reader.n_samples))""",
+     """    n_eff = int(reader.n_samples)""", "tests/test_ld_significance.py"),
+    # The device emit builds its own n_obs, but that path needs cuDF, so a
+    # mutation there is unreachable on a CPU box and would leave the sweep
+    # permanently red. phased_from_haplotypes is the CPU-side equivalent.
+    ('phased N counts individuals, not haplotypes', 'cugen/ld.py',
+     """            "n": np.full(pairs.shape[0], H),""",
+     """            "n": np.full(pairs.shape[0], H / 2.0),""", "tests/test_ld_significance.py"),
+    ('asymptotic p-value branch taken far too early', 'cugen/ld.py',
+     """_NLP_ASYMPTOTIC_FROM = 400.0""",
+     """_NLP_ASYMPTOTIC_FROM = 30.0""", "tests/test_ld_significance.py"),
+    ('erfc branch used everywhere, no asymptotic tail', 'cugen/ld.py',
+     """    return xp.where(z <= cut, small, large)""",
+     """    return small""", "tests/test_ld_significance.py"),
+    ('BH inequality flipped', 'cugen/ld.py',
+     """    ok = order >= np.log10(m / (k * alpha))""",
+     """    ok = order <= np.log10(m / (k * alpha))""", "tests/test_ld_significance.py"),
+    ('BH uses the survivor count as m, not the test count', 'cugen/ld.py',
+     """        cut, k = _bh_threshold_neglog10p(vals, m, alpha)""",
+     """        cut, k = _bh_threshold_neglog10p(vals, vals.size, alpha)""", "tests/test_ld_significance.py"),
+    ('Bonferroni forgets to divide by the test count', 'cugen/ld.py',
+     """        max_p = alpha / m_tests""",
+     """        max_p = alpha""", "tests/test_ld_significance.py"),
     ("aggregate pos = mean(all) not mean(first,last)", "cugen/_impute_core.py",
      "agg_cm = 0.5 * (cm[starts] + cm[stops - 1])",
      "agg_cm = np.array([cm[a:b].mean() for a, b in zip(starts, stops)])"),
@@ -60,23 +233,51 @@ MUTATIONS = [
 ]
 
 
-def run():
-    r = subprocess.run([".venv/bin/python", "-m", "pytest", "tests/test_impute.py",
+# Each mutation names the test file that is SUPPOSED to catch it. Running the
+# whole suite per mutation would be correct but slow; running one fixed file --
+# which this did, always tests/test_impute.py -- silently gives every mutation
+# outside that file a free pass. Both failure modes are worse than this.
+# The interpreter to test with: .venv locally, $CUGEN_PY where the venv lives
+# somewhere else (a pod mounts it outside the repo).
+PY = os.environ.get("CUGEN_PY", str(ROOT / ".venv/bin/python"))
+
+DEFAULT_TARGET = "tests/test_impute.py"
+
+
+def run(target=DEFAULT_TARGET):
+    # PYTHONDONTWRITEBYTECODE is load-bearing, not tidiness. Several mutations
+    # here swap a string for one of the SAME LENGTH (e.g. [6, 4, 2, 0] ->
+    # [0, 2, 4, 6]). Restoring the original then leaves a file with identical
+    # size and a near-identical mtime, so CPython happily reuses the .pyc it
+    # compiled from the MUTATED source -- and the next ordinary `pytest` run
+    # reports failures that are not in the working tree. That cost real
+    # debugging time once; do not remove this.
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    r = subprocess.run([PY, "-m", "pytest", target,
                         "-q", "--no-header", "-p", "no:cacheprovider"],
-                       cwd=ROOT, capture_output=True, text=True)
+                       cwd=ROOT, capture_output=True, text=True, env=env)
     return (r.stdout + r.stderr).strip().splitlines()[-1]
 
 
+def _drop_pycache():
+    for d in ROOT.rglob("__pycache__"):
+        shutil.rmtree(d, ignore_errors=True)
+
+
 caught = missed = 0
-for desc, rel, frm, to in MUTATIONS:
+for entry in MUTATIONS:
+    desc, rel, frm, to = entry[:4]
+    target = entry[4] if len(entry) > 4 else DEFAULT_TARGET
     f = ROOT / rel
     bak = f.read_text()
     if frm not in bak:
         print(f"  {desc:48s} !! PATTERN NOT FOUND")
         continue
     f.write_text(bak.replace(frm, to, 1))
-    line = run()
+    _drop_pycache()
+    line = run(target)
     f.write_text(bak)
+    _drop_pycache()
     ok = "failed" in line
     caught += ok
     missed += not ok

@@ -1,6 +1,11 @@
 """cugen.ld - GPU linkage disequilibrium from packed genotypes.
 
-    ld_matrix(...)    signed r, r^2, signed r^2, D, D'     (alias: cg.r2)
+    ld_matrix(...)    signed r, r^2, signed r^2, D, D', phased variants,
+                      and significance: chi2, -log10(p), an exact conditional
+                      test, Bonferroni/BH-FDR filtering and inflation control
+                      (alias: cg.r2; CLI: cugen ld)
+                      Also r2_S / r2_V / r2_VS -- r^2 corrected for population
+                      structure and relatedness (estimators only, no p-value)
     ld_prune(...)     prune to approximate linkage equilibrium  (alias:
                       cg.prune). plink2 --indep-pairwise parity. Same greedy
                       algorithm as ld_clump, ranked by allele frequency rather
@@ -64,6 +69,42 @@ does not build on read_to_gpu(), which maps missing -> dosage 0; that is the
 failure mode fixed in 85ff1b0 (complete-case association kernel, session 52).
 Verified: plink2 --r2-unphased is also pairwise-complete, not mean-imputing.
 
+SIGNIFICANCE
+------------
+The test of no disequilibrium between two biallelic loci is chi2 = N * r^2 with
+1 df -- Park (2019) eq. 1 writes it as 2n D^2 / (pA qA pB qB), the same thing.
+N counts GAMETES for the phased statistics and INDIVIDUALS for the composite
+ones, which is the factor of two between gametic and composite LD; N_OBS
+already carries the right one on every path.
+
+Emitted as -log10(p), never p. p underflows float64 at chi2 ~ 1450 and float32
+at chi2 ~ 170, and chi2 = N_OBS * r^2, so at 1000 Genomes size (N_hap = 5008)
+float32 dies at r^2 = 0.034 and float64 at r^2 = 0.29. A P column would read as
+a flat zero for essentially every linked pair genome-wide.
+
+Filtering by p costs nothing. With no missingness every pair shares one N, so
+chi2 is strictly monotone in r^2 and a p-cut IS an r^2-cut: max_p is converted
+to min_r2 and handed to the filter the kernel already applies. The number of
+tests likewise needs no pass over the data -- it is _count_pairs, closed form
+from the row count and the window -- so Bonferroni and BH-FDR are affordable at
+genome scale. BH runs in -log10(p) space because at m = 1e14 the thresholds are
+around 1e-16 and the p-values are unrepresentable.
+
+exact= adds a two-sided Fisher test on the 2x2 haplotype table (hap2bit only).
+This IS the exact permutation p-value, not an approximation to it: permuting
+haplotype labels leaves both allele counts fixed, so the permutation null of the
+table is the hypergeometric with those margins. Koch (2013) Monte-Carlo sampled
+that distribution for ~34,000 CPU-hours. exact='auto' fires only where the
+minimum expected cell count is under 5, which bounds the tail sum by
+sqrt(5N) ~ 158 terms at 1000 Genomes size -- the pairs that need it are the
+pairs where it is cheap.
+
+lambda_gc is off by default and matters on real cohorts. Per-pair p assumes
+independent haplotypes, so structure and cryptic relatedness make it
+anti-conservative. Measured here on two subpopulations differing by dAF = 0.6
+with no gametic LD anywhere in the data: lambda = 920, and all 7,140 pairs look
+genome-wide significant on raw p. See the lambda_gc tests.
+
 SIGN
 ----
 r is signed relative to the ALT allele at both variants, consistent with
@@ -109,6 +150,39 @@ open discrepancy rather than a fault on either side. If you need
 plink2-identical D', treat this as a known 0.005% divergence; r and r^2 carry
 no such caveat. See test_cubic_picks_the_global_maximum_likelihood_root.
 
+The significance layer has NO plink2 counterpart to compare against: plink2
+emits no LD p-values (the author planned {chi-square, df, p-value} columns for
+--r2 and never shipped them). It is validated against scipy instead, which is a
+genuinely different implementation:
+
+    -log10(p) vs log(2) + log_ndtr(-sqrt(chi2))     < 1e-6 over chi2 in
+                                                      [0.5, 1e7]
+    exact test vs scipy.stats.fisher_exact          < 1e-4, 40+ pairs
+    exact test vs enumerated permutation null       < 1e-12
+    BH-FDR vs a textbook rank-walk implementation   exact agreement
+    lambda_gc on 1e5 true chi2_1df draws            1.0022
+    nAB recovered from float32 r                    0 wrong of 250+ at N=500
+
+Note that scipy.stats.chi2.logsf is NOT usable as an oracle: it computes
+log(sf()) and returns inf above chi2 ~ 1450, which is the regime the p-value
+helper exists to serve.
+
+Those are simulated panels. On REAL data (1kGP high-coverage phased chr22
+20-21Mb, 503 EUR samples, no frequency filter):
+
+    chi2 vs N_hap * plink2's own r^2, 319,600 pairs   9.98e-06 relative,
+                                                     plink2's 6-sig-fig floor
+    exact test vs scipy.stats.fisher_exact           1.16e-06, 400 real pairs
+
+and the rare-variant tail behaves very differently from a simulated one:
+exact='auto' fires on 82% of real pairs against 32% simulated, the asymptotic
+test overstates significance on 97.9% of those, and at p < 5e-8 it makes 644
+calls where the exact test makes 387 -- 40% false positives. The worst real pair
+has r^2 = 1.0000 at N = 1,006 with asymptotic -log10(p) = 220.0 against an exact
+3.0, because chi2 = N * r^2 peaks whenever r^2 = 1 no matter how few copies of
+the allele produced it. See benchmarks/results/SIGNIFICANCE.md and
+tests/data/README.md.
+
 References
 ----------
 Each was checked against the paper before the method went into the code.
@@ -127,9 +201,91 @@ Gaunt, Rodriguez & Day (2007) BMC Bioinf 8:428  CubeX exact cubic (production)
     https://doi.org/10.1186/1471-2105-8-428
 Chang et al. (2015) GigaScience 4:7             PLINK, behavioural reference
     https://pubmed.ncbi.nlm.nih.gov/25722852/
+Park (2019) Sci Rep 9:11380                     chi2 = 2n D^2/(pA qA pB qB),
+    https://doi.org/10.1038/s41598-019-47832-y  1 df; FDR < 0.05; and the
+                                                argument for chi2 over Fisher
+                                                on both calibration and cost
+Koch, Ristroph & Kirkpatrick (2013)             permutation LRLD -- the method
+    PLoS ONE 8:e80754                           the exact test replaces
+    https://doi.org/10.1371/journal.pone.0080754
+Zaykin, Meng & Weir (2008) Genetics 180:533     n(k-1)(m-1)/(km) R^2 ~ chi2;
+    https://pmc.ncbi.nlm.nih.gov/articles/PMC2535703/  composite LD is robust
+                                                to single-locus HWE departure
+Devlin & Roeder (1999) Biometrics 55(4):997     genomic control; lambda =
+    https://pubmed.ncbi.nlm.nih.gov/11315092/   median(chi2)/0.4549364
+Yang et al. (2011) AJHG 88(1):76-82             GCTA standardised GRM
+    https://doi.org/10.1016/j.ajhg.2010.11.011  (cugen.popstruct.grm)
+
+Implemented as ESTIMATORS ONLY, and the reason for the qualifier matters:
+
+Mangin, Siberchicot, Nicolas, Doligez, This & Cierco-Ayrolles (2012)
+    Heredity 108(3):285-291        r^2_S / r^2_V / r^2_VS -- LD corrected for
+    https://doi.org/10.1038/hdy.2011.73   population structure and relatedness
+
+Their eqs (1)-(3), cross-checked against the authors' own R implementation
+(LDcorSV 1.3.3, CRAN archive), are:
+
+    r^2_S   partial correlation -- the Schur complement of the joint
+            covariance of the two loci and the structure matrix S, i.e. the
+            residual covariance after regressing both loci on S.
+    r^2_V   GLS-centred, V^-1-weighted correlation. With
+            F = 1 1' V^-1 / (1' V^-1 1), the paper premultiplies by V^-1/2 and
+            forms Sigma^V = (X - FX)' V^-1 (X - FX).
+    r^2_VS  the Schur complement of eq (1), taken in the V^-1 metric.
+
+All three reduce to ONE linear map applied to the genotype planes once, after
+which an ordinary UNCENTERED r^2 is the answer -- and ld_epilogue_compact
+already computes that if it is handed zero sum vectors, since
+(n*S - sA*sB)/sqrt(...) collapses to S/sqrt(qA*qB). That is how they are computed here: _corrected_transform builds
+one n x n P per dataset and _corrected_r2 takes the Gram of P X. V is only positive SEMI-definite in practice (the paper uses
+the Moore-Penrose inverse V^-, and builds a PSD matrix by zeroing negative
+eigenvalues of an SVD), so the whitening must come from the eigendecomposition,
+V^-1/2 = U Lambda^-1/2 U'; there is no Cholesky factor.
+
+What is NOT implemented is a p-value for them, and that is a statistics
+limit rather than a code one. Main text and Supplementary Information (both
+read) establish exactly two things:
+
+  Appendix A   Cov(X^l|S, X^m|S) = (1-t)Cov(X^l,X^m|S=0) + t Cov(X^l,X^m|S=1),
+               which is 0 for unlinked loci. Unbiasedness, not a distribution.
+  Appendix B   in the association model Y = 1u + S beta + X theta + eps, the
+               t-statistic at a linked marker is asymptotically Gaussian with
+               VARIANCE 1 and expectation sqrt(r^2_S) Esp(t at the causal
+               locus). That is the null variance of an ASSOCIATION test that
+               carries S as a covariate -- not of the LD measure. Tables 1-3
+               add unbiasedness by simulation. The r^2_V / r^2_VS power results
+               are asserted to follow "the same steps" and are not proven.
+
+So nothing here gives a null sampling law for the corrected measures, and
+chi2 = N * r^2 does not transfer to them: after GLS centring and rank-K
+residualisation the effective sample size is not N.
+
+There IS a route the paper does not take, and it is worth naming so nobody
+re-derives it from scratch. r^2_S is an ordinary squared PARTIAL correlation, so
+classical normal theory gives r^2/(1-r^2) * (N-K-2) ~ F(1, N-K-2) with K the
+column rank of the structure matrix. It was rejected here on purpose. That
+result needs joint normality, which genotypes do not have, whereas the plain
+chi2 = N * r^2 rests on the multinomial structure of the 2x2 table and needs no
+such assumption -- and this module already measures the asymptotic test
+overstating significance on 97.9% of real rare-variant pairs, where the exact
+conditional test is what saves it. Residualising destroys the contingency table,
+so the exact test is unavailable and the fallback is WEAKER than the
+approximation already known to fail on this data. Shipping it would look like
+added rigour and be the opposite. For r^2_V the effective degrees of freedom
+after whitening by a rank-deficient V^- is not even clear.
+
+Hence: asking for chi2/p beside a corrected measure raises.
+
+Two further cautions the authors state themselves: which V to use "remains an
+open question", and inverting V "drastically slowed down the computation" at
+their scale (183 accessions). The n x n eigendecomposition puts r^2_V at
+cohort, not biobank, sample sizes. r^2_S is rank-K and has no such limit.
+
+(Main text only; the appendices are in Supplementary Information, unread.)
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
@@ -173,12 +329,36 @@ EPS = 1e-12
 # deliberately dosage-only, so adding a phased statistic here never changes
 # the result of an existing call.
 _STATS = ("r", "r2", "r2_signed", "d", "dp", "r_phased", "r2_phased",
-          "d_phased", "dp_phased", "r2_phased_em")
+          "d_phased", "dp_phased", "r2_phased_em",
+          "chi2", "p", "p_exact", "chi2_adj", "p_adj",
+          "r2_s", "r2_v", "r2_vs")
 _DEFAULT_STATS = ("r", "r2", "r2_signed", "d", "dp")
 _STAT_COL = {"r": "R", "r2": "R2", "r2_signed": "R2_SIGNED", "d": "D", "dp": "DP",
              "r_phased": "R_PHASED", "r2_phased": "R2_PHASED",
              "d_phased": "D_PHASED", "dp_phased": "DP_PHASED",
-             "r2_phased_em": "R2_PHASED_EM"}
+             "r2_phased_em": "R2_PHASED_EM",
+             "chi2": "CHI2", "p": "NEG_LOG10_P",
+             "p_exact": "NEG_LOG10_P_EXACT",
+             "chi2_adj": "CHI2_ADJ", "p_adj": "NEG_LOG10_P_ADJ",
+             "r2_s": "R2_S", "r2_v": "R2_V", "r2_vs": "R2_VS"}
+# The significance pair. Derived from whichever correlation the path computed
+# and from N_OBS, so they cost no extra passes over the data. "p" emits
+# -log10(p), not p -- see _neglog10_chi2_1df for why p itself is unusable.
+_SIG_STATS = frozenset(("chi2", "p", "p_exact", "chi2_adj", "p_adj"))
+# median of chi-square with 1 df; the denominator of the genomic-control ratio
+_CHI2_1DF_MEDIAN = 0.4549364
+# p_exact conditions on the 2x2 HAPLOTYPE table, which dosage data does not
+# carry -- unlike chi2/p it is phased-only even though it is not a _PHASED_STATS
+# member (those name specific LD estimators; this names a test of any of them).
+_EXACT_MODES = ("never", "auto", "always")
+# Mangin et al. (2012) bias-corrected r^2. ESTIMATORS ONLY -- the paper derives
+# no null sampling distribution for them, so they cannot carry a p-value; see
+# the References block at the head of this module.
+_CORRECTED_STATS = frozenset(("r2_s", "r2_v", "r2_vs"))
+# LDcorSV's Inv.proj.matrix.sdp zeroes eigenvalues below this before inverting.
+# The Moore-Penrose inverse is the paper's prescription; the floor is the R
+# package's choice and is reproduced here for parity with it.
+_PSD_EIGEN_TOL = 1e-5
 # Statistics computed from TRUE haplotype counts, which only a HAP2BIT file
 # carries. Mixing these with the dosage statistics in one call is refused
 # rather than silently served: hap2bit and 2bit share bytes but not meaning
@@ -479,42 +659,140 @@ def _parse_region(region: str) -> Tuple[str, Optional[int], Optional[int]]:
     return chrom, start, end
 
 
-def _pair_bounds(n_rows: int, positions: Optional[np.ndarray],
-                 window: Optional[int], window_kb: Optional[float]):
-    """Per-row exclusive upper column bound for the upper-triangle scan.
+SCOPES = ("all", "cis", "trans")
 
-    Both window predicates AND together, matching PLINK. Banding by position
-    uses searchsorted so the column extent is O(band), not O(p). Returns
-    (starts, hi) so the pair COUNT can be taken without materialising pairs --
-    at p = 1.1M the materialised list would be ~6e11 entries.
+
+def _chrom_runs(chrom_codes) -> np.ndarray:
+    """Row-block boundaries per chromosome, as an (n_blocks + 1,) edge array.
+
+    cis/trans banding stays a CONTIGUOUS column range only because each
+    chromosome occupies one contiguous run of rows -- which is what a
+    position-sorted .cugen (and merge_cugen's output) gives. If a chromosome
+    appears in two runs the contiguous form would silently drop pairs, so this
+    refuses rather than banding wrongly.
     """
-    if window_kb is not None and positions is None:
-        raise ValueError("window_kb requires variant positions; pass annotation=")
-    if positions is not None and len(positions):
-        if np.any(np.diff(positions) < 0):
-            raise ValueError("positions are not non-decreasing along file rows; "
-                             "banding would be silently wrong. Sort the .cugen "
-                             "or drop window_kb.")
+    a = np.asarray(chrom_codes)
+    if a.size == 0:
+        return np.zeros(1, dtype=np.int64)
+    edges = np.concatenate([[0], np.flatnonzero(a[1:] != a[:-1]) + 1, [a.size]])
+    seen = a[edges[:-1]]
+    if len(np.unique(seen)) != len(seen):
+        dup = [int(c) for c in np.unique(seen) if (seen == c).sum() > 1]
+        raise ValueError(
+            f"chromosome code(s) {dup} appear in more than one row run, so "
+            f"chromosomes are not contiguous blocks of rows. cis/trans banding "
+            f"needs contiguous blocks; sort the .cugen by (chrom, pos) first.")
+    return edges.astype(np.int64)
+
+
+def _pair_bounds(n_rows: int, positions: Optional[np.ndarray],
+                 window: Optional[int], window_kb: Optional[float],
+                 min_dist_kb: Optional[float] = None,
+                 max_dist_kb: Optional[float] = None,
+                 scope: str = "all", chrom_codes=None):
+    """Per-row half-open column range ``[starts, hi)`` for the upper triangle.
+
+    Every test-space predicate collapses to this one contiguous range, which is
+    what keeps the pair COUNT closed-form -- at p = 1.1M a materialised pair
+    list would be ~6e11 entries, and m is needed before any data is read.
+    Predicates AND together, matching PLINK:
+
+        window        hi <- i + window + 1
+        max_dist_kb   hi <- last j with pos[j] - pos[i] <= span   (== window_kb)
+        scope="cis"   hi <- end of i's chromosome block
+        min_dist_kb   starts <- first j with pos[j] - pos[i] >= span
+        scope="trans" starts <- end of i's chromosome block
+
+    Two raise ``hi``-side bounds down and two push ``starts`` up, so the
+    intersection is still one range and no predicate needs a mask.
+
+    A bp predicate is implicitly WITHIN-chromosome (plink2's --ld-window-kb
+    semantic): base-pair distance between chromosomes is not a number, so the
+    span search runs per chromosome block and never reaches across one.
+    """
+    if scope not in SCOPES:
+        raise ValueError(f"unknown scope {scope!r}; valid are {list(SCOPES)}")
+    bp = {"window_kb": window_kb, "min_dist_kb": min_dist_kb,
+          "max_dist_kb": max_dist_kb}
+    set_bp = [k for k, v in bp.items() if v is not None]
+    if set_bp and positions is None:
+        raise ValueError(f"{set_bp[0]} requires variant positions; pass "
+                         f"annotation=")
+    if scope == "trans" and set_bp:
+        raise ValueError(
+            f"scope='trans' cannot be combined with {set_bp[0]}: base-pair "
+            f"distance between two chromosomes is not defined, so the "
+            f"combination has no pairs by construction. Drop one of them.")
+    if (min_dist_kb is not None and max_dist_kb is not None
+            and float(min_dist_kb) > float(max_dist_kb)):
+        raise ValueError(
+            f"min_dist_kb={min_dist_kb} exceeds max_dist_kb={max_dist_kb}, "
+            f"which selects no pairs at all.")
+    if scope != "all" and chrom_codes is None:
+        raise ValueError(f"scope={scope!r} requires chromosomes; pass "
+                         f"annotation=")
+
     lo = np.arange(n_rows, dtype=np.int64)
+    starts = lo + 1
     hi = np.full(n_rows, n_rows, dtype=np.int64)
     if window is not None:
         hi = np.minimum(hi, lo + int(window) + 1)
-    if window_kb is not None:
-        span = int(round(float(window_kb) * 1000))
-        hi = np.minimum(hi, np.searchsorted(positions, positions + span,
-                                            side="right").astype(np.int64))
-    return lo + 1, hi
+
+    # A bp predicate confines the scan to one chromosome, so it needs the block
+    # structure even when scope was left at "all".
+    need_blocks = scope != "all" or bool(set_bp)
+    if need_blocks and chrom_codes is not None:
+        edges = _chrom_runs(chrom_codes)
+        blk_start = np.repeat(edges[:-1], np.diff(edges))
+        blk_end = np.repeat(edges[1:], np.diff(edges))
+    elif need_blocks:
+        # bp predicate with no chromosome labels: one implicit block, and the
+        # old global monotonicity rule is the only guard available.
+        edges = np.array([0, n_rows], dtype=np.int64)
+        blk_start = np.zeros(n_rows, dtype=np.int64)
+        blk_end = np.full(n_rows, n_rows, dtype=np.int64)
+    if scope == "cis" or set_bp:
+        hi = np.minimum(hi, blk_end)
+    if scope == "trans":
+        starts = np.maximum(starts, blk_end)
+
+    if set_bp and positions is not None and n_rows:
+        pos = np.asarray(positions, dtype=np.int64)
+        for b0, b1 in zip(edges[:-1], edges[1:]):
+            pb = pos[b0:b1]
+            if pb.size > 1 and np.any(np.diff(pb) < 0):
+                raise ValueError(
+                    "positions are not non-decreasing within a chromosome "
+                    "block, so banding would be silently wrong. Sort the "
+                    ".cugen by (chrom, pos) or drop the bp predicate.")
+            for key, side, comb in (("window_kb", "right", "hi"),
+                                    ("max_dist_kb", "right", "hi"),
+                                    ("min_dist_kb", "left", "starts")):
+                v = bp[key]
+                if v is None:
+                    continue
+                span = int(round(float(v) * 1000))
+                edge = b0 + np.searchsorted(pb, pb + span,
+                                            side=side).astype(np.int64)
+                if comb == "hi":
+                    hi[b0:b1] = np.minimum(hi[b0:b1], edge)
+                else:
+                    starts[b0:b1] = np.maximum(starts[b0:b1], edge)
+    # With no bp predicate nothing bands by position, so position order is
+    # irrelevant and the old global monotonicity check would only reject files
+    # it never actually mis-banded.
+    return starts, hi
 
 
-def _count_pairs(n_rows: int, positions, window, window_kb) -> int:
-    starts, hi = _pair_bounds(n_rows, positions, window, window_kb)
+def _count_pairs(n_rows: int, positions, window, window_kb, **kw) -> int:
+    starts, hi = _pair_bounds(n_rows, positions, window, window_kb, **kw)
     return int(np.maximum(hi - starts, 0).sum())
 
 
 def _plan_pairs(n_rows: int, positions: Optional[np.ndarray],
-                window: Optional[int], window_kb: Optional[float]):
+                window: Optional[int], window_kb: Optional[float], **kw):
     """Materialised upper-triangle pair list, for the NumPy reference path."""
-    starts, hi = _pair_bounds(n_rows, positions, window, window_kb)
+    starts, hi = _pair_bounds(n_rows, positions, window, window_kb, **kw)
     lo = np.arange(n_rows, dtype=np.int64)
     counts = np.maximum(hi - starts, 0)
     total = int(counts.sum())
@@ -525,6 +803,476 @@ def _plan_pairs(n_rows: int, positions: Optional[np.ndarray],
         np.concatenate([[0], np.cumsum(counts)[:-1]]), counts)
     j = np.repeat(starts, counts) + offs
     return np.stack([i, j], axis=1), total
+
+
+# chi2 above which the closed-form tail expansion replaces erfc. Below it erfc
+# is exact; above chi2 ~ 1450 erfc underflows to 0 in float64 and -log10 of that
+# is +inf, which is the bug this constant exists to avoid. 400 is chosen well
+# clear of that ceiling (erfc(sqrt(200)) ~ 1e-88) and high enough that the
+# truncated expansion is already accurate to 1e-7 where it takes over -- at a
+# cut of 30 the expansion is only good to 2e-4.
+_NLP_ASYMPTOTIC_FROM = 400.0
+_LN10 = math.log(10.0)
+_HALF_LN_PI = 0.5 * math.log(math.pi)
+
+
+def _erfc_for(xp):
+    """erfc for either numpy or cupy arrays. numpy has no erfc of its own."""
+    if xp is np:
+        from scipy.special import erfc
+        return erfc
+    from cupyx.scipy.special import erfc
+    return erfc
+
+
+def _neglog10_chi2_1df(chi2, xp=np):
+    """``-log10(P(X > chi2))`` for X ~ chi-square with 1 df.
+
+    Returns -log10(p) rather than p because p is not representable. The
+    right-tail p-value underflows float64 at chi2 ~ 1450 and float32 at
+    chi2 ~ 170 -- and chi2 = N_OBS * r^2, so at 1000 Genomes size
+    (N_hap = 5008) float32 dies at r^2 = 0.034 and float64 at r^2 = 0.29. A
+    ``P`` column would therefore read as a flat zero for essentially every
+    linked pair genome-wide. -log10(p) tops out around 8.7e5 and fits float32
+    comfortably.
+
+    Two branches, both evaluated on clamped inputs so neither can produce an
+    inf that ``where`` would then have to discard:
+
+      chi2 <= 400:  -log10(erfc(sqrt(chi2/2))), exact.
+      chi2 >  400:  the asymptotic expansion of erfc. With z = chi2/2,
+                   erfc(sqrt(z)) ~ exp(-z)/sqrt(pi*z) * (1 - 1/(2z) + 3/(4z^2)),
+                   so -ln p ~ z + ln(sqrt(pi*z)) - log1p(-1/(2z) + 3/(4z^2)).
+
+    Measured against log(2) + scipy.special.log_ndtr(-sqrt(chi2)), which is
+    genuinely log-space: max error 1e-7 in -log10(p) units over chi2 in
+    [0.5, 1e7]. Note that scipy.stats.chi2.logsf is NOT a usable oracle here --
+    it computes log(sf()) and so returns inf above chi2 ~ 1450, the very regime
+    this helper exists to serve. Do not use ``1.0 - erf(...)`` instead -- it
+    cancels catastrophically in the tail (see cugen.qc._chi2_p_1df, and the
+    same failure documented for the inverse direction in cugen.assoc).
+    """
+    z = xp.maximum(xp.asarray(chi2, dtype=xp.float64) * 0.5, 0.0)
+    cut = _NLP_ASYMPTOTIC_FROM * 0.5
+    erfc = _erfc_for(xp)
+    small = -xp.log10(erfc(xp.sqrt(xp.minimum(z, cut))))
+    zl = xp.maximum(z, cut)
+    large = (zl + 0.5 * xp.log(zl) + _HALF_LN_PI
+             - xp.log1p(-1.0 / (2.0 * zl) + 3.0 / (4.0 * zl * zl))) / _LN10
+    return xp.where(z <= cut, small, large)
+
+
+def _add_significance(res, stats, xp=np, exact="never"):
+    """Attach ``chi2`` and ``p`` to a result dict, in place.
+
+    The test of no disequilibrium between two biallelic loci is
+
+        chi2 = N * r^2,   1 df
+
+    (Park 2019 eq. 1, which writes it as 2n D^2 / (pA qA pB qB); Weir, Genetic
+    Data Analysis II.) N is the number of sampled GAMETES for phased data and
+    the number of INDIVIDUALS for the composite (unphased) statistic -- the
+    factor of two between gametic and composite LD. ``res["n"]`` already
+    carries the right one on every path: 2*n_samples for hap2bit input,
+    n_samples (or the per-pair co-observed count) for 2bit.
+
+    r^2 is taken from whichever correlation this path computed, matching the
+    resolution the caller does for filtering: dosage ``r2`` if present, else
+    haplotype ``r2_phased``. A call that asks for r2_phased_em gets the dosage
+    r2 and the individual count, which are consistent with each other; the EM
+    haplotype estimate is a different estimator and is not tested here.
+    """
+    if not (_SIG_STATS & set(stats)):
+        return res
+    for key in ("r2", "r2_phased"):
+        if key in res:
+            r2 = res[key]
+            break
+    else:
+        r_key = "r" if "r" in res else "r_phased"
+        r2 = res[r_key] ** 2
+    chi2 = xp.asarray(res["n"], dtype=xp.float64) * r2
+    res["chi2"] = chi2
+    res["p"] = _neglog10_chi2_1df(chi2, xp)
+    if "p_exact" in stats:
+        res["p_exact"] = _exact_column(res["nAB"], res["nA"], res["nB"],
+                                       res["n"], exact)
+    return res
+
+
+def _exact_column(nAB, nA, nB, n, exact):
+    """Fisher exact -log10(p) per pair, NaN where the mode says not to bother.
+
+    NaN rather than falling back to the asymptotic value: the two columns answer
+    different questions, and silently mixing them would make NEG_LOG10_P_EXACT
+    mean "exact where we felt like it". A NaN says plainly that the asymptotic
+    p-value in NEG_LOG10_P is the one to use for that pair.
+
+    Loops over the pairs that need it. Under 'auto' that set is small by
+    construction -- see _exact_needed -- and this is the reference path, whose
+    contract is correct rather than fast.
+    """
+    nAB = np.asarray(nAB, dtype=np.int64)
+    nA = np.asarray(nA, dtype=np.int64)
+    nB = np.asarray(nB, dtype=np.int64)
+    n = np.asarray(n, dtype=np.int64)
+    out = np.full(nAB.shape, np.nan, dtype=np.float64)
+    need = (np.ones(nAB.shape, dtype=bool) if exact == "always"
+            else _exact_needed(nA, nB, n))
+    for t in np.flatnonzero(need):
+        out[t] = _fisher_neglog10p_2x2(nAB[t], nA[t], nB[t], n[t])
+    return out
+
+
+def _fisher_neglog10p_2x2(nAB, nA, nB, N):
+    """Two-sided Fisher exact test on the 2x2 haplotype table, as -log10(p).
+
+    This is the EXACT PERMUTATION p-value, not an approximation to it.
+    Permuting haplotype labels leaves both variants' allele counts untouched,
+    so the permutation null of the table is the hypergeometric distribution
+    with those margins fixed, and summing its mass over the tables at least as
+    extreme as the observed one is precisely Fisher's exact test. Koch et al.
+    (2013) spent ~34,000 CPU-hours Monte-Carlo sampling this distribution.
+
+    Two-sided in the conventional sense: total probability of every table whose
+    own probability does not exceed the observed table's. Computed through
+    lgamma so the factorials never overflow.
+
+    The cost is one term per admissible table, i.e. min(nA, nB) + 1 terms, and
+    the gate in _exact_needed keeps it small where it matters: the exact test is
+    only needed when nA*nB/N < 5, and min(nA,nB)^2 <= nA*nB < 5N bounds the
+    loop by sqrt(5N) -- about 158 terms at 1000 Genomes size, fewer for rarer
+    variants. The pairs that need this are the pairs where it is cheap.
+    """
+    from scipy.special import gammaln  # noqa: PLC0415
+    nAB, nA, nB, N = int(nAB), int(nA), int(nB), int(N)
+    lo, hi = max(0, nA + nB - N), min(nA, nB)
+    if hi < lo:
+        return 0.0
+    k = np.arange(lo, hi + 1, dtype=np.float64)
+    # log hypergeometric pmf, dropping the k-independent normaliser and
+    # restoring it by summing to one.
+    logp = (-gammaln(k + 1.0) - gammaln(nA - k + 1.0)
+            - gammaln(nB - k + 1.0) - gammaln(N - nA - nB + k + 1.0))
+    logp -= logp.max()
+    pmf = np.exp(logp)
+    pmf /= pmf.sum()
+    obs = pmf[nAB - lo]
+    # 1 + 1e-7 absorbs the float noise between two mathematically equal
+    # tables, which is common with symmetric margins; without it the mirror
+    # table is dropped and the p-value comes out roughly half.
+    tail = float(pmf[pmf <= obs * (1.0 + 1e-7)].sum())
+    tail = min(max(tail, 0.0), 1.0)
+    if tail <= 0.0:
+        return np.inf
+    return -math.log10(tail)
+
+
+def _exact_needed(nA, nB, N, xp=np):
+    """Where the chi-square approximation should not be trusted.
+
+    The minimum expected cell count of the 2x2 table under independence is
+    min(nA, N-nA) * min(nB, N-nB) / N. Below 5 -- the classic rule -- the
+    asymptotic test is anti-conservative; Park (2019) fig. 1 shows exactly this
+    breakdown, and at N=14 with symmetric margins the asymptotic p can be 3x
+    too small.
+    """
+    a = xp.minimum(nA, N - nA)
+    b = xp.minimum(nB, N - nB)
+    return (a * b / xp.asarray(N, dtype=xp.float64)) < 5.0
+
+
+def _recover_nab(r, nA, nB, N):
+    """Recover the AB haplotype count from r and the two allele counts.
+
+    r = (N*nAB - nA*nB) / sqrt(nA(N-nA) * nB(N-nB)), so nAB follows by
+    rearrangement. It exists because the fused GPU path emits r and discards
+    the cross-product that produced it -- reconstructing is cheaper than a
+    second kernel, and means the exact test has ONE implementation shared by
+    the host and device paths.
+
+    Exact in practice despite r being float32: nAB is an integer, and the
+    reconstruction error is bounded by sqrt(nA(N-nA)nB(N-nB))/N * eps32 <=
+    N/4 * 1.2e-7, which is 1.5e-4 at N=5008 -- three orders below the 0.5
+    needed for rounding to land on the right integer. The float64 upcast below
+    is insurance for large N rather than a necessity at that scale; the tests
+    pass without it today. `rint` is not optional -- truncating instead
+    misplaces roughly half the counts.
+    """
+    r = np.asarray(r, dtype=np.float64)
+    nA = np.asarray(nA, dtype=np.float64)
+    nB = np.asarray(nB, dtype=np.float64)
+    den = np.sqrt(nA * (N - nA) * nB * (N - nB))
+    return np.rint((r * den + nA * nB) / float(N)).astype(np.int64)
+
+
+def _lambda_gc(chi2, separation=None, min_null=100):
+    """Genomic-control inflation factor for the LD test statistic.
+
+    lambda = median(chi2) / median(chi2_1df), the genomic-control ratio (Devlin
+    & Roeder 1999) applied to an LD test rather than an association test. Above
+    1 means the per-pair test is anti-conservative, which is what population
+    structure and cryptic relatedness do to LD: they correlate variants that are
+    in no gametic disequilibrium at all. Park (2019) fig. 1C/D models the
+    effect and Koch (2013) flags it; neither offers a correction, and I could
+    not find lambda applied to LD statistics anywhere in the literature.
+
+    Assumes most of the tests it is given are null. For an unwindowed scan that
+    is reasonable -- almost every pair on a chromosome is far apart -- but false
+    for a tight window, where every pair is expected to be linked. So the median
+    is taken over the more DISTANT half of the pairs by index separation
+    whenever that leaves at least ``min_null`` of them, keeping the close,
+    genuinely-linked pairs out of it.
+
+    Separation in variant index is a deliberately crude proxy for distance. The
+    point is to prefer far pairs to near ones, not to model recombination.
+
+    MUST be called before any significance filtering. Filtering selects the
+    tail, and the median of a selected tail says nothing about the null.
+    """
+    chi2 = np.asarray(chi2, dtype=np.float64)
+    ok = np.isfinite(chi2)
+    if separation is not None and len(separation) == chi2.size:
+        sep = np.asarray(separation)[ok]
+    else:
+        sep = None
+    chi2 = chi2[ok]
+    if chi2.size == 0:
+        return float("nan")
+    if sep is not None:
+        far = sep >= np.median(sep)
+        if far.sum() >= min_null:
+            chi2 = chi2[far]
+    return float(np.median(chi2) / _CHI2_1DF_MEDIAN)
+
+
+def _psd_pinv_and_sqrt(V, tol=_PSD_EIGEN_TOL):
+    """Moore-Penrose inverse of a PSD matrix, and its symmetric square root.
+
+    Kinship matrices are routinely singular -- and estimators of them routinely
+    return something not quite PSD -- so V has no Cholesky factor and V^-1 does
+    not exist. Mangin et al. prescribe the Moore-Penrose inverse V^-, "which is
+    always defined", and build a PSD matrix by zeroing negative eigenvalues of a
+    decomposition. Both come out of one eigendecomposition here.
+
+    Returns ``(V_inv, W)`` with ``W.T @ W == V_inv``, so a quadratic form
+    ``x' V^- y`` becomes an ordinary dot product ``(Wx) . (Wy)``.
+    """
+    w, U = np.linalg.eigh(np.asarray(V, dtype=np.float64))
+    dead = w < tol
+    inv = np.where(dead, 0.0, 1.0 / np.where(dead, 1.0, w))
+    V_inv = (U * inv) @ U.T
+    W = (U * np.sqrt(inv)) @ U.T
+    return V_inv, W
+
+
+def _corrected_transform(which, n, kinship=None, structure=None):
+    """The one n x n map that turns a corrected r^2 into an ordinary one.
+
+    Every measure in Mangin et al. (2012) is a ratio of entries of a
+    covariance-like matrix, and in each case that matrix is the GRAM matrix of a
+    linearly transformed genotype vector. So a single P, built once per dataset,
+    reduces all three to an UNCENTERED r^2 on ``P x``:
+
+      r2_s   (eq. 1)  P = (I - H_S)(I - 11'/n)
+                      centre, then residualise on the structure matrix. The
+                      published form is a Schur complement of the joint
+                      covariance of the two loci and S, which is the residual
+                      covariance after regressing the loci on S -- and since
+                      (I - H_S) is idempotent that equals the Gram of the
+                      residuals.
+      r2_v   (eq. 2)  P = W (I - F),  F = 1 1' V^- / (1' V^- 1)
+                      GLS-centre, then whiten. F is the projection onto the GLS
+                      mean; W'W = V^-, so x'V^-y becomes (Wx).(Wy).
+      r2_vs  (eq. 3)  P = (I - H_Z) W (I - F),  Z_S = W (I - F) S
+                      the same Schur complement, taken in the V^- metric.
+
+    H_S and H_Z are hat matrices built with the same pseudo-inverse, so a
+    rank-deficient or collinear structure matrix degrades gracefully instead of
+    raising.
+    """
+    eye = np.eye(n)
+    if which == "r2_s":
+        S = _as_covariate_block(structure, n)
+        Sc = S - S.mean(axis=0)
+        H = Sc @ _psd_pinv_and_sqrt(Sc.T @ Sc)[0] @ Sc.T
+        return (eye - H) @ (eye - np.full((n, n), 1.0 / n))
+
+    V_inv, W = _psd_pinv_and_sqrt(_as_square(kinship, n))
+    one = np.ones(n)
+    denom = float(one @ V_inv @ one)
+    if not np.isfinite(denom) or abs(denom) < 1e-300:
+        raise ValueError(
+            "1' V^- 1 vanished, so the GLS mean is undefined -- the kinship "
+            "matrix has no usable non-null space. Check it is the right matrix "
+            "and is positive semi-definite.")
+    P = W @ (eye - np.outer(one, one @ V_inv) / denom)
+    if which == "r2_v":
+        return P
+    Zs = P @ _as_covariate_block(structure, n)
+    Hz = Zs @ _psd_pinv_and_sqrt(Zs.T @ Zs)[0] @ Zs.T
+    return (eye - Hz) @ P
+
+
+def _as_square(M, n):
+    if M is None:
+        raise ValueError(
+            "r2_v/r2_vs need a kinship matrix; pass kinship= an (n_samples, "
+            "n_samples) array of genetic covariances between individuals.")
+    A = np.asarray(M, dtype=np.float64)
+    if A.shape != (n, n):
+        raise ValueError(
+            f"kinship shape {A.shape} does not match n_samples={n}; it must be "
+            f"({n}, {n}) and in the same sample order as the .cugen file.")
+    return A
+
+
+def _as_covariate_block(M, n):
+    if M is None:
+        raise ValueError(
+            "r2_s/r2_vs need a structure matrix; pass structure= an "
+            "(n_samples, K) array -- e.g. K-1 admixture proportions from "
+            "STRUCTURE, or leading principal components.")
+    A = np.atleast_2d(np.asarray(M, dtype=np.float64))
+    if A.shape[0] != n and A.shape[1] == n:
+        A = A.T
+    if A.shape[0] != n:
+        raise ValueError(
+            f"structure has {A.shape[0]} rows but n_samples={n}; it must be "
+            f"(n_samples, K) and in the same sample order as the .cugen file.")
+    return A
+
+
+def _corrected_r2(dosages, pairs, P):
+    """Uncentered r^2 of the transformed variant vectors, for every pair.
+
+    ``dosages`` is (n_variants, n_samples); P is applied on the sample axis, so
+    row v becomes ``P x_v``. The Gram matrix is (p, p) -- the same O(p^2) the
+    rest of this module lives with -- and every pair reads two diagonal entries
+    and one off-diagonal one.
+    """
+    X = np.asarray(dosages, dtype=np.float64)
+    Z = X @ P.T
+    G = Z @ Z.T
+    d = np.diag(G).copy()
+    a, b = pairs[:, 0], pairs[:, 1]
+    # LDcorSV returns 0 when a transformed variance underflows; mirror that
+    # rather than emitting inf or nan for a variant the transform annihilated.
+    floor = 1e-12 * max(float(d.max()), 1.0)
+    ok = (d[a] > floor) & (d[b] > floor)
+    den = np.where(ok, d[a] * d[b], 1.0)
+    return np.where(ok, np.clip(G[a, b] ** 2 / den, 0.0, 1.0), 0.0)
+
+
+def _bh_threshold_neglog10p(neglog10p, m, alpha):
+    """Benjamini-Hochberg, computed entirely in -log10(p) space.
+
+    BH rejects the k smallest p-values for the largest k satisfying
+    p_(k) <= k*alpha/m. Taking -log10 of both sides flips the inequality:
+
+        neglog10p_(k) >= log10(m / (k*alpha))
+
+    where neglog10p_(k) is the k-th LARGEST. Working in log space is not a
+    convenience here -- at m = 1e14 the Bonferroni-scale thresholds are around
+    1e-16 and the observed p-values are unrepresentable, so a direct
+    implementation would compare two zeros.
+
+    Returns ``(cut, k)``: the -log10(p) threshold to keep at, and how many
+    tests are rejected. ``(inf, 0)`` when nothing is significant.
+
+    The sort makes this O(K log K) in the number of SURVIVORS, not in m -- the
+    screen has already discarded everything with a larger p-value, and those
+    can never be among the k smallest.
+    """
+    order = np.sort(np.asarray(neglog10p, dtype=np.float64))[::-1]
+    if order.size == 0:
+        return np.inf, 0
+    k = np.arange(1, order.size + 1, dtype=np.float64)
+    ok = order >= np.log10(m / (k * alpha))
+    if not ok.any():
+        return np.inf, 0
+    kmax = int(np.flatnonzero(ok)[-1]) + 1
+    return float(order[kmax - 1]), kmax
+
+
+def _apply_top_k(df, k):
+    """Keep each variant's K strongest partners by |r|. Retention, not testing.
+
+    SYMMETRIC by construction: a pair survives if it is in the top K of EITHER
+    endpoint. The asymmetric alternative -- rank within gidx_a only -- makes a
+    pair's survival depend on which side of the upper triangle it landed on,
+    so a variant near the end of the file would keep almost nothing. This is
+    the honest form of the fix for a random per-variant subsample, where most
+    strong pairs lose an endpoint and the survivors are not the strong ones.
+
+    Row count is bounded by k * n_variants, and no variant is dropped
+    entirely, which is the property a downstream degree-based prune needs.
+    """
+    if k is None or df is None or len(df) == 0:
+        return df
+    k = int(k)
+
+    def host(col):
+        # cudf on the device write path, pandas everywhere else
+        v = df[col]
+        return np.asarray(v.to_numpy() if hasattr(v, "to_numpy") else v)
+
+    a = host("gidx_a").astype(np.int64)
+    b = host("gidx_b").astype(np.int64)
+    absr = np.abs(host("R").astype(np.float64))
+
+    # Both orientations stacked, so ONE ranking pass covers both endpoints.
+    owner = np.concatenate([a, b])
+    strength = np.concatenate([absr, absr])
+    row = np.concatenate([np.arange(len(a)), np.arange(len(a))])
+
+    # sort by (owner asc, |r| desc), then take the first k of each owner run
+    order = np.lexsort((-strength, owner))
+    owner_s, row_s = owner[order], row[order]
+    starts = np.concatenate(
+        [[0], np.flatnonzero(owner_s[1:] != owner_s[:-1]) + 1])
+    rank = np.arange(len(owner_s)) - np.repeat(
+        starts, np.diff(np.append(starts, len(owner_s))))
+
+    keep = np.sort(np.unique(row_s[rank < k]))
+    return df.iloc[keep].reset_index(drop=True)
+
+
+def _apply_significance_filters(df, *, max_p, correction, alpha, m, screened,
+                                verbose):
+    """Post-scan p-value filtering. Accepts a pandas or a cudf frame.
+
+    Runs after the scan for two reasons. Under missingness N_OBS varies per
+    pair, so the r^2 pre-filter derived from max_p is only a conservative bound
+    and the exact cut has to be applied here. And BH-FDR is defined over the
+    whole set of p-values, so its threshold is not knowable before the scan.
+    """
+    if max_p is None and correction is None:
+        return df
+    col = df["NEG_LOG10_P"]
+    vals = col.to_numpy() if hasattr(col, "to_numpy") else np.asarray(col)
+    vals = np.asarray(vals, dtype=np.float64)
+
+    if correction == "fdr":
+        cut, k = _bh_threshold_neglog10p(vals, m, alpha)
+        if verbose:
+            print(f"cugen.ld: BH-FDR at alpha={alpha} over m={m:,} tests -> "
+                  f"{k:,} rejected, -log10(p) cut {cut:.4f}")
+        if screened and k == vals.size and k > 0:
+            raise ValueError(
+                f"BH-FDR rejected every one of the {k:,} pairs that survived "
+                f"the screen, so the true threshold may lie below it and real "
+                f"discoveries were discarded before FDR ran. Loosen or drop "
+                f"the min_r2/max_p screen and re-run.")
+    else:
+        # max_p, exact. -log10 so the comparison never meets an underflowed p.
+        cut = -math.log10(max_p)
+    keep = vals >= cut - 1e-12
+    if keep.all():
+        return df
+    if hasattr(df, "iloc"):
+        return df.iloc[np.flatnonzero(keep)].reset_index(drop=True)
+    return df[keep]
 
 
 def _empty_pairs(stats: Sequence[str]) -> pd.DataFrame:
@@ -600,7 +1348,24 @@ class _ChunkWriter:
             self._pq = None
 
 
-def _write_df(df: pd.DataFrame, path: str) -> None:
+def _write_df(df, path: str, *, params: Optional[dict] = None) -> None:
+    """Write an LD result, delegating to cugen.ldio.
+
+    One writer, so a format is added in one module rather than in branches
+    here. _ChunkWriter above is the streaming counterpart: it appends chunk by
+    chunk during a scan, where this writes a finished frame once.
+    """
+    from . import ldio                                       # noqa: PLC0415
+    # Everything routes through ldio, including text. The legacy path kept a
+    # separate cuDF branch with two defects from the same cause -- no feather
+    # case, so .feather got CSV written into it (visible as feather costing
+    # exactly as many bytes per pair as TSV, 77.57, which is how it was caught),
+    # and no compression= argument, so .tsv.gz got uncompressed bytes under a
+    # .gz name. Two writers meant two behaviours; there is now one.
+    return ldio.write_ld(df, str(path), params=params)
+
+
+def _write_df_legacy(df: pd.DataFrame, path: str) -> None:
     """Same output conventions as qc._write_df, but via pyarrow when possible.
 
     pandas.to_csv is the single largest cost in a large LD run -- 7.3 s to
@@ -2676,6 +3441,14 @@ def _assemble_device(pairs_dev, payload, reader, rows, stats, sign_reference,
         g["R_PHASED"] = r.astype(cp.float32)
     if "r2_phased" in stats:
         g["R2_PHASED"] = r2.astype(cp.float32)
+    # chi2 = N_OBS * r2, 1 df. n_dev already holds haplotypes for a phased scan
+    # and individuals for a dosage one (see ld_matrix, where it is built).
+    if _SIG_STATS & set(stats):
+        chi2 = n_dev.astype(cp.float64) * r2
+        if "chi2" in stats:
+            g["CHI2"] = chi2.astype(cp.float32)
+        if "p" in stats:
+            g["NEG_LOG10_P"] = _neglog10_chi2_1df(chi2, cp).astype(cp.float32)
     g["gidx_a"] = gidx_dev[ia]
     g["gidx_b"] = gidx_dev[ib]
     return g
@@ -2726,7 +3499,9 @@ def phased_from_haplotypes(hap, pairs):
         dp = np.where(good & (dmax > 0), D / dmax, np.nan)
     return {"r_phased": r, "r2_phased": r * r, "d_phased": np.where(good, D, np.nan),
             "dp_phased": dp, "pA": pA, "pB": pB,
-            "n": np.full(pairs.shape[0], H)}
+            "n": np.full(pairs.shape[0], H),
+            # the 2x2 haplotype table, for the exact conditional test
+            "nAB": nAB, "nA": nA, "nB": nB}
 
 
 def _dosages_numpy(reader) -> np.ndarray:
@@ -2741,7 +3516,7 @@ def _dosages_numpy(reader) -> np.ndarray:
 
 def _scan_gpu(reader, rows, window, window_kb, positions, min_r2, min_obs,
               tile_size=None, verbose=False, need_table=True,
-              keep_device=False):
+              keep_device=False, bounds=None):
     """Tiled upper-triangle scan. Returns (pairs_local, tables) for survivors.
 
     Peak device memory is a function of tile size and sample count only, never
@@ -2762,19 +3537,24 @@ def _scan_gpu(reader, rows, window, window_kb, positions, min_r2, min_obs,
 
     packed = _load_packed_rows(reader, rows, bpv, verbose)
 
+    if bounds is None:
+        bounds = _pair_bounds(p, positions, window, window_kb)
+    starts_all, hi_all = bounds
+    st_d = cp.asarray(starts_all)
+    hi_d = cp.asarray(hi_all)
+
     out_pairs, out_tabs, out_r, out_n = [], [], [], []
     for i0 in range(0, p, B):
         i1 = min(i0 + B, p)
         pl_a = build(packed, cp.arange(i0, i1), ns, bpv)
-        # column extent: upper triangle, bounded by whichever windows are set
-        hi = p
-        if window is not None:
-            hi = min(hi, i1 - 1 + int(window) + 1)
-        if window_kb is not None:
-            hi = min(hi, int(np.searchsorted(
-                positions, positions[i1 - 1] + int(round(window_kb * 1000)),
-                side="right")))
-        for j0 in range(i0, hi, B):
+        # Column extent from the SAME (starts, hi) the pair count used, so the
+        # emitted set cannot disagree with m. Tile bounds are the widest over
+        # the row block; the per-pair mask below is what is exact.
+        hi = int(hi_all[i0:i1].max()) if i1 > i0 else i0
+        j_lo = int(starts_all[i0:i1].min()) if i1 > i0 else i0
+        # skip whole tiles below the first legal column (long-range / trans)
+        j_first = max(i0, (j_lo // B) * B)
+        for j0 in range(j_first, hi, B):
             j1 = min(j0 + B, hi)
             pl_b = pl_a if j0 == i0 else build(
                 packed, cp.arange(j0, j1), ns, bpv)
@@ -2787,12 +3567,13 @@ def _scan_gpu(reader, rows, window, window_kb, positions, min_r2, min_obs,
 
             ii = cp.arange(i0, i1)[:, None]
             jj = cp.arange(j0, j1)[None, :]
-            keep = (jj > ii) & cp.isfinite(r) & (n >= min_obs)
-            if window is not None:
-                keep &= (jj - ii) <= int(window)
-            if window_kb is not None:
-                pos = cp.asarray(positions)
-                keep &= (pos[jj] - pos[ii]) <= int(round(window_kb * 1000))
+            # One predicate, not five: every test-space bound already lives in
+            # (starts, hi), so window / window_kb / min_dist_kb / max_dist_kb /
+            # cis / trans all reduce to a range check here. That is what makes
+            # the GPU path agree with the reference BY CONSTRUCTION rather than
+            # by a parity test.
+            keep = ((jj >= st_d[ii]) & (jj < hi_d[ii])
+                    & cp.isfinite(r) & (n >= min_obs))
             if min_r2 > 0:
                 keep &= (r * r) >= min_r2
 
@@ -2851,9 +3632,21 @@ def ld_matrix(
     variants=None,
     region: Optional[str] = None,
     maf_min: float = 0.0,
+    maf_max: Optional[float] = None,
+    min_dist_kb: Optional[float] = None,
+    max_dist_kb: Optional[float] = None,
+    scope: str = "all",
+    top_k: Optional[int] = None,
     window: Optional[int] = None,
     window_kb: Optional[float] = None,
     min_r2: float = 0.0,
+    max_p: Optional[float] = None,
+    correction: Optional[str] = None,
+    alpha: float = 0.05,
+    exact: str = "never",
+    lambda_gc: bool = False,
+    kinship=None,
+    structure=None,
     stats: Sequence[str] = _DEFAULT_STATS,
     dprime_method: str = "phased",
     sign_reference: str = "alt",
@@ -2900,9 +3693,55 @@ def ld_matrix(
         ``max_pairs`` catches the runaway case.
     min_r2
         Drop pairs below this r^2. PLINK's ``--ld-window-r2``.
+    max_p
+        Drop pairs whose p-value exceeds this. Requires ``'p'`` in ``stats``,
+        and is mutually exclusive with ``min_r2``: with N constant across pairs
+        the two are the same filter, so this is converted to the equivalent
+        ``min_r2`` and costs nothing.
+    correction
+        ``None`` (default), ``'bonferroni'``, or ``'fdr'`` (Benjamini-Hochberg).
+        Derives its own threshold from ``alpha`` and the number of tests, which
+        is the pair count and is known in closed form before the scan. Requires
+        ``'p'`` in ``stats``.
+    alpha
+        Family-wise error rate for ``'bonferroni'``, or the false discovery
+        rate for ``'fdr'``. Default 0.05.
+    exact
+        ``'never'`` (default), ``'auto'`` or ``'always'``. Adds
+        ``NEG_LOG10_P_EXACT``, a two-sided Fisher exact test on the 2x2
+        haplotype table -- which IS the exact permutation p-value, since
+        permuting haplotype labels leaves both allele counts fixed and so draws
+        from the hypergeometric with those margins. hap2bit input only.
+        ``'auto'`` computes it where the minimum expected cell count falls below
+        5 and leaves NaN elsewhere, meaning the asymptotic p-value is the one to
+        use for that pair. Selecting ``'p_exact'`` in ``stats`` implies
+        ``'auto'``. Forces the reference path, as ``d``/``dp`` already do.
+    lambda_gc
+        Estimate the genomic-control inflation factor and add ``CHI2_ADJ`` /
+        ``NEG_LOG10_P_ADJ`` beside the raw columns, with lambda itself in
+        ``df.attrs['lambda_gc']``. Off by default. Per-pair p-values assume
+        independent haplotypes, so population structure and cryptic relatedness
+        make them anti-conservative: on two subpopulations differing by
+        dAF = 0.6, lambda reaches ~920 and every pair looks genome-wide
+        significant despite no gametic LD existing at all. Estimated over the
+        more distant half of pairs and always before any filtering, since
+        filtering selects the tail. Forces the reference path.
+    kinship, structure
+        Matrices for the bias-corrected measures ``r2_s`` / ``r2_v`` /
+        ``r2_vs`` (Mangin et al. 2012): ``kinship`` is (n_samples, n_samples)
+        genetic covariances between individuals, ``structure`` is
+        (n_samples, K) -- admixture proportions or leading PCs. Both must be in
+        the .cugen file's sample order. Dosage input only, and they force the
+        reference path. These are ESTIMATORS: the paper derives no null
+        distribution for them, so requesting ``chi2``/``p`` alongside raises
+        rather than inventing a degrees-of-freedom.
     stats
-        Any of ``r, r2, r2_signed, d, dp``. Dropping ``d``/``dp`` skips the
-        cubic entirely.
+        Any of ``r, r2, r2_signed, d, dp`` (dosage), ``r_phased, r2_phased,
+        d_phased, dp_phased`` (true phase, hap2bit input), ``r2_phased_em`` (EM
+        haplotype estimate from unphased input), or ``chi2, p`` (significance;
+        valid on either encoding). Dropping ``d``/``dp`` skips the cubic
+        entirely. Defaults to the dosage set, so adding a statistic here never
+        changes an existing call's result.
     dprime_method
         ``'phased'`` (exact cubic, plink2 ``--r2-phased`` parity) or
         ``'composite'`` (Burrows' closed form; not a phase estimate).
@@ -2920,8 +3759,12 @@ def ld_matrix(
     Returns
     -------
     DataFrame with columns
-    ``CHR_A POS_A ID_A MAF_A CHR_B POS_B ID_B MAF_B N_OBS [R R2 R2_SIGNED D DP]
-    gidx_a gidx_b``, or an :class:`LDMatrix`.
+    ``CHR_A POS_A ID_A MAF_A CHR_B POS_B ID_B MAF_B N_OBS [R R2 R2_SIGNED D DP
+    R_PHASED R2_PHASED D_PHASED DP_PHASED R2_PHASED_EM CHI2 NEG_LOG10_P]
+    gidx_a gidx_b``, or an :class:`LDMatrix`. Which statistic columns appear is
+    exactly what ``stats`` asked for. ``NEG_LOG10_P`` carries -log10(p), not p:
+    p itself underflows float32 at chi2 = 170, i.e. r^2 = 0.034 at 1000 Genomes
+    sample size.
     """
     # ---- validation, all before any allocation --------------------------
     bad = [s for s in stats if s not in _STATS]
@@ -2929,6 +3772,14 @@ def ld_matrix(
         raise ValueError(f"unknown stats {bad}; valid are {list(_STATS)}")
     if output_format not in ("pairs", "matrix"):
         raise ValueError(f"output_format must be 'pairs' or 'matrix', got {output_format!r}")
+    if output_format == "matrix" and (min_r2 > 0 or max_p is not None
+                                      or correction is not None):
+        raise ValueError(
+            "output_format='matrix' cannot be combined with a retention "
+            "threshold. A dense matrix built from a filtered scan would replace "
+            "every sub-threshold correlation with zero rather than its true "
+            "value, and nothing downstream could detect it. Drop min_r2/max_p/"
+            "correction, or use output_format='pairs'.")
     if dprime_method not in ("phased", "composite"):
         raise ValueError(f"dprime_method must be 'phased' or 'composite', got {dprime_method!r}")
     if sign_reference not in ("alt", "major"):
@@ -2939,6 +3790,52 @@ def ld_matrix(
             f"(complete-case) is available.")
     if backend not in ("auto", "gpu", "numpy"):
         raise ValueError(f"backend must be 'auto', 'gpu' or 'numpy', got {backend!r}")
+    if correction is not None and correction not in ("bonferroni", "fdr"):
+        raise ValueError(
+            f"correction must be None, 'bonferroni' or 'fdr', got {correction!r}")
+    if max_p is not None:
+        if not (0.0 < float(max_p) <= 1.0):
+            raise ValueError(f"max_p must be in (0, 1], got {max_p!r}")
+        if min_r2 > 0:
+            raise ValueError(
+                "pass max_p or min_r2, not both -- with N constant they are the "
+                "same filter, and two thresholds would silently take the "
+                "stricter one.")
+        if correction is not None:
+            raise ValueError(
+                f"pass max_p or correction={correction!r}, not both: a "
+                f"correction derives its own threshold.")
+    if (max_p is not None or correction is not None) and "p" not in stats:
+        raise ValueError(
+            "max_p/correction filter on the p-value, so 'p' must be in stats. "
+            "Add it: stats=(..., 'p').")
+    if not (0.0 < float(alpha) <= 1.0):
+        raise ValueError(f"alpha must be in (0, 1], got {alpha!r}")
+    if lambda_gc and "p" not in stats:
+        raise ValueError(
+            "lambda_gc adjusts the p-value, so 'p' must be in stats. "
+            "Add it: stats=(..., 'p').")
+    want_corrected = [x for x in stats if x in _CORRECTED_STATS]
+    if want_corrected and (_SIG_STATS & set(stats)):
+        raise ValueError(
+            f"{want_corrected} are bias-corrected ESTIMATORS with no null "
+            f"distribution -- Mangin et al. (2012) prove them unbiased for "
+            f"unlinked loci and link them to association power, but derive no "
+            f"null sampling law, so chi2 = N * r^2 does not transfer to them. "
+            f"Emitting a p-value beside them would mean inventing a "
+            f"degrees-of-freedom. Request them on their own.")
+    if exact not in _EXACT_MODES:
+        raise ValueError(f"exact must be one of {_EXACT_MODES}, got {exact!r}")
+    # exact= and stats=('p_exact',) are two doors to the same room: either one
+    # implies the other, and asking via stats defaults the mode to 'auto'.
+    stats = tuple(stats)
+    if exact != "never" and "p_exact" not in stats:
+        stats = stats + ("p_exact",)
+    if lambda_gc:
+        stats = stats + tuple(c for c in ("chi2_adj", "p_adj")
+                              if c not in stats)
+    elif exact == "never" and "p_exact" in stats:
+        exact = "auto"
 
     path = str(cugen)
     if os.path.isdir(path):
@@ -2970,7 +3867,12 @@ def ld_matrix(
 
     reader = read_cugen(path, device=device)
     want_phased = [s for s in stats if s in _PHASED_STATS]
-    want_dosage = [s for s in stats if s not in _PHASED_STATS]
+    # chi2/p are ENCODING-NEUTRAL: the test is N_OBS * r^2 either way, and the
+    # encoding only decides whether N_OBS counts gametes or individuals. They
+    # must not fall into want_dosage, or asking for them on a hap2bit file
+    # trips the cross-guard below.
+    want_dosage = [s for s in stats
+                   if s not in _PHASED_STATS and s not in _SIG_STATS]
     enc = int(reader.encoding)
     if enc == ENCODING_HAP2BIT:
         if want_dosage:
@@ -2987,6 +3889,19 @@ def ld_matrix(
         raise ValueError(
             f"{want_phased} need TRUE phase, which a 2bit file does not carry. "
             f"Convert a phased VCF with cg.convert.vcf2cugenh().")
+    if enc == ENCODING_HAP2BIT and want_corrected:
+        raise ValueError(
+            f"{want_corrected} are defined on GENOTYPES -- Mangin et al. build "
+            f"the correction from a covariance matrix between individuals, and "
+            f"the kinship/structure matrices are indexed by individual, not by "
+            f"haplotype. Use a 2bit (dosage) file.")
+    if enc != ENCODING_HAP2BIT and "p_exact" in stats:
+        raise ValueError(
+            "the exact conditional test conditions on the 2x2 HAPLOTYPE table, "
+            "which needs TRUE phase and a 2bit file does not carry -- there is "
+            "nothing to condition on, so serving it would return a plausible "
+            "wrong number. Convert a phased VCF with cg.convert.vcf2cugenh(), "
+            "or drop exact=/'p_exact'.")
 
     p_all = int(reader.n_variants)
     gidx_all = np.asarray(reader.gidx, dtype=np.int64)
@@ -3008,17 +3923,35 @@ def ld_matrix(
         rows = rows[np.isin(gidx_all[rows], np.asarray(sub["gidx"], dtype=np.int64))]
     if maf_min > 0:
         rows = rows[maf_all[rows] >= maf_min]
+    if maf_max is not None:
+        if maf_max < maf_min:
+            raise ValueError(
+                f"maf_max={maf_max} is below maf_min={maf_min}, which selects "
+                f"no variants at all.")
+        rows = rows[maf_all[rows] <= float(maf_max)]
+    if top_k is not None and int(top_k) < 1:
+        raise ValueError(f"top_k={top_k} must be >= 1, or None to keep every "
+                         f"pair above the retention threshold.")
     if rows.size == 0:
         return _empty_pairs(stats)
 
     positions = None
+    chrom_codes = None
     if ann is not None:
         pos_map = dict(zip(np.asarray(ann["gidx"], dtype=np.int64),
                            np.asarray(ann["POS"], dtype=np.int64)))
         positions = np.array([pos_map.get(int(g), 0) for g in gidx_all[rows]],
                              dtype=np.int64)
+        # Integer codes, not strings: the scan compares these per pair on the
+        # device, and "1" vs "chr1" vs 1 would all have to agree there.
+        chr_map = dict(zip(np.asarray(ann["gidx"], dtype=np.int64),
+                           [str(c) for c in np.asarray(ann["CHR"])]))
+        labels = [chr_map.get(int(g), "") for g in gidx_all[rows]]
+        chrom_codes = np.unique(labels, return_inverse=True)[1].astype(np.int64)
 
-    n_pairs = _count_pairs(len(rows), positions, window, window_kb)
+    _space = dict(min_dist_kb=min_dist_kb, max_dist_kb=max_dist_kb,
+                  scope=scope, chrom_codes=chrom_codes)
+    n_pairs = _count_pairs(len(rows), positions, window, window_kb, **_space)
     if n_pairs > max_pairs and not count_only:
         raise ValueError(
             f"plan would emit {n_pairs:,} pairs, above max_pairs={max_pairs:,}. "
@@ -3027,10 +3960,65 @@ def ld_matrix(
     if n_pairs == 0:
         return _empty_pairs(stats)
 
+    # ---- significance thresholds ----------------------------------------
+    # n_pairs IS the number of tests. It comes from _count_pairs, in closed
+    # form from the row count and the window, so m is known without touching
+    # the data -- which is what makes correction affordable at genome scale.
+    m_tests = n_pairs
+    if correction == "bonferroni":
+        max_p = alpha / m_tests
+    if max_p is not None:
+        # With no missingness every pair shares one N, so chi2 = N*r^2 is
+        # strictly monotone in r^2 and the p-cut IS an r^2-cut: hand it to the
+        # filter the kernel already applies and the test costs nothing. With
+        # missingness N varies per pair and N <= n_eff, so the same conversion
+        # is a CONSERVATIVE pre-filter (a pair below it cannot reach the cut at
+        # any smaller N) and _apply_significance_filters applies the exact one.
+        from scipy.stats import chi2 as _chi2_dist  # noqa: PLC0415
+        n_eff = (2 * int(reader.n_samples) if want_phased
+                 else int(reader.n_samples))
+        min_r2 = float(_chi2_dist.isf(max_p, 1)) / n_eff
+        if verbose:
+            print(f"cugen.ld: max_p={max_p:.3g} over m={m_tests:,} tests -> "
+                  f"min_r2={min_r2:.6g} at N={n_eff}")
+    # Both parameter families, recorded together: the test space determines m
+    # and so the correction thresholds, and the retention family is what a
+    # reader is allowed to be asked about. A run is only reproducible if both
+    # travel with the file.
+    _ld_params = {
+        "maf_min": float(maf_min),
+        "maf_max": None if maf_max is None else float(maf_max),
+        "window": window, "window_kb": window_kb,
+        "min_dist_kb": None if min_dist_kb is None else float(min_dist_kb),
+        "max_dist_kb": None if max_dist_kb is None else float(max_dist_kb),
+        "scope": scope,
+        "min_r2": float(min_r2), "max_p": max_p, "correction": correction,
+        "alpha": float(alpha),
+        "top_k": None if top_k is None else int(top_k),
+        "n_obs": (2 * int(reader.n_samples) if want_phased
+                  else int(reader.n_samples)),
+        "m_tests": int(m_tests),
+    }
+    _screened = min_r2 > 0
+    _sig_kw = dict(max_p=max_p, correction=correction, alpha=alpha,
+                   m=m_tests, screened=_screened, verbose=verbose)
+    # FDR needs every p-value to find its threshold, so it must not pre-screen.
+    if correction == "fdr":
+        _sig_kw["max_p"] = None
+
     # ---- counts ----------------------------------------------------------
     # D and D' need the 3x3 table; r-family statistics do not, and skipping it
     # avoids ~9x the memory traffic per tile.
     need_table = bool({"d", "dp"} & set(stats))
+    if want_corrected and use_gpu:
+        # The cost here is one n x n eigendecomposition plus a dense transform
+        # of the genotype matrix, neither of which the GPU scan is shaped for,
+        # and the paper's own scale is hundreds of individuals. Take the
+        # reference path and say so rather than pretending otherwise.
+        if verbose:
+            print(f"cugen.ld: {want_corrected} take the reference path "
+                  f"(dense sample-axis transform); backend={backend!r} ignored")
+        use_gpu = False
 
     use_tf32 = _resolve_precision(precision, int(reader.n_samples), verbose)
 
@@ -3039,7 +4027,15 @@ def ld_matrix(
     # letting cudf wrap them avoids a host round trip we would immediately undo.
     # The cuDF/output preconditions exist to avoid a host round trip when
     # SERIALISING. count_only serialises nothing, so they do not apply.
-    on_device = (use_gpu and not need_table and annotation is None
+    #
+    # p_exact is excluded for the same reason need_table is: it needs the 2x2
+    # table, and the fused epilogue emits only r. nAB IS recoverable from r via
+    # _recover_nab, but the Fisher tail sum itself is a host loop over scipy's
+    # gammaln, so keeping the survivors on the device would buy nothing and
+    # would leave a second implementation of the same test to keep in step.
+    # Under exact='auto' the loop runs on a small subset by construction.
+    on_device = (use_gpu and not need_table and "p_exact" not in stats
+                 and not lambda_gc and annotation is None
                  and (count_only or (HAS_CUDF and output is not None)))
     # The fused single-kernel scan handles the clean r-only case: no
     # missingness, no bp window, no D/D'. That is the hot path, and it is
@@ -3048,7 +4044,13 @@ def ld_matrix(
     # precondition is structural there rather than a property of this file.
     fused_ok_phased = (not want_phased
                        or set(want_phased) <= {"r_phased", "r2_phased"})
-    fused = (on_device and not reader.has_missing and window_kb is None
+    # The fused kernel takes `window` as a SCALAR, so any predicate needing
+    # per-row bounds (bp distance, cis/trans) falls to the tiled path -- the
+    # same way window_kb already does. Lifting this means giving the kernel the
+    # starts/hi arrays; see the handoff note in benchmarks/results/STORAGE.md.
+    _needs_row_bounds = (window_kb is not None or min_dist_kb is not None
+                         or max_dist_kb is not None or scope != "all")
+    fused = (on_device and not reader.has_missing and not _needs_row_bounds
              and min_obs <= reader.n_samples and fused_ok_phased)
 
     if stream and output is None:
@@ -3081,16 +4083,54 @@ def ld_matrix(
         if stream:
             n_obs_s = (2 * int(reader.n_samples) if want_phased
                        else int(reader.n_samples))
-            writer = _ChunkWriter(str(output))
+            native = str(output).endswith(".cugenld")
 
-            def _flush(ii_d, jj_d, rr_d):
-                g = _assemble_device(
-                    cp.stack([ii_d, jj_d], axis=1),
-                    (rr_d, cp.full(ii_d.size, float(n_obs_s),
-                                   dtype=cp.float32)),
-                    reader, rows, stats, sign_reference, path, False,
-                    n_planned=n_pairs)
-                writer.write(g)
+            if native:
+                # Straight from the device arrays to the encoder, skipping
+                # _assemble_device entirely. That frame is 76 B/row of which
+                # three columns carry information, so building one per flush
+                # would put ~4x more bytes across PCIe than the encoded shard
+                # occupies on disk. A shard IS one tile's output, and #4's
+                # flushes land on tile boundaries, so each flush becomes one
+                # self-contained shard and nothing is ever accumulated.
+                from . import ldio                            # noqa: PLC0415
+                dsw = ldio.LDDatasetWriter(str(output), params=_ld_params)
+                _k = [0]
+                if sign_reference == "major":
+                    af_dev = cp.asarray(
+                        np.asarray(reader.mu_x, dtype=np.float32)) / 2.0
+                    rows_dev = cp.asarray(rows)
+
+                rows_d = cp.asarray(rows)
+
+                def _flush(ii_d, jj_d, rr_d):
+                    r_d = rr_d
+                    if sign_reference == "major":
+                        flip = ((af_dev[rows_d[ii_d]] > 0.5)
+                                ^ (af_dev[rows_d[jj_d]] > 0.5))
+                        r_d = cp.where(flip, -r_d, r_d)
+                    g_i, g_j = rows_d[ii_d], rows_d[jj_d]
+                    # Sort on the DEVICE. Profiling the host path at 8 M rows
+                    # put np.lexsort at 2.03 s of 2.31 s total host work -- 88%,
+                    # against 0.21 s for the delta+zstd encode. cp.lexsort does
+                    # the same sort in 0.37 s, and the D2H that follows is
+                    # 0.01 s because the payload is narrow.
+                    o = cp.lexsort(cp.stack([g_j, g_i]))
+                    dsw.write_shard((_k[0], 0), cp.asnumpy(g_i[o]),
+                                    cp.asnumpy(g_j[o]), cp.asnumpy(r_d[o]),
+                                    presorted=True)
+                    _k[0] += 1
+            else:
+                writer = _ChunkWriter(str(output))
+
+                def _flush(ii_d, jj_d, rr_d):
+                    g = _assemble_device(
+                        cp.stack([ii_d, jj_d], axis=1),
+                        (rr_d, cp.full(ii_d.size, float(n_obs_s),
+                                       dtype=cp.float32)),
+                        reader, rows, stats, sign_reference, path, False,
+                        n_planned=n_pairs)
+                    writer.write(g)
 
             try:
                 total = _scan_gpu_fused(
@@ -3099,10 +4139,19 @@ def ld_matrix(
                     phased=bool(want_phased), on_flush=_flush,
                     flush_rows=flush_rows)
             finally:
-                writer.close()
+                if native:
+                    dsw.mark_complete()
+                    dsw.close()
+                else:
+                    writer.close()
             if verbose:
-                extra = (f" in {writer.flushes} parts" if writer.flushes > 1
-                         else "")
+                # Both writers split their output; say which and how many.
+                if native:
+                    extra = f" ({_k[0]} shards)"
+                elif writer.flushes > 1:
+                    extra = f" in {writer.flushes} parts"
+                else:
+                    extra = ""
                 print(f"cugen.ld: streamed {total:,} rows to {output}{extra}")
             return int(total)
         ii, jj, rr = _scan_gpu_fused(reader, rows, window, min_r2,
@@ -3116,7 +4165,8 @@ def ld_matrix(
         n_dev = cp.full(ii.size, float(n_obs), dtype=cp.float32)
         df = _assemble_device(pairs_local, (rr, n_dev), reader, rows, stats,
                               sign_reference, path, verbose, n_planned=n_pairs)
-        _write_df(df, str(output))
+        df = _apply_top_k(_apply_significance_filters(df, **_sig_kw), top_k)
+        _write_df(df, str(output), params=_ld_params)
         if verbose:
             print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs "
                   f"planned, {len(df):,} emitted  (gpu, fused kernel)")
@@ -3127,13 +4177,15 @@ def ld_matrix(
         pairs_local, payload = _scan_gpu(
             reader, rows, window, window_kb, positions, min_r2, min_obs,
             tile_size=tile_size, verbose=verbose, need_table=need_table,
-            keep_device=on_device)
+            keep_device=on_device, bounds=_pair_bounds(
+                len(rows), positions, window, window_kb, **_space))
         if len(pairs_local) == 0:
             return _empty_pairs(stats)
         if on_device:
             df = _assemble_device(pairs_local, payload, reader, rows, stats,
                                   sign_reference, path, verbose, n_planned=n_pairs)
-            _write_df(df, str(output))
+            df = _apply_top_k(_apply_significance_filters(df, **_sig_kw), top_k)
+            _write_df(df, str(output), params=_ld_params)
             if verbose:
                 print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs "
                       f"planned, {len(df):,} emitted  (gpu, cudf device write)")
@@ -3144,7 +4196,8 @@ def ld_matrix(
             r_arr, n_arr = payload
             res = _r_only_result(r_arr, n_arr, reader, rows, pairs_local)
     else:
-        pairs_local, _ = _plan_pairs(len(rows), positions, window, window_kb)
+        pairs_local, _ = _plan_pairs(len(rows), positions, window,
+                                     window_kb, **_space)
         if want_phased:
             hap = _haplotypes_numpy(reader)[rows]
             res = phased_from_haplotypes(hap, pairs_local)
@@ -3152,6 +4205,23 @@ def ld_matrix(
             dos = _dosages_numpy(reader)[rows]
             tables = contingency_tables(dos, pairs_local)
             res = ld_from_counts(tables, dprime_method=dprime_method)
+            if want_corrected:
+                # Missing calls are mean-imputed here. The transform is a dense
+                # operation on the sample axis, so it cannot be done pairwise
+                # complete-case the way the counts above are; LDcorSV drops
+                # incomplete rows instead, which would change the sample set
+                # from pair to pair and with it the kinship matrix.
+                d = np.asarray(dos, dtype=np.float64)
+                miss = d == 3
+                if miss.any():
+                    mu = np.where(miss, np.nan, d)
+                    col = np.nanmean(mu, axis=1)
+                    d = np.where(miss, col[:, None], d)
+                for which in want_corrected:
+                    P = _corrected_transform(which, int(reader.n_samples),
+                                             kinship=kinship,
+                                             structure=structure)
+                    res[which] = _corrected_r2(d, pairs_local, P)
 
     # ---- orientation -----------------------------------------------------
     # Flipping BOTH variants leaves r unchanged; flipping exactly one negates
@@ -3167,6 +4237,18 @@ def ld_matrix(
     # this call actually computed rather than assuming "r" is present
     r_key = "r" if "r" in res else "r_phased"
     r2_key = "r2" if "r2" in res else "r2_phased"
+    _add_significance(res, stats, exact=exact)
+    lam = None
+    if lambda_gc:
+        # Before `keep` is applied: filtering selects the tail, and the median
+        # of a selected tail carries no information about the null.
+        lam = _lambda_gc(res["chi2"],
+                         pairs_local[:, 1] - pairs_local[:, 0])
+        res["chi2_adj"] = res["chi2"] / lam
+        res["p_adj"] = _neglog10_chi2_1df(res["chi2_adj"])
+        if verbose:
+            print(f"cugen.ld: lambda_gc = {lam:.4f} over "
+                  f"{len(res['chi2']):,} pairs")
     keep = np.isfinite(res[r_key]) & (res["n"] >= min_obs)
     if min_r2 > 0:
         keep &= res[r2_key] >= min_r2
@@ -3192,11 +4274,70 @@ def ld_matrix(
         chrom_fallback = int(m.group(1))
     df = _merge_annotation(df, ann, chrom_fallback)
     df = _finalize(df, stats)
+    df = _apply_top_k(_apply_significance_filters(df, **_sig_kw), top_k)
 
     if verbose:
         print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs planned, "
               f"{len(df):,} emitted  (backend={'gpu' if use_gpu else 'numpy'}, "
               f"dprime={dprime_method}, sign={sign_reference})")
+    if lam is not None:
+        # last, because iloc/astype/concat do not reliably carry attrs
+        df.attrs["lambda_gc"] = lam
     if output is not None:
-        _write_df(df, str(output))
+        _write_df(df, str(output), params=_ld_params)
+    if output_format == "matrix":
+        return _as_ld_matrix(df, reader, rows, gidx_all, maf_all, ann, stats,
+                             dprime_method, missing)
     return df
+
+
+def _as_ld_matrix(df, reader, rows, gidx_all, maf_all, ann, stats,
+                  dprime_method, missing) -> "LDMatrix":
+    """Scatter a pairs frame into the dense symmetric matrices of an LDMatrix.
+
+    LDMatrix was declared, exported, documented and validated, and never
+    constructed anywhere in the repo -- so output_format="matrix" silently
+    returned a pairs DataFrame. This is the missing half.
+
+    Only reachable with no retention threshold (checked in ld_matrix), because a
+    dense matrix assembled from a filtered scan would read as zero wherever the
+    filter bit rather than as the value that was there.
+    """
+    gidx = gidx_all[rows]
+    p = len(rows)
+    pos_of = {int(g): k for k, g in enumerate(gidx)}
+    ia = np.array([pos_of[int(g)] for g in df["gidx_a"]], dtype=np.int64)
+    ib = np.array([pos_of[int(g)] for g in df["gidx_b"]], dtype=np.int64)
+
+    def dense(col, diag):
+        if col not in df.columns:
+            return None
+        M = np.full((p, p), np.nan, dtype=np.float64)
+        v = df[col].to_numpy(np.float64)
+        M[ia, ib] = v
+        M[ib, ia] = v
+        np.fill_diagonal(M, diag)
+        return M
+
+    n_obs = np.full((p, p), float(reader.n_samples))
+    if "N_OBS" in df.columns:
+        n_obs[ia, ib] = df["N_OBS"].to_numpy(np.float64)
+        n_obs[ib, ia] = df["N_OBS"].to_numpy(np.float64)
+
+    chrom = np.zeros(p, dtype=np.int32)
+    posn = np.zeros(p, dtype=np.int64)
+    if ann is not None:
+        m = ann.set_index("gidx")
+        for k, g in enumerate(gidx):
+            if int(g) in m.index:
+                chrom[k] = int(m.at[int(g), "CHR"])
+                posn[k] = int(m.at[int(g), "POS"])
+
+    return LDMatrix(
+        r=dense("R", 1.0) if "R" in df.columns else dense("R_PHASED", 1.0),
+        r2=dense("R2", 1.0) if "R2" in df.columns else dense("R2_PHASED", 1.0),
+        r2_signed=dense("R2_SIGNED", 1.0),
+        d=dense("D", np.nan), d_prime=dense("DP", np.nan),
+        n_obs=n_obs, gidx=gidx, chrom=chrom, pos=posn,
+        maf=maf_all[rows], n_samples=int(reader.n_samples),
+        dprime_method=dprime_method, missing=missing)

@@ -119,10 +119,18 @@ def _hwe_chi2(n0: 'cp.ndarray', n1: 'cp.ndarray',
 
 
 def _chi2_p_1df(chi2: 'cp.ndarray') -> 'cp.ndarray':
-    """Right-tail p-value for chi² with 1 df: ``1 - erf(sqrt(chi2/2))``."""
-    # cp.special.erf(x) returns elementwise erf
-    from cupyx.scipy import special as _sp  # noqa: PLC0415
-    return 1.0 - _sp.erf(cp.sqrt(cp.maximum(chi2, 0.0) / 2.0))
+    """Right-tail p-value for chi² with 1 df.
+
+    Delegates to cugen.ld._neglog10_chi2_1df so there is one implementation of
+    this tail. The obvious form, ``1 - erf(sqrt(chi2/2))``, cancels
+    catastrophically: erf approaches 1 and the subtraction throws away every
+    significant digit, so it returns 0.0 for anything past chi² ~ 40 in float32
+    -- the same failure cugen.assoc documents for the inverse direction. Going
+    through -log10(p) and exponentiating keeps full precision where p is
+    representable and underflows cleanly to 0.0 where it is not.
+    """
+    from .ld import _neglog10_chi2_1df  # noqa: PLC0415
+    return cp.power(10.0, -_neglog10_chi2_1df(chi2, cp))
 
 
 # ---------------------------------------------------------------------------
