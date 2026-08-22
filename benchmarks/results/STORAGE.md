@@ -231,13 +231,47 @@ found where the time actually went, and it was not where I assumed:
     total host work                                2.31 s
 
 I had assumed the Python encode loop dominated. It is 9%. **The host sort is
-88%**, and `cp.lexsort` does the same 8 M rows in 0.37 s with a 0.01 s D2H
-afterwards because the payload is narrow. Sorting on the device and handing the
-writer `presorted=True` replaced 2.10 s of host work with 0.39 s — and turned a
-0.71x loss into a 2.36x win.
+88%.** Sorting on the device instead and handing the writer `presorted=True`
+turned a 0.71x loss into the 2.36x win in the table above.
+
+Those per-stage figures are single cold calls, so read them as relative
+magnitudes, not steady state — a first `cp.lexsort` includes kernel compilation
+and measured 0.37 s where the warm call is 0.031 s. The end-to-end 7.9 s -> 2.4 s
+is the authoritative number.
+
+### Re-profiled after the fix, warm
+
+| stage | sec (8 M rows) | % | where |
+|---|---:|---:|---|
+| GPU lexsort | 0.031 | 10.9% | device |
+| GPU gather + quantise | 0.022 | 7.6% | device |
+| D2H (int64, int64, int16) | 0.027 | 9.5% | bus |
+| **host delta-pack + zstd loop** | **0.207** | **72.0%** | **HOST** |
+
+Splitting that host term settles what to do next, and rules out what I had been
+calling the obvious answer: **delta-pack is 0.130 s and zstd is 0.005 s.**
+Compression is **1.7% of the whole write path**, so moving it to the GPU with
+nvCOMP — a new dependency, plus a stream-compatibility risk for GPU-less readers
+— would buy at most that. The cost is the Python per-block loop doing numpy
+`sort`/`diff`/`tobytes`.
+
+Also measured, and also wrong: `argsort` on a packed `(i<<32)|j` key takes
+0.204 s against `lexsort`'s 0.031 s — **6.7x slower**, not faster.
+
+So the next target is to vectorise the block packing onto the device (segmented
+delta across row boundaries, quantise, build all block payloads in one pass, one
+D2H) and leave zstd on the host where it is already free. That addresses 72%
+rather than 1.7%, with no new dependency.
+
+One gap worth naming: scaling this profile to 27.5 M rows predicts ~1.0 s of
+serialisation against ~2.1 s measured, so roughly half is unaccounted for --
+likely `LDShardWriter._flush`'s `unique`/`concatenate`, the per-shard manifest
+rewrite, and file I/O. That should be located before optimising the visible half.
 
 The lesson generalises past this format: at these row counts any per-row host
-work is the bottleneck, and the useful question is always which one.
+work is the bottleneck, and the useful question is always which one -- guessing
+has now been wrong three times (the 2B^2 buffer, block size vs indexing, and
+zstd vs packing).
 
 ## Caveats
 

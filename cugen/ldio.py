@@ -465,7 +465,11 @@ class LDShardWriter:
         ``presorted`` skips the host lexsort, which profiling showed to be 88%
         of all host write work (2.03 s of 2.31 s at 8 M rows) -- far more than
         the delta+zstd encode at 9%. A caller holding the data on a GPU should
-        sort there instead: cp.lexsort does the same 8 M rows in 0.37 s.
+        sort there instead; cp.lexsort does the same 8 M rows in 0.031 s warm.
+
+        After that change the remaining host term is the per-block pack loop
+        (0.130 s at 8 M rows), not compression -- zstd itself is 0.005 s. See
+        benchmarks/results/STORAGE.md.
         """
         ia = np.asarray(i, dtype=np.int64).ravel()
         if ia.size == 0:
