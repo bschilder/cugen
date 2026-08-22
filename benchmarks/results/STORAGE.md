@@ -193,6 +193,52 @@ Two levels, and they are not interchangeable:
   it opens 21.8% for r²≥0.8. The test suite carries both fixtures for exactly
   this reason.
 
+## Streaming straight into `.cugenld`
+
+#4's `stream=True` calls an `on_flush(i, j, r)` callback whose flushes land on
+tile boundaries, and a shard *is* one tile's output — so the two compose: each
+flush becomes one self-contained shard and nothing is accumulated. The native
+path skips `_assemble_device` entirely, since building a 76 B/row frame per
+flush would put ~4x more bytes across PCIe than the encoded shard occupies on
+disk.
+
+Real chr22, all pairs, p = 51,100:
+
+| min_r2 | target | rows | wall | size | B/pair | vs parquet |
+|---:|---|---:|---:|---:|---:|---:|
+| 0.2 | parquet (#4) | 1,930,958 | 1.8 s | 22.3 MB | 11.56 | 1.00x |
+| 0.2 | **`.cugenld`** | 1,930,958 | **0.6 s** | **5.1 MB** | **2.65** | **3.24x** |
+| 0.2 | `count_only` (scan floor) | — | 0.3 s | — | — | — |
+| 0.05 | parquet (#4) | 27,541,325 | 5.7 s | 338.2 MB | 12.28 | 1.00x |
+| 0.05 | **`.cugenld`** | 27,541,325 | **2.4 s** | **55.4 MB** | **2.01** | **2.36x** |
+| 0.05 | `count_only` (scan floor) | — | 0.3 s | — | — | — |
+
+**6.1x smaller and 2.4x faster** at 27.5 M rows. Against the 0.3 s scan floor,
+parquet spends 5.4 s serialising (95% of wall clock) and `.cugenld` 2.1 s (87%) —
+still the dominant term, but 2.6x less of it.
+
+### The sort, not the compression, was the cost
+
+The first native version was **slower** than parquet at 27.5 M rows — 7.9 s
+against 5.7 s — while being 6.1x smaller. Profiling the host path at 8 M rows
+found where the time actually went, and it was not where I assumed:
+
+    D2H copy (int64, int64, float64 = 24 B/row)    0.04 s
+    host np.lexsort                                2.03 s   <- 88%
+    quantise r -> int16                            0.03 s
+    per-block delta + zstd encode                  0.21 s   <- 9%
+    ------------------------------------------------------
+    total host work                                2.31 s
+
+I had assumed the Python encode loop dominated. It is 9%. **The host sort is
+88%**, and `cp.lexsort` does the same 8 M rows in 0.37 s with a 0.01 s D2H
+afterwards because the payload is narrow. Sorting on the device and handing the
+writer `presorted=True` replaced 2.10 s of host work with 0.39 s — and turned a
+0.71x loss into a 2.36x win.
+
+The lesson generalises past this format: at these row counts any per-row host
+work is the bottleneck, and the useful question is always which one.
+
 ## Caveats
 
 - One 10 Mb window of chr22 in one cohort. Enough to size the formats and the
@@ -203,10 +249,9 @@ Two levels, and they are not interchangeable:
   on the GPU yet.
 - `variant()` builds a row-variant index at open, which is O(row variants) in
   Python. At 84 M variants that becomes the cost to beat.
-- `_scan_gpu_fused` still accumulates into its own output buffer rather than
-  calling the writer per tile, so the streaming path that removes the
-  `max_pairs` ceiling is designed but not wired up. The sharded writer is driven
-  from Python in the benchmark above, one `ld_matrix` call per tile.
+- The delta + zstd encode is still a host-side Python loop. It is only 9% of
+  host work now that the sort moved to the device, but it is the next term, and
+  zstd on the GPU would need nvCOMP.
 - Shard-level `max_abs_r` skipping is weak whenever every shard is within LD
   range of the diagonal, which is the common case for a windowed cis scan. It
   pays for trans and long-range work.

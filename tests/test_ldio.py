@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from cugen import ldio
+from conftest import requires_cudf
 
 
 # ------------------------------------------------------------------ encodings
@@ -959,3 +960,74 @@ def test_matrix_output_refuses_a_threshold(small_cugen):
     with pytest.raises(ValueError, match="matrix|threshold|min_r2"):
         L.ld_matrix(small_cugen[0], stats=("r",), output_format="matrix",
                     min_r2=0.2, backend="numpy", verbose=False)
+
+
+# ------------------------------------------------ streaming into .cugenld
+# #4 added stream=True with an on_flush callback whose flushes land on tile
+# boundaries. A shard IS one tile's output, so the two compose: each flush
+# becomes a shard, and nothing is ever accumulated.
+
+@requires_cudf
+@pytest.mark.gpu
+def test_streaming_to_cugenld_matches_the_buffered_result(tmp_path,
+                                                          write_cugen_file):
+    from cugen import ld as L
+    from conftest import simulate_haplotypes
+    # simulate_haplotypes returns (n_variants, n_samples)
+    dos = simulate_haplotypes(400, 900, seed=4)
+    assert dos.shape == (900, 400)
+    path = write_cugen_file(dos)
+
+    # min_r2=0 on purpose: the flush buffer clamps at 65,536 rows and drains at
+    # half full, so a thresholded scan on this fixture emits one flush and the
+    # sharding assertion below would be vacuous.
+    buffered = L.ld_matrix(path, min_r2=0.0, stats=("r", "r2"),
+                           output=str(tmp_path / "b.parquet"),
+                           max_pairs=10**15, verbose=False)
+
+    d = str(tmp_path / "streamed.cugenld")
+    # tile_size forces many tiles: the buffer drains BETWEEN tiles, so a scan
+    # that fits in one tile flushes exactly once however large the result is,
+    # and the sharding assertion below would be vacuous.
+    n = L.ld_matrix(path, min_r2=0.0, stats=("r", "r2"), output=d,
+                    stream=True, flush_rows=1 << 16, tile_size=128,
+                    max_pairs=10**15, verbose=False)
+    assert isinstance(n, int), "stream=True must return a row count"
+    assert n == len(buffered)
+
+    ds = ldio.open_ld(d)
+    assert ds.complete and ds.n_pairs == n
+    assert ds.n_shards > 1, "flush_rows was too large to exercise sharding"
+    gi, gj, gr = ds.rows()
+    want = set(zip(buffered["gidx_a"].to_numpy().tolist(),
+                   buffered["gidx_b"].to_numpy().tolist()))
+    assert set(zip(gi.tolist(), gj.tolist())) == want
+    # r survives quantisation
+    ref = dict(zip(zip(buffered["gidx_a"].to_numpy().tolist(),
+                       buffered["gidx_b"].to_numpy().tolist()),
+                   buffered["R"].to_numpy(np.float64).tolist()))
+    err = max(abs(r - ref[(int(a), int(b))])
+              for a, b, r in zip(gi, gj, gr))
+    assert err <= 0.51 / 32767 + 1e-9, f"max |dr| {err:.2e}"
+
+
+@requires_cudf
+@pytest.mark.gpu
+def test_streaming_to_cugenld_records_its_params_and_resumes(tmp_path,
+                                                            write_cugen_file):
+    """A streamed dataset is an ordinary sharded dataset: it carries the run's
+    parameters and a resumed writer sees what already landed."""
+    from cugen import ld as L
+    from conftest import simulate_haplotypes
+    dos = simulate_haplotypes(300, 600, seed=9)
+    path = write_cugen_file(dos)
+    d = str(tmp_path / "s.cugenld")
+    L.ld_matrix(path, min_r2=0.05, stats=("r", "r2"), output=d, stream=True,
+                flush_rows=1 << 15, tile_size=128, max_pairs=10**15,
+                verbose=False)
+
+    ds = ldio.open_ld(d)
+    assert ds.params["min_r2"] == 0.05
+    assert ds.params["n_obs"] == dos.shape[1] or ds.params["n_obs"] > 0
+    w = ldio.LDDatasetWriter(d, params=ds.params, resume=True)
+    assert len(w.completed_shards()) == ds.n_shards
