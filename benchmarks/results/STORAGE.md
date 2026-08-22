@@ -45,11 +45,27 @@ bp-range predicate can actually skip row groups.
 51,100 variants → 1.31e9 pairs, no window. This is the shape a genome-wide run
 takes.
 
-| min_r2 | rows | vs r²≥0.2 | wall | size | B/pair |
-|---:|---:|---:|---:|---:|---:|
-| 0.2 | 1,415,371 | 1× | 6.7 s | 4.0 MB | 2.83 |
-| 0.05 | 12,730,642 | 9.0× | 10.5 s | 24.7 MB | 1.94 |
-| **0.01** | **164,079,591** | **116×** | 70.4 s | 345 MB | 2.10 |
+| min_r2 | rows | rows/variant | % of all pairs | vs r²≥0.2 | wall | size | B/pair |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.2 | 1,415,371 | 27.7 | 0.108% | 1× | 7.5 s | 4.0 MB | 2.84 |
+| 0.1 | 3,448,914 | 67.5 | 0.264% | 2.4× | 7.1 s | 8.2 MB | 2.39 |
+| 0.05 | 12,730,642 | 249.1 | 0.975% | 9.0× | 10.2 s | 25.6 MB | 2.01 |
+| 0.02 | 66,765,884 | 1,306.6 | 5.114% | 47× | 31.0 s | 135.9 MB | 2.04 |
+| **0.01** | **164,079,591** | **3,211.0** | **12.568%** | **116×** | 323 s | 345.1 MB | 2.10 |
+
+The log-log slope is **t^-1.64**, with local slopes of −1.29 (0.2→0.1), −1.88
+(0.1→0.05), −1.81 (0.05→0.02) and −1.30 (0.02→0.01). An earlier version of this
+analysis modelled it as 1/t, which is wrong in the measured range — tightening
+the threshold buys more than 1/t suggests.
+
+But the power law cannot continue, and the "% of all pairs" column is why: at
+r² ≥ 0.01 the retained set is already **12.6% of every pair in the file**. It
+saturates toward the full within-LD-span pair space rather than growing without
+bound, so extrapolating t^-1.64 into a biobank regime overshoots. The real
+ceiling is `p × (variants within the LD span)` — roughly 7e10 rows genome-wide
+for a ~1 Mb span — plus a trans contribution that stays α-limited by
+construction. The flattening at both ends of the measured range is that ceiling
+becoming visible.
 
 **This is the measurement the repo did not have.** Every previously recorded
 output volume used `min_r2 = 0.2`, and `GENOMEWIDE.md` flagged the threshold as
@@ -113,6 +129,70 @@ filters look expensive because a statistically defensible threshold retains
 **5–13× more pairs** than `min_r2 = 0.2` — that is output volume, not overhead,
 and it is the same finding as the 116× above.
 
+## Sharded datasets and resumability
+
+A shard is one scan tile's output, keyed by the `(A, B)` variant-block pair the
+scan already walks, so shards are written independently — concurrently, across
+GPUs, and across a resumed run — with no cross-shard coordination and no global
+sort. Real chr22, `min_r2 = 0.1`, tile = 8192 variants → 28 shards:
+
+    interrupted after 11/28 shards, 1,206,999 pairs, 27.8 s
+    resume saw 11 completed shards and recomputed 17
+    resumed: 28 shards, 3,448,696 pairs, 26.2 s, 2.55 B/pair
+    resume skipped 52% of the total work
+
+**The resumed dataset is identical to a single unsharded scan** — 3,448,696 rows
+on both sides, symmetric difference **0**. That is the property that makes
+resumability trustworthy rather than merely convenient: on spot or preemptible
+capacity a format that forces all-or-nothing writes makes an hours-long
+genome-wide job impractical.
+
+Shards land by **atomic rename**, so a process killed mid-write leaves a temp
+file no reader ever sees, and the manifest — not the directory listing — is the
+record of what exists. Resuming with different parameters is refused outright:
+the test space sets the number of tests and therefore every corrected threshold,
+so half a dataset at one setting and half at another is not a dataset.
+
+### Query latency across 28 shards, 386 blocks, 3.45 M pairs
+
+| query | rows | latency | shards opened | blocks read |
+|---|---:|---:|---:|---:|
+| `above(r²≥0.2)` | 1,415,522 | 68.6 ms | 28/28 | 152/386 (39%) |
+| `above(r²≥0.5)` | 619,257 | 31.3 ms | 27/28 | 84/386 (22%) |
+| `above(r²≥0.8)` | 306,674 | 15.3 ms | 27/28 | 41/386 (11%) |
+| `region(10k,12k)` | 60,455 | 9.4 ms | **1/28 (4%)** | — |
+| `variant(v)` | — | **2.38 ms** | ~10 | — |
+
+**Footer re-parsing was dominating every cross-shard query.** Each shard open
+parses its footer and rebuilds its row-variant index; doing that per lookup cost
+more than the decompression it was there to avoid. Caching the readers — the
+files are immutable, so it is always safe — gave:
+
+    variant()          21.74 ms -> 2.38 ms    9.1x
+    above(r2>=0.2)   1209.9 ms  -> 68.6 ms   17.6x
+    above(r2>=0.5)   1162.9 ms  -> 31.3 ms   37.2x
+    above(r2>=0.8)    635.6 ms  -> 15.3 ms   41.5x
+    region(10k,12k)     22.5 ms ->  9.4 ms    2.4x
+
+Note that `above()` opens nearly every shard here and that is correct: at
+tile = 8192 variants (~1.6 Mb) every shard in a 10 Mb window is within LD range,
+so none can be excluded on its max |r|. The block-level tier skip is what does
+the work (39% → 11% of blocks as the cut tightens).
+
+### Where each skip actually earns its keep
+
+Two levels, and they are not interchangeable:
+
+- **Index-based skips** (`min_i`/`max_i`, `min_j`/`max_j`) are the reliable ones.
+  `region()` opens 1 of 28 shards; `variant()` about 10 of 55 on a synthetic
+  fixture. These work regardless of how signal is distributed.
+- **Value-based skips** (per-shard `max_abs_r`, per-block tier) depend on the data
+  being clustered in r. On a fixture with strong pairs spread *uniformly* the
+  shard-level r skip opened **all 55 shards** — correct, but unexercised, because
+  every shard genuinely contained something strong. On realistic near-diagonal LD
+  it opens 21.8% for r²≥0.8. The test suite carries both fixtures for exactly
+  this reason.
+
 ## Caveats
 
 - One 10 Mb window of chr22 in one cohort. Enough to size the formats and the
@@ -123,5 +203,14 @@ and it is the same finding as the 116× above.
   on the GPU yet.
 - `variant()` builds a row-variant index at open, which is O(row variants) in
   Python. At 84 M variants that becomes the cost to beat.
-- Sharding by variant-block pair, the manifest, and resumability are designed
-  (see `cugen/ldio.py`) but not yet implemented: this is one shard per file.
+- `_scan_gpu_fused` still accumulates into its own output buffer rather than
+  calling the writer per tile, so the streaming path that removes the
+  `max_pairs` ceiling is designed but not wired up. The sharded writer is driven
+  from Python in the benchmark above, one `ld_matrix` call per tile.
+- Shard-level `max_abs_r` skipping is weak whenever every shard is within LD
+  range of the diagonal, which is the common case for a windowed cis scan. It
+  pays for trans and long-range work.
+- `bytes_per_pair` rises with shard count: each shard pays a 256-byte header and
+  its own footer, so a small dataset cut into many shards is worse than one file
+  (7.43 vs 4.4 B/pair on a 115 k-pair fixture). Shards must be sized to hold a
+  meaningful number of pairs; `tests/test_ldio.py` pins the direction.

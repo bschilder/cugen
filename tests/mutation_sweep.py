@@ -19,6 +19,25 @@ ROOT = pathlib.Path("/Users/bschilder/code/cugen")
 
 MUTATIONS = [
     # ---- LD result storage (.cugenld) ----
+    # Deliberately NOT included: replacing os.replace() with copy+remove.
+    # Both complete identically in the absence of a crash, so it is an
+    # equivalent mutant -- atomicity is only observable under fault
+    # injection, and listing it would keep the sweep permanently red.
+    ('resume trusts a manifest entry whose file is gone', 'cugen/ldio.py',
+     """                            if os.path.exists(os.path.join(self.path,""",
+     """                            if True or os.path.exists(os.path.join(self.path,""", "tests/test_ldio.py"),
+    ('resume ignores a params mismatch', 'cugen/ldio.py',
+     """            if man.get(\"params\") != self.params:""",
+     """            if False:""", "tests/test_ldio.py"),
+    ('manifest shard skip ignores max_abs_r', 'cugen/ldio.py',
+     """            return sh[\"max_abs_r\"] ** 2 >= min_r2""",
+     """            return True""", "tests/test_ldio.py"),
+    ('variant() opens every shard', 'cugen/ldio.py',
+     """            if not (sh[\"min_i\"] <= v <= sh[\"max_i\"]):""",
+     """            if False:""", "tests/test_ldio.py"),
+    ('block pair cap is ignored', 'cugen/ldio.py',
+     """                if ti.size > self.max_block_pairs:""",
+     """                if False:""", "tests/test_ldio.py"),
     ('r quantisation truncates instead of rounding', 'cugen/ldio.py',
      """    return np.clip(np.rint(a * scale), -lim, lim).astype(_ENC_DTYPE[encoding])""",
      """    return np.clip(np.trunc(a * scale), -lim, lim).astype(_ENC_DTYPE[encoding])""", "tests/test_ldio.py"),

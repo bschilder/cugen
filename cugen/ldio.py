@@ -32,16 +32,30 @@ NULL pairs is alpha by construction, so raising the test count raises the
 threshold exactly enough to compensate. Trans pairs are self-limiting.
 
 What is not self-limiting is the sample size. Since chi2 = N * r^2, a larger
-cohort pushes the significance threshold down and the cis partner count up:
+cohort pushes the significance threshold down and the cis partner count up --
+and the threshold is by far the dominant lever on output volume. Measured on
+real chr22 (51,100 variants at MAF >= 0.01, all pairs, see
+benchmarks/results/STORAGE.md):
 
-    1KG MAF>=1%, r2 >= 0.2     8.4e8 rows     2.5 GB banded    85 GB TSV
-    1KG MAF>=1%, Bonferroni    1.3e10 rows   0.04 TB           0.9 TB
-    1KG all variants, Bonf.    7.2e10 rows   0.21 TB           5.0 TB
-    biobank N=1e6, Bonferroni  2.6e12 rows    7.7 TB           178 TB
+    min_r2   rows          rows/variant   % of all pairs
+    0.2      1,415,371     27.7           0.108%
+    0.1      3,448,914     67.5           0.264%
+    0.05     12,730,642    249.1          0.975%
+    0.02     66,765,884    1,306.6        5.114%
+    0.01     164,079,591   3,211.0        12.568%
 
-Only the first line is measured; the rest scale cis partners/variant as 1/t
-from that measurement. So: 1e9 to 1e13 rows, and bytes-per-pair is the only
-lever this module owns.
+That is 116x between 0.2 and 0.01, and the log-log slope is **t^-1.64**, not the
+1/t an earlier version of this docstring assumed. Two things follow, in opposite
+directions. Tightening the threshold buys more than 1/t suggests; but the power
+law cannot continue, because at r2 >= 0.01 the retained set is already 12.6% of
+ALL pairs, so it saturates toward the full within-LD-span pair space rather than
+growing without bound. Extrapolating t^-1.64 into the biobank regime therefore
+overshoots -- the real ceiling is
+p * (variants within the LD span), roughly 7e10 rows genome-wide for a ~1 Mb
+span, plus a trans contribution that stays alpha-limited.
+
+So: 1e6 to 1e11 rows across the useful threshold range, and bytes-per-pair is
+the only lever this module owns.
 
 Shape of the format
 -------------------
@@ -951,3 +965,283 @@ def read_pairs(path: str):
     if p.endswith((".csv", ".csv.gz")):
         return pd.read_csv(p)
     raise ValueError(f"no reader for {p!r}")
+
+
+# ---------------------------------------------------------------------------
+# Sharded datasets. A shard is one scan tile's output, keyed by the (A, B)
+# variant-block pair the scan already walks, so shards are written
+# independently -- concurrently, across GPUs, and across a resumed run -- with
+# no cross-shard coordination and no global sort.
+#
+# Resumability is not a convenience at this scale. A genome-wide all-by-all run
+# is hours of GPU time, and on spot or preemptible capacity a format that forces
+# all-or-nothing writes makes the job impractical. The manifest is the record of
+# what exists; a shard lands by atomic rename, so a process killed mid-write
+# leaves a temp file that no reader ever sees.
+# ---------------------------------------------------------------------------
+MANIFEST = "manifest.json"
+
+
+def _shard_name(key) -> str:
+    a, b = key
+    return f"{int(a)}-{int(b)}.ldz"
+
+
+class LDDatasetWriter:
+    """Write a sharded LD dataset; resume one that was interrupted.
+
+    ``write_shard(key, i, j, r)`` is the whole interface. Each call produces one
+    self-contained, independently queryable shard and appends it to the
+    manifest, so progress is durable at shard granularity rather than at the end
+    of the run.
+    """
+
+    def __init__(self, path: str, *, params: Optional[dict] = None,
+                 encoding: str = DEFAULT_ENCODING, block_variants: int = 4096,
+                 max_block_pairs: int = MAX_BLOCK_PAIRS, tiers=DEFAULT_TIERS,
+                 resume: bool = False):
+        import json                                          # noqa: PLC0415
+        import os                                            # noqa: PLC0415
+
+        _check_encoding(encoding)
+        self.path = str(path)
+        self.encoding = encoding
+        self.block_variants = int(block_variants)
+        self.max_block_pairs = int(max_block_pairs)
+        self.tiers = tiers
+        self.params = {k: (params or {}).get(k) for k in _PARAM_KEYS}
+        os.makedirs(self.path, exist_ok=True)
+        man_path = os.path.join(self.path, MANIFEST)
+
+        self._shards: list = []
+        self._complete = False
+        if resume and os.path.exists(man_path):
+            man = json.loads(open(man_path).read())
+            if man.get("params") != self.params:
+                diff = {k for k in _PARAM_KEYS
+                        if man.get("params", {}).get(k) != self.params[k]}
+                raise ValueError(
+                    f"refusing to resume: the existing dataset was written with "
+                    f"different parameters ({sorted(diff)}). The test space sets "
+                    f"the number of tests and therefore every corrected "
+                    f"threshold, so half a dataset at one setting and half at "
+                    f"another is not a dataset. Write to a new path.")
+            if man.get("encoding") != self.encoding:
+                raise ValueError(
+                    f"refusing to resume: existing encoding is "
+                    f"{man.get('encoding')!r}, requested {self.encoding!r}")
+            # Trust the manifest, not the directory listing: a shard killed
+            # mid-write leaves a temp file, and a torn file must never be read.
+            self._shards = [sh for sh in man.get("shards", [])
+                            if os.path.exists(os.path.join(self.path,
+                                                           sh["file"]))]
+            self._complete = bool(man.get("complete", False))
+        self._flush_manifest()
+
+    # -- writing ------------------------------------------------------------
+    def completed_shards(self):
+        """Keys already durably written, so a resumed run can skip them."""
+        return [tuple(sh["key"]) for sh in self._shards]
+
+    def write_shard(self, key, i, j, r) -> str:
+        """One tile's survivors as one shard. Lands by atomic rename."""
+        import os                                            # noqa: PLC0415
+
+        name = _shard_name(key)
+        final = os.path.join(self.path, name)
+        tmp = final + f".tmp{os.getpid()}"
+        ia = np.asarray(i, dtype=np.int64).ravel()
+        ja = np.asarray(j, dtype=np.int64).ravel()
+        ra = np.asarray(r, dtype=np.float64).ravel()
+        order = np.lexsort((ja, ia))
+        w = LDShardWriter(tmp, encoding=self.encoding,
+                          block_variants=self.block_variants,
+                          max_block_pairs=self.max_block_pairs,
+                          params=self.params, tiers=self.tiers,
+                          block_a=int(key[0]), block_b=int(key[1]))
+        w.append(ia[order], ja[order], ra[order])
+        w.close()
+        os.replace(tmp, final)                   # atomic: no torn shard is ever
+                                                 # visible under its real name
+        self._shards = [sh for sh in self._shards
+                        if tuple(sh["key"]) != tuple(key)]
+        self._shards.append({
+            "key": [int(key[0]), int(key[1])], "file": name,
+            "n_pairs": int(w.n_pairs),
+            "min_i": int(ia.min()) if ia.size else 0,
+            "max_i": int(ia.max()) if ia.size else -1,
+            "min_j": int(ja.min()) if ja.size else 0,
+            "max_j": int(ja.max()) if ja.size else -1,
+            "max_abs_r": float(np.abs(ra).max()) if ra.size else 0.0,
+        })
+        self._flush_manifest()
+        return final
+
+    def mark_complete(self) -> None:
+        """Record that every planned shard is present."""
+        self._complete = True
+        self._flush_manifest()
+
+    def _flush_manifest(self) -> None:
+        import json                                          # noqa: PLC0415
+        import os                                            # noqa: PLC0415
+
+        man = {
+            "format": "cugenld", "version": FORMAT_VERSION,
+            "encoding": self.encoding, "params": self.params,
+            "block_variants": self.block_variants,
+            "max_block_pairs": self.max_block_pairs,
+            "tiers": list(self.tiers),
+            "complete": self._complete,
+            "n_pairs": int(sum(sh["n_pairs"] for sh in self._shards)),
+            "shards": sorted(self._shards, key=lambda sh: sh["key"]),
+        }
+        p = os.path.join(self.path, MANIFEST)
+        tmp = p + f".tmp{os.getpid()}"
+        with open(tmp, "w") as f:
+            f.write(json.dumps(man, indent=1))
+        os.replace(tmp, p)
+
+    def close(self) -> None:
+        self._flush_manifest()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *exc):
+        if exc_type is None:
+            self.mark_complete()
+        self.close()
+
+
+class LDDatasetReader:
+    """Query a sharded LD dataset. Routes each query to the shards that can
+    answer it, using the manifest's per-shard index and r ranges."""
+
+    def __init__(self, path: str):
+        import json                                          # noqa: PLC0415
+        import os                                            # noqa: PLC0415
+
+        self.path = str(path)
+        man_path = os.path.join(self.path, MANIFEST)
+        if not os.path.exists(man_path):
+            raise ValueError(
+                f"{self.path!r} has no {MANIFEST}; it is not a cugenld dataset. "
+                f"For a single shard use read_ld() on the .ldz/.cugenld file.")
+        self.manifest = json.loads(open(man_path).read())
+        self.params = self.manifest["params"]
+        self.encoding = self.manifest["encoding"]
+        self.complete = bool(self.manifest.get("complete", False))
+        self.shards = self.manifest["shards"]
+        self.n_pairs = int(self.manifest.get("n_pairs", 0))
+        self.blocks_read = 0
+        # Shards OPENED, counted separately from blocks decompressed. The
+        # manifest-level skip saves file opens, not block decodes, so a
+        # blocks_read counter cannot see whether it works -- opening a shard and
+        # finding nothing reads zero blocks. Without this the skip is unfalsifiable.
+        self.shards_read = 0
+        # Opening a shard parses its footer and rebuilds its row-variant index.
+        # A cross-shard variant() touches ~10 shards, and re-parsing each time
+        # took a GPU-scale lookup from 2.94 ms (single shard) to 21.74 ms. Cache
+        # the readers; the footers are small and the files are immutable.
+        self._cache: dict = {}
+        self._cache_max = 64
+
+    @property
+    def n_shards(self) -> int:
+        return len(self.shards)
+
+    def reset_counters(self) -> None:
+        self.blocks_read = 0
+        self.shards_read = 0
+
+    def _open(self, sh) -> LDReader:
+        import os                                            # noqa: PLC0415
+        self.shards_read += 1
+        f = sh["file"]
+        rd = self._cache.get(f)
+        if rd is None:
+            if len(self._cache) >= self._cache_max:
+                self._cache.pop(next(iter(self._cache)))
+            rd = LDReader(os.path.join(self.path, f))
+            self._cache[f] = rd
+        rd.reset_counters()
+        return rd
+
+    def _gather(self, pick, call):
+        oi, oj, orr = [], [], []
+        for sh in self.shards:
+            if not pick(sh):
+                continue
+            rd = self._open(sh)
+            out = call(rd)
+            self.blocks_read += rd.blocks_read
+            if out is None:
+                continue
+            oi.append(out[0])
+            oj.append(out[1])
+            orr.append(out[2])
+        if not oi:
+            e = np.zeros(0, dtype=np.int64)
+            return e, e.copy(), np.zeros(0)
+        return np.concatenate(oi), np.concatenate(oj), np.concatenate(orr)
+
+    # -- queries ------------------------------------------------------------
+    def rows(self):
+        return self._gather(lambda sh: True, lambda rd: rd.rows())
+
+    def above(self, min_r2: Optional[float] = None,
+              max_p: Optional[float] = None):
+        """Skips whole SHARDS on the manifest's max_abs_r before opening them,
+        then whole blocks on each shard's own zone map."""
+        def pick(sh):
+            if min_r2 is None or min_r2 <= 0.0:
+                return True
+            return sh["max_abs_r"] ** 2 >= min_r2
+        return self._gather(pick, lambda rd: rd.above(min_r2=min_r2,
+                                                      max_p=max_p))
+
+    def variant(self, gidx: int):
+        v = int(gidx)
+        oj, orr = [], []
+        for sh in self.shards:
+            if not (sh["min_i"] <= v <= sh["max_i"]):
+                continue
+            rd = self._open(sh)
+            j, r = rd.variant(v)
+            self.blocks_read += rd.blocks_read
+            if j.size:
+                oj.append(j)
+                orr.append(r)
+        if not oj:
+            return np.zeros(0, dtype=np.int64), np.zeros(0)
+        j = np.concatenate(oj)
+        r = np.concatenate(orr)
+        o = np.argsort(j, kind="stable")
+        return j[o], r[o]
+
+    def region(self, lo: int, hi: int):
+        """Every stored pair with both endpoints in [lo, hi)."""
+        def pick(sh):
+            return not (sh["max_i"] < lo or sh["min_i"] >= hi
+                        or sh["max_j"] < lo or sh["min_j"] >= hi)
+
+        def call(rd):
+            i, j, r = rd.rows()
+            m = (i >= lo) & (i < hi) & (j >= lo) & (j < hi)
+            return i[m], j[m], r[m]
+        return self._gather(pick, call)
+
+    def bytes_per_pair(self) -> float:
+        import os                                            # noqa: PLC0415
+        total = sum(os.path.getsize(os.path.join(self.path, sh["file"]))
+                    for sh in self.shards)
+        return total / max(self.n_pairs, 1)
+
+
+def open_ld(path: str):
+    """Open a sharded dataset (directory) or a single shard (file)."""
+    import os                                                # noqa: PLC0415
+    if os.path.isdir(path):
+        return LDDatasetReader(path)
+    return LDReader(path)

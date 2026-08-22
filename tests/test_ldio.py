@@ -583,3 +583,331 @@ def test_blocks_are_capped_by_pair_count_not_only_by_variant_count(tmp_path):
         f"largest block holds {biggest} pairs against a cap of {cap}")
     gi, gj, _ = rd.rows()
     assert gi.size == i.size
+
+
+# ------------------------------------------- sharded datasets & resumability
+# One 100 TB object cannot be written by concurrent GPUs, cannot be resumed, and
+# cannot be partially recomputed. A shard is one scan tile's output.
+
+def tile_stream(i, j, r, n_tiles=6):
+    """Split pairs into (A, B) tile keys the way the scan walks them."""
+    lo, hi = int(i.min()), int(j.max()) + 1
+    edges = np.linspace(lo, hi, n_tiles + 1).astype(np.int64)
+    out = []
+    for a in range(n_tiles):
+        for b in range(a, n_tiles):
+            m = ((i >= edges[a]) & (i < edges[a + 1])
+                 & (j >= edges[b]) & (j < edges[b + 1]))
+            if m.any():
+                out.append(((a, b), i[m], j[m], r[m]))
+    return out
+
+
+def test_dataset_round_trips_across_many_shards(tmp_path):
+    i, j, r = brute_pairs(min_r2=0.05)
+    d = str(tmp_path / "ds")
+    with ldio.LDDatasetWriter(d, params=PARAMS) as w:
+        for key, ti, tj, tr in tile_stream(i, j, r):
+            w.write_shard(key, ti, tj, tr)
+
+    ds = ldio.open_ld(d)
+    assert ds.n_pairs == i.size
+    assert ds.n_shards > 1, "fixture must produce more than one shard"
+    gi, gj, gr = ds.rows()
+    order = np.lexsort((gj, gi))
+    np.testing.assert_array_equal(gi[order], i)
+    np.testing.assert_array_equal(gj[order], j)
+    assert np.abs(gr[order] - r).max() <= 0.51 / 32767 + 1e-12
+
+
+def test_a_dataset_resumes_and_skips_what_is_already_written(tmp_path):
+    """A 3.3 h genome-wide job that dies at hour 2 must not start over."""
+    i, j, r = brute_pairs(min_r2=0.05)
+    tiles = tile_stream(i, j, r)
+    d = str(tmp_path / "ds")
+
+    # first attempt dies partway
+    w = ldio.LDDatasetWriter(d, params=PARAMS)
+    for key, ti, tj, tr in tiles[:4]:
+        w.write_shard(key, ti, tj, tr)
+    w.close()
+    partial = ldio.open_ld(d)
+    assert partial.n_shards == 4
+    assert not partial.complete
+
+    # resume: the writer reports what is already done and does not redo it
+    w2 = ldio.LDDatasetWriter(d, params=PARAMS, resume=True)
+    done = set(w2.completed_shards())
+    assert done == {t[0] for t in tiles[:4]}
+    redone = 0
+    for key, ti, tj, tr in tiles:
+        if key in done:
+            continue
+        w2.write_shard(key, ti, tj, tr)
+        redone += 1
+    w2.mark_complete()
+    w2.close()
+    assert redone == len(tiles) - 4
+
+    ds = ldio.open_ld(d)
+    assert ds.complete
+    assert ds.n_pairs == i.size
+    gi, gj, _ = ds.rows()
+    assert set(zip(gi.tolist(), gj.tolist())) == set(
+        zip(i.tolist(), j.tolist()))
+
+
+def test_a_resumed_dataset_equals_one_written_in_a_single_pass(tmp_path):
+    i, j, r = brute_pairs(min_r2=0.05)
+    tiles = tile_stream(i, j, r)
+
+    one = str(tmp_path / "one")
+    with ldio.LDDatasetWriter(one, params=PARAMS) as w:
+        for key, ti, tj, tr in tiles:
+            w.write_shard(key, ti, tj, tr)
+
+    two = str(tmp_path / "two")
+    w = ldio.LDDatasetWriter(two, params=PARAMS)
+    for key, ti, tj, tr in tiles[:3]:
+        w.write_shard(key, ti, tj, tr)
+    w.close()
+    w = ldio.LDDatasetWriter(two, params=PARAMS, resume=True)
+    for key, ti, tj, tr in tiles[3:]:
+        w.write_shard(key, ti, tj, tr)
+    w.mark_complete()
+    w.close()
+
+    a, b = ldio.open_ld(one), ldio.open_ld(two)
+    assert a.n_pairs == b.n_pairs
+    for x, y in zip(a.rows(), b.rows()):
+        np.testing.assert_allclose(np.sort(x), np.sort(y))
+
+
+def test_an_interrupted_shard_is_not_trusted(tmp_path):
+    """A shard half-written when the process died must not be read as complete.
+
+    Shards land by atomic rename, so a torn file never appears in the manifest.
+    """
+    i, j, r = brute_pairs(min_r2=0.05)
+    d = str(tmp_path / "ds")
+    with ldio.LDDatasetWriter(d, params=PARAMS) as w:
+        for key, ti, tj, tr in tile_stream(i, j, r)[:3]:
+            w.write_shard(key, ti, tj, tr)
+
+    import pathlib
+    (pathlib.Path(d) / "0-99.ldz").write_bytes(b"torn garbage")
+    ds = ldio.open_ld(d)
+    assert ds.n_shards == 3, "a file not in the manifest must be ignored"
+    ds.rows()                                   # must not raise
+
+
+def test_queries_route_across_shards(tmp_path):
+    i, j, r = brute_pairs(min_r2=0.05)
+    d = str(tmp_path / "ds")
+    with ldio.LDDatasetWriter(d, params=PARAMS) as w:
+        for key, ti, tj, tr in tile_stream(i, j, r):
+            w.write_shard(key, ti, tj, tr)
+    ds = ldio.open_ld(d)
+
+    for v in (0, 5, 100, 399):
+        gj, _ = ds.variant(v)
+        np.testing.assert_array_equal(gj, np.sort(j[i == v]))
+
+    gi, gj, _ = ds.above(min_r2=0.5)
+    m = r ** 2 >= 0.5
+    step = 1.0 / 32767
+    band = {(int(a), int(b)) for a, b, rr in zip(i, j, r)
+            if abs(rr ** 2 - 0.5) <= 2 * step}
+    assert (set(zip(gi.tolist(), gj.tolist()))
+            ^ set(zip(i[m].tolist(), j[m].tolist()))) <= band
+
+
+def test_the_manifest_records_the_params_and_the_shard_list(tmp_path):
+    i, j, r = brute_pairs(min_r2=0.05)
+    d = str(tmp_path / "ds")
+    tiles = tile_stream(i, j, r)
+    with ldio.LDDatasetWriter(d, params=PARAMS) as w:
+        for key, ti, tj, tr in tiles:
+            w.write_shard(key, ti, tj, tr)
+
+    import json
+    import pathlib
+    man = json.loads((pathlib.Path(d) / "manifest.json").read_text())
+    for k, v in PARAMS.items():
+        assert man["params"][k] == v
+    assert len(man["shards"]) == len(tiles)
+    assert sum(sh["n_pairs"] for sh in man["shards"]) == i.size
+    assert man["format"] == "cugenld" and man["version"] == ldio.FORMAT_VERSION
+
+
+def test_resuming_with_different_params_is_refused(tmp_path):
+    """Half a dataset at maf_min=0.01 and half at 0.05 is not a dataset. The
+    test space sets m, so mixing them corrupts every corrected threshold."""
+    i, j, r = brute_pairs(min_r2=0.05)
+    d = str(tmp_path / "ds")
+    w = ldio.LDDatasetWriter(d, params=PARAMS)
+    w.write_shard((0, 0), i[:100], j[:100], r[:100])
+    w.close()
+    with pytest.raises(ValueError, match="params|differ"):
+        ldio.LDDatasetWriter(d, params=dict(PARAMS, maf_min=0.25), resume=True)
+
+
+def test_the_manifest_skips_shards_before_opening_them(tmp_path):
+    """Two levels of skipping: whole shards on the manifest's per-shard index
+    and max_abs_r, then whole blocks on each shard's own zone map. A shard that
+    cannot contain the answer must not be opened at all."""
+    i, j, r = sparse_trans_pairs(p=6000)
+    d = str(tmp_path / "ds")
+    with ldio.LDDatasetWriter(d, params=dict(PARAMS, min_r2=1e-4)) as w:
+        for key, ti, tj, tr in tile_stream(i, j, r, n_tiles=10):
+            w.write_shard(key, ti, tj, tr)
+
+    ds = ldio.open_ld(d)
+    assert ds.n_shards > 20
+    ds.rows()
+    total = ds.blocks_read
+
+    n_shards = ds.n_shards
+
+    ds.reset_counters()
+    ds.above(min_r2=0.8)
+    assert ds.blocks_read <= 0.35 * total, "block zone map is not skipping"
+    # NOT asserting a shard-level skip here. This fixture spreads strong pairs
+    # uniformly, so every shard genuinely contains one and no shard CAN be
+    # skipped -- the manifest max_abs_r is correct but unexercised. See
+    # test_shard_r_skip_works_when_strong_ld_is_local for the realistic case.
+
+    ds.reset_counters()
+    gj, _ = ds.variant(100)
+    np.testing.assert_array_equal(gj, np.sort(j[i == 100]))
+    assert ds.shards_read <= 0.3 * n_shards, (
+        f"one variant opened {ds.shards_read} of {n_shards} shards; the "
+        f"manifest min_i/max_i skip is dead")
+    assert ds.blocks_read <= 0.15 * total
+
+    ds.reset_counters()
+    gi, gj, _ = ds.region(1000, 2000)
+    m = (i >= 1000) & (i < 2000) & (j >= 1000) & (j < 2000)
+    assert set(zip(gi.tolist(), gj.tolist())) == set(
+        zip(i[m].tolist(), j[m].tolist()))
+    assert ds.shards_read <= 0.4 * n_shards, "region shard skip is dead"
+    assert ds.blocks_read <= 0.25 * total
+
+
+def test_sharding_costs_a_fixed_overhead_per_shard(tmp_path):
+    """Honest accounting: every shard pays a 256-byte header and its own footer,
+    so shards must be sized to hold a meaningful number of pairs. This pins the
+    direction so nobody shards a small dataset into uselessness."""
+    i, j, r = brute_pairs(min_r2=0.05)
+    few, many = str(tmp_path / "few"), str(tmp_path / "many")
+    for d, n_tiles in ((few, 2), (many, 12)):
+        with ldio.LDDatasetWriter(d, params=PARAMS) as w:
+            for key, ti, tj, tr in tile_stream(i, j, r, n_tiles=n_tiles):
+                w.write_shard(key, ti, tj, tr)
+    a, b = ldio.open_ld(few), ldio.open_ld(many)
+    assert a.n_pairs == b.n_pairs == i.size
+    assert b.n_shards > a.n_shards
+    assert b.bytes_per_pair() > a.bytes_per_pair(), (
+        "more shards should cost more per pair; if not, the accounting is wrong")
+
+
+def test_a_manifest_entry_whose_file_vanished_is_dropped_on_resume(tmp_path):
+    """The manifest is the record, but a file it names may not survive -- a
+    partial upload, a cleaned scratch dir. Resuming must re-do that shard rather
+    than assume it is present."""
+    import os
+    i, j, r = brute_pairs(min_r2=0.05)
+    tiles = tile_stream(i, j, r)
+    d = str(tmp_path / "ds")
+    w = ldio.LDDatasetWriter(d, params=PARAMS)
+    for key, ti, tj, tr in tiles[:4]:
+        w.write_shard(key, ti, tj, tr)
+    w.close()
+
+    gone = ldio.open_ld(d).shards[0]["file"]
+    os.remove(os.path.join(d, gone))
+
+    w2 = ldio.LDDatasetWriter(d, params=PARAMS, resume=True)
+    assert len(w2.completed_shards()) == 3, (
+        "a manifest entry with no file on disk was trusted")
+    assert gone not in {_shard_file(k) for k in w2.completed_shards()}
+
+
+def _shard_file(key):
+    return f"{int(key[0])}-{int(key[1])}.ldz"
+
+
+def local_ld_pairs(p=6000, n_hap=5008, seed=11):
+    """Realistic LD: strength decays with separation, as it does on a chromosome.
+
+    The uniform-signal fixture cannot exercise a shard-level r skip, because
+    every shard contains something strong. Real strong LD is near-diagonal, so
+    off-diagonal shards genuinely have a low max |r| and are skippable -- which
+    is the whole reason the manifest carries one.
+    """
+    rng = np.random.default_rng(seed)
+    I, J, R = [], [], []
+    for v in range(p - 1):
+        k = min(int(rng.integers(30, 80)), p - v - 1)
+        j = np.sort(rng.choice(np.arange(v + 1, p), size=k, replace=False))
+        sep = (j - v).astype(np.float64)
+        # r^2 ~ 1/(1 + sep/scale): strong nearby, noise far away
+        base = np.sqrt(1.0 / (1.0 + sep / 30.0))
+        r = base * rng.uniform(0.6, 1.0, k) + rng.normal(
+            0, 1 / np.sqrt(n_hap), k)
+        R.append(np.clip(r, -1, 1))
+        I.append(np.full(k, v, dtype=np.int64))
+        J.append(j.astype(np.int64))
+    i, j, r = np.concatenate(I), np.concatenate(J), np.concatenate(R)
+    keep = r ** 2 >= 1e-4
+    return i[keep], j[keep], r[keep]
+
+
+def test_shard_r_skip_works_when_strong_ld_is_local(tmp_path):
+    """The manifest's per-shard max_abs_r earns its keep on realistic data."""
+    i, j, r = local_ld_pairs()
+    d = str(tmp_path / "ds")
+    with ldio.LDDatasetWriter(d, params=dict(PARAMS, min_r2=1e-4)) as w:
+        for key, ti, tj, tr in tile_stream(i, j, r, n_tiles=10):
+            w.write_shard(key, ti, tj, tr)
+
+    ds = ldio.open_ld(d)
+    n_shards = ds.n_shards
+    assert n_shards > 20
+
+    ds.reset_counters()
+    gi, gj, _ = ds.above(min_r2=0.8)
+    m = r ** 2 >= 0.8
+    step = 1.0 / 32767
+    band = {(int(a), int(b)) for a, b, rr in zip(i, j, r)
+            if abs(rr ** 2 - 0.8) <= 2 * step}
+    assert (set(zip(gi.tolist(), gj.tolist()))
+            ^ set(zip(i[m].tolist(), j[m].tolist()))) <= band
+    assert ds.shards_read < 0.5 * n_shards, (
+        f"opened {ds.shards_read} of {n_shards} shards for r2>=0.8 on "
+        f"near-diagonal data; the manifest max_abs_r skip is dead")
+
+
+def test_repeated_queries_do_not_reparse_every_shard_footer(tmp_path):
+    """Opening a shard parses its footer and rebuilds its row-variant index.
+
+    A cross-shard variant() touches several shards, and re-parsing each time
+    took a GPU-scale lookup from 2.94 ms on one shard to 21.74 ms across 28.
+    Readers are cached; the files are immutable so it is always safe.
+    """
+    i, j, r = local_ld_pairs()
+    d = str(tmp_path / "ds")
+    with ldio.LDDatasetWriter(d, params=dict(PARAMS, min_r2=1e-4)) as w:
+        for key, ti, tj, tr in tile_stream(i, j, r, n_tiles=10):
+            w.write_shard(key, ti, tj, tr)
+
+    ds = ldio.open_ld(d)
+    first = ds.variant(100)
+    n_cached = len(ds._cache)
+    assert n_cached > 1, "expected several shards to hold one variant"
+
+    for _ in range(5):
+        again = ds.variant(100)
+    np.testing.assert_array_equal(first[0], again[0])
+    assert len(ds._cache) == n_cached, "the cache is not being reused"
+    assert len(ds._cache) <= ds._cache_max
