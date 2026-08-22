@@ -29,6 +29,11 @@ MUTATIONS = [
      """_SHIFTS = np.array([6, 4, 2, 0], dtype=np.uint8)""",
      """_SHIFTS = np.array([0, 2, 4, 6], dtype=np.uint8)""", "tests/test_popstruct.py"),
     # ---- LD significance ----
+    ('exact test just returns the asymptotic value', 'cugen/ld.py',
+     """    for t in np.flatnonzero(need):
+        out[t] = _fisher_neglog10p_2x2(nAB[t], nA[t], nB[t], n[t])""",
+     """    for t in np.flatnonzero(need):
+        out[t] = _neglog10_chi2_1df(np.array([float(n[t]) * 0.5]), np)[0]""", "tests/test_ld_significance.py"),
     ('nAB reconstruction truncates instead of rounding', 'cugen/ld.py',
      """    return np.rint((r * den + nA * nB) / float(N)).astype(np.int64)""",
      """    return np.floor((r * den + nA * nB) / float(N)).astype(np.int64)""", "tests/test_ld_significance.py"),
