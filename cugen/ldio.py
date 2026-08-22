@@ -1124,13 +1124,18 @@ class LDDatasetWriter:
         ia = np.asarray(i, dtype=np.int64).ravel()
         ja = np.asarray(j, dtype=np.int64).ravel()
         ra = np.asarray(r, dtype=np.float64).ravel()
-        order = (np.arange(ia.size) if presorted else np.lexsort((ja, ia)))
+        # No identity permutation. The earlier form built np.arange(n) and then
+        # gathered all three arrays through it, copying ~216 MB per 9 M-row
+        # flush to reorder nothing.
+        if not presorted:
+            o = np.lexsort((ja, ia))
+            ia, ja, ra = ia[o], ja[o], ra[o]
         w = LDShardWriter(tmp, encoding=self.encoding,
                           block_variants=self.block_variants,
                           max_block_pairs=self.max_block_pairs,
                           params=self.params, tiers=self.tiers,
                           block_a=int(key[0]), block_b=int(key[1]))
-        w.append(ia[order], ja[order], ra[order], presorted=True)
+        w.append(ia, ja, ra, presorted=True)
         w.close()
         os.replace(tmp, final)                   # atomic: no torn shard is ever
                                                  # visible under its real name

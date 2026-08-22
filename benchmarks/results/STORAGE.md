@@ -300,6 +300,47 @@ Guessing where the time goes has now been wrong four times in this file: the
 `2B²` buffer, block size vs indexing, zstd vs packing, and packing vs
 partitioning. Every fix was cheap once measured.
 
+### End to end, and how little of the isolated win survived
+
+**Different hardware — read this table on its own.** The A100 the rest of this
+file uses does not support network volumes, so the before/after pair was measured
+on an **RTX 4090** (US-IL-1, CuPy 14.2.0, cuDF 25.12) with source data on the
+volume and benchmark output on local container disk. Same fixture (51,100
+variants x 3,202 samples), same harness, median of 3. Absolute times are not
+comparable with the A100 rows above; the ratios within this table are.
+
+| min_r2 | rows | parquet (#4) | `.cugenld` | size | vs parquet |
+|---:|---:|---:|---:|---:|---:|
+| 0.2 | 1,930,958 | 0.72 s | **0.40 s** | 22.6 -> **5.1 MB** | **1.81x** |
+| 0.05 | 27,541,325 | 5.52 s | **1.86 s** | 340.0 -> **55.4 MB** | **2.96x** |
+
+Progression of the writer changes at 27.5 M rows:
+
+    masks + 15 gathers, np.unique, identity gather   2.23 s   (baseline)
+    + per-group flatnonzero partition, _run_starts   2.06 s   1.08x
+    + no identity permutation gather                 1.86 s   1.20x total
+
+**The isolated host measurement said 1.66x; end to end it is 1.20x.** Scaling a
+micro-benchmark by row count over-predicted, because the writer's host path is a
+smaller share of streaming time than that scaling assumed. Worth having, but the
+honest figure is the end-to-end one — and the larger half of it came from
+deleting an identity permutation, not from the partition rewrite.
+
+That identity gather is worth naming: for presorted input `write_shard` built
+`np.arange(n)` and gathered all three arrays through it, copying ~216 MB per
+9 M-row flush to reorder nothing.
+
+Against the 0.25 s `count_only` scan floor, 1.61 s of the 1.86 s is still
+serialisation (87%). Where that goes is not yet itemised on this hardware.
+
+### A measurement that had to be thrown away
+
+The first before/after pair on this box wrote its output to the network volume,
+and identical parquet writes swung **1.4-5.4 s** — a 3.9x spread on the same
+operation. That was measuring MooseFS, not the writer. Benchmark output moved to
+local container disk, where median and best now agree within 5%. Source data can
+live on the volume; results cannot.
+
 The lesson generalises past this format: at these row counts any per-row host
 work is the bottleneck, and the useful question is always which one -- guessing
 has now been wrong three times (the 2B^2 buffer, block size vs indexing, and
