@@ -243,15 +243,38 @@ eigenvalues of an SVD), so the whitening must come from the eigendecomposition,
 V^-1/2 = U Lambda^-1/2 U'; there is no Cholesky factor.
 
 What is NOT implemented is a p-value for them, and that is a statistics
-limit rather than a code one. The paper establishes that these
-measures are unbiased for unlinked loci (Appendix A, and Tables 1-3 by
-simulation) and that r^2_S is the factor by which sample size must grow to hold
-power at a linked marker -- a POWER result. It derives no null sampling
-distribution for the corrected measures. So chi2 = N * r^2 does not transfer to
-them: after GLS centring and rank-K residualisation the effective sample size is
-not N, and nothing here says what it is. Shipping p on an r^2_V column would mean
-inventing a degrees-of-freedom, which is research, not implementation -- so
-asking for chi2/p beside a corrected measure raises.
+limit rather than a code one. Main text and Supplementary Information (both
+read) establish exactly two things:
+
+  Appendix A   Cov(X^l|S, X^m|S) = (1-t)Cov(X^l,X^m|S=0) + t Cov(X^l,X^m|S=1),
+               which is 0 for unlinked loci. Unbiasedness, not a distribution.
+  Appendix B   in the association model Y = 1u + S beta + X theta + eps, the
+               t-statistic at a linked marker is asymptotically Gaussian with
+               VARIANCE 1 and expectation sqrt(r^2_S) Esp(t at the causal
+               locus). That is the null variance of an ASSOCIATION test that
+               carries S as a covariate -- not of the LD measure. Tables 1-3
+               add unbiasedness by simulation. The r^2_V / r^2_VS power results
+               are asserted to follow "the same steps" and are not proven.
+
+So nothing here gives a null sampling law for the corrected measures, and
+chi2 = N * r^2 does not transfer to them: after GLS centring and rank-K
+residualisation the effective sample size is not N.
+
+There IS a route the paper does not take, and it is worth naming so nobody
+re-derives it from scratch. r^2_S is an ordinary squared PARTIAL correlation, so
+classical normal theory gives r^2/(1-r^2) * (N-K-2) ~ F(1, N-K-2) with K the
+column rank of the structure matrix. It was rejected here on purpose. That
+result needs joint normality, which genotypes do not have, whereas the plain
+chi2 = N * r^2 rests on the multinomial structure of the 2x2 table and needs no
+such assumption -- and this module already measures the asymptotic test
+overstating significance on 97.9% of real rare-variant pairs, where the exact
+conditional test is what saves it. Residualising destroys the contingency table,
+so the exact test is unavailable and the fallback is WEAKER than the
+approximation already known to fail on this data. Shipping it would look like
+added rigour and be the opposite. For r^2_V the effective degrees of freedom
+after whitening by a rank-deficient V^- is not even clear.
+
+Hence: asking for chi2/p beside a corrected measure raises.
 
 Two further cautions the authors state themselves: which V to use "remains an
 open question", and inverting V "drastically slowed down the computation" at

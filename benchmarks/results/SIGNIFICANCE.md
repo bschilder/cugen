@@ -267,12 +267,25 @@ Two independent checks of the correction actually correcting:
       r2, with the clones            0.0769
       r2_v, same sample + kinship    0.0587      (paper reports 0.060 / 0.063)
 
-**They carry no p-value, and asking for one raises.** The paper proves them
-unbiased for unlinked loci and links them to association-test power, but derives
-no null sampling distribution, so `chi2 = N * r^2` does not transfer: after GLS
-centering and rank-K residualization the effective sample size is not N and
-nothing in the paper says what it is. Emitting a p-value there would mean
-inventing a degrees-of-freedom.
+**They carry no p-value, and asking for one raises.** Main text and
+Supplementary Information both establish only unbiasedness for unlinked loci
+(Appendix A) and a power result — Appendix B shows the *association* t-test
+carrying S as a covariate is asymptotically Gaussian with variance 1 and
+expectation `sqrt(r2_S)·Esp(t_causal)`, which is a statement about that test, not
+about the LD measure. No null sampling law for the measures themselves.
+
+A route exists and was rejected deliberately, which is worth stating so nobody
+re-derives it. `r2_s` is an ordinary squared **partial** correlation, so
+classical normal theory gives `r²/(1−r²)·(N−K−2) ~ F(1, N−K−2)`. But that needs
+joint normality, which genotypes do not have — whereas `chi2 = N·r²` rests on the
+multinomial structure of the 2×2 table and needs no such assumption. And the
+real-data section above measures that asymptotic test **overstating significance
+on 97.9% of rare-variant pairs**, with the exact conditional test as the thing
+that rescues it. Residualizing destroys the contingency table, so the exact test
+is unavailable and the remaining option is *weaker* than an approximation already
+known to fail on this data. It would look like added rigour and be the opposite.
+For `r2_v` the effective degrees of freedom after whitening by a rank-deficient
+`V⁻` is not even clear.
 
 Note that the paper's Table 1 numbers are **not** reproduced here, and the reason
 is informative. Pooling two populations induces Hardy–Weinberg disequilibrium
