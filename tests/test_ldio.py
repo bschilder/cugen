@@ -1,0 +1,441 @@
+"""On-disk LD results: the .cugenld format, and the writer/reader registry.
+
+The design target is genome-wide all-by-all, which is 10^9 to 10^13 emitted
+pairs depending only on the retention threshold -- and the threshold is set by
+the number of tests and the sample size, neither of which the format controls.
+Bytes per pair is what the format controls, and at 10^12 rows it is the
+difference between 7.7 TB and 178 TB. See the design notes at the head of
+cugen/ldio.py.
+
+Everything here is checked against an independent implementation or against
+brute force, never against the production path restated.
+"""
+import numpy as np
+import pytest
+
+from cugen import ldio
+
+
+# ------------------------------------------------------------------ encodings
+# Half a quantisation step, not a whole one: rounding cannot exceed 0.5 steps
+# while truncation reaches a full step, so a loose bound here would accept a
+# truncating implementation. The mutation sweep caught exactly that.
+@pytest.mark.parametrize("encoding,tol", [
+    ("int16", 0.51 / 32767),
+    ("int8", 0.51 / 127),
+    # float32 is the "lossless" option in the sense that it stores r as given,
+    # but it is not bit-exact against a float64 source: 1e-6 and 0.9999 are not
+    # representable, so the bound is float32's own relative precision.
+    ("float32", float(np.finfo(np.float32).eps)),
+])
+def test_r_round_trips_within_the_encoding_resolution(encoding, tol):
+    """r lives in [-1, 1], so a fixed-point scale is the right quantisation.
+
+    int16 gives uniform ~3e-5 resolution, which is finer than the six
+    significant figures of plink2's own text output that cugen is validated
+    against, and two to three orders below LD's own estimation error.
+    """
+    r = np.array([-1.0, -0.9999, -0.5, -1e-6, 0.0, 1e-6, 0.5, 0.9999, 1.0],
+                 dtype=np.float64)
+    back = ldio.dequantize_r(ldio.quantize_r(r, encoding), encoding)
+    assert np.abs(back - r).max() <= tol + 1e-12
+    # the endpoints must be exact -- r = +/-1 is a real value, not a rounding
+    assert back[0] == pytest.approx(-1.0, abs=tol + 1e-12)
+    assert back[-1] == pytest.approx(1.0, abs=tol + 1e-12)
+
+
+def test_quantisation_is_monotone():
+    """Ordering by stored r must equal ordering by true r, or every
+    threshold query and every zone map silently returns the wrong set."""
+    r = np.linspace(-1.0, 1.0, 20001)
+    q = ldio.quantize_r(r, "int16")
+    assert (np.diff(q.astype(np.int64)) >= 0).all()
+
+
+def test_int16_is_the_declared_default():
+    assert ldio.DEFAULT_ENCODING == "int16"
+
+
+def test_an_unknown_encoding_is_refused():
+    with pytest.raises(ValueError, match="encoding"):
+        ldio.quantize_r(np.zeros(3), "float16")
+
+
+# --------------------------------------------------------------------- header
+def test_header_round_trips_every_field():
+    fields = dict(version=1, encoding="int16", payload="banded",
+                  n_row_variants=12345, n_pairs=9_876_543_210_123,
+                  index_offset=256, blocks_offset=4096,
+                  footer_offset=1 << 40, r_scale=32767.0,
+                  block_a=7, block_b=9, flags=0b101)
+    buf = ldio.pack_header(**fields)
+    assert len(buf) == ldio.HEADER_SIZE
+    assert buf[:8] == ldio.MAGIC
+    got = ldio.parse_header(buf)
+    for k, v in fields.items():
+        assert got[k] == v, f"{k}: {got[k]!r} != {v!r}"
+
+
+def test_header_counts_are_64_bit():
+    """A variant in an all-by-all scan can have more than 2**31 partners, and a
+    dataset can hold more than 2**31 pairs. int32 counts do not survive the
+    design target."""
+    big = (1 << 42) + 7
+    got = ldio.parse_header(ldio.pack_header(
+        version=1, encoding="int16", payload="banded", n_row_variants=1,
+        n_pairs=big, index_offset=256, blocks_offset=512,
+        footer_offset=big, r_scale=32767.0, block_a=0, block_b=0, flags=0))
+    assert got["n_pairs"] == big
+    assert got["footer_offset"] == big
+
+
+def test_a_foreign_magic_is_refused():
+    buf = bytearray(ldio.pack_header(
+        version=1, encoding="int16", payload="banded", n_row_variants=1,
+        n_pairs=1, index_offset=256, blocks_offset=512, footer_offset=1024,
+        r_scale=32767.0, block_a=0, block_b=0, flags=0))
+    buf[:8] = b"NOTCUGEN"
+    with pytest.raises(ValueError, match="magic|not a .cugenld"):
+        ldio.parse_header(bytes(buf))
+
+
+def test_a_future_version_is_refused_rather_than_guessed():
+    buf = bytearray(ldio.pack_header(
+        version=1, encoding="int16", payload="banded", n_row_variants=1,
+        n_pairs=1, index_offset=256, blocks_offset=512, footer_offset=1024,
+        r_scale=32767.0, block_a=0, block_b=0, flags=0))
+    buf[8:12] = (ldio.FORMAT_VERSION + 1).to_bytes(4, "little")
+    with pytest.raises(ValueError, match="version"):
+        ldio.parse_header(bytes(buf))
+
+
+# ------------------------------------------------------------- delta coding
+def test_delta_coding_round_trips_sorted_partner_indices():
+    rng = np.random.default_rng(0)
+    j = np.unique(rng.integers(0, 5_000_000, size=100_000)).astype(np.int64)
+    for width in (1, 2, 4):
+        enc, used = ldio.delta_encode(j, width)
+        if used is None:
+            continue                       # this width cannot hold the deltas
+        np.testing.assert_array_equal(ldio.delta_decode(enc, j[0], used), j)
+
+
+def test_delta_width_is_chosen_from_the_actual_gaps():
+    near = np.arange(0, 1000, 3, dtype=np.int64)          # gaps of 3 -> u8
+    far = np.array([0, 1_000_000, 5_000_000], dtype=np.int64)   # -> u32
+    assert ldio.delta_width_for(near) == 1
+    assert ldio.delta_width_for(far) == 4
+
+
+def test_delta_coding_refuses_unsorted_input():
+    """Deltas are only meaningful on an ascending index. Silently encoding a
+    negative gap would produce a file that decodes to garbage."""
+    with pytest.raises(ValueError, match="ascending|sorted"):
+        ldio.delta_encode(np.array([5, 3, 9], dtype=np.int64), 4)
+
+
+# ------------------------------------------------------------------- blocks
+def test_block_payload_round_trips_through_zstd():
+    rng = np.random.default_rng(1)
+    j = np.sort(rng.choice(200_000, size=50_000, replace=False)).astype(np.int64)
+    r = rng.uniform(-1, 1, j.size)
+    blob, meta = ldio.encode_block(j, r, encoding="int16")
+    gj, gr = ldio.decode_block(blob, meta, encoding="int16")
+    np.testing.assert_array_equal(gj, j)
+    assert np.abs(gr - r).max() <= 2.0 / 32767 + 1e-12
+
+
+def test_block_meta_carries_a_zone_map():
+    """min_r/max_r per block is what lets a threshold query skip whole blocks
+    without decompressing them."""
+    j = np.arange(10, dtype=np.int64)
+    r = np.array([0.1, -0.9, 0.3, 0.2, -0.05, 0.8, 0.0, -0.2, 0.4, 0.15])
+    _, meta = ldio.encode_block(j, r, encoding="int16")
+    assert meta["min_r"] == pytest.approx(-0.9, abs=1e-4)
+    assert meta["max_r"] == pytest.approx(0.8, abs=1e-4)
+    assert meta["max_abs_r"] == pytest.approx(0.9, abs=1e-4)
+    assert meta["n"] == 10
+
+
+def test_a_corrupt_block_is_detected_not_silently_decoded():
+    j = np.arange(100, dtype=np.int64)
+    blob, meta = ldio.encode_block(j, np.zeros(100), encoding="int16")
+    torn = blob[:-4]
+    with pytest.raises(Exception):
+        ldio.decode_block(torn, meta, encoding="int16")
+
+
+# ------------------------------------------------------ shard writer / reader
+def brute_pairs(seed=0, p=400, n=300, min_r2=0.0):
+    """An honest reference set of (i, j, r), computed with numpy corrcoef."""
+    rng = np.random.default_rng(seed)
+    lat = rng.random(n)
+    X = np.empty((n, p))
+    for v in range(p):
+        mix = rng.uniform(0.0, 0.9)
+        X[:, v] = mix * lat + (1 - mix) * rng.random(n)
+    R = np.corrcoef(X, rowvar=False)
+    iu = np.triu_indices(p, k=1)
+    i, j, r = iu[0], iu[1], R[iu]
+    keep = r ** 2 >= min_r2
+    return i[keep].astype(np.int64), j[keep].astype(np.int64), r[keep]
+
+
+PARAMS = dict(maf_min=0.01, maf_max=0.5, window=None, window_kb=None,
+              min_dist_kb=None, max_dist_kb=None, scope="all",
+              min_r2=0.05, max_p=None, correction=None, alpha=0.05,
+              top_k=None, n_obs=600, m_tests=79800)
+
+
+def write_shard(tmp_path, i, j, r, *, chunks=1, encoding="int16",
+                block_variants=64, params=None):
+    tmp_path = __import__("pathlib").Path(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    path = tmp_path / "shard.cugenld"
+    w = ldio.LDShardWriter(str(path), encoding=encoding,
+                           block_variants=block_variants,
+                           params=params if params is not None else PARAMS)
+    for a, b, c in zip(np.array_split(i, chunks), np.array_split(j, chunks),
+                       np.array_split(r, chunks)):
+        w.append(a, b, c)
+    w.close()
+    return str(path)
+
+
+def test_shard_round_trips_every_pair(tmp_path):
+    i, j, r = brute_pairs(min_r2=0.05)
+    assert i.size > 5000, "fixture too small to be meaningful"
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r))
+    gi, gj, gr = rd.rows()
+    order = np.lexsort((gj, gi))
+    np.testing.assert_array_equal(gi[order], i)
+    np.testing.assert_array_equal(gj[order], j)
+    assert np.abs(gr[order] - r).max() <= 2.0 / 32767 + 1e-12
+    assert rd.n_pairs == i.size
+
+
+def test_streaming_in_many_chunks_gives_the_same_file(tmp_path):
+    """append() is called once per scan tile, so the result must not depend on
+    how the stream was cut up."""
+    i, j, r = brute_pairs(min_r2=0.05)
+    one = write_shard(tmp_path / "a", i, j, r, chunks=1)
+    many = write_shard(tmp_path / "b", i, j, r, chunks=17)
+
+    def sorted_rows(path):
+        gi, gj, gr = ldio.read_ld(path).rows()
+        o = np.lexsort((gj, gi))
+        return gi[o], gj[o], gr[o]
+
+    # Sorted, not raw: blocks are cut by row-variant group AND by r^2 tier, so
+    # block order depends on how the stream was flushed. Ordering is guaranteed
+    # within a block, never across the file -- that is what makes shards
+    # independently writable, and globally sorting 10^12 rows would cost more
+    # than the LD scan.
+    for x, y in zip(sorted_rows(one), sorted_rows(many)):
+        np.testing.assert_allclose(x, y)
+    assert ldio.read_ld(one).n_pairs == ldio.read_ld(many).n_pairs == i.size
+
+
+def test_variant_query_matches_brute_force(tmp_path):
+    i, j, r = brute_pairs(min_r2=0.05)
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r))
+    for v in (0, 1, 7, 100, 399):
+        gj, gr = rd.variant(v)
+        want = j[i == v]
+        np.testing.assert_array_equal(gj, want)
+        if want.size:
+            assert np.abs(gr - r[i == v]).max() <= 2.0 / 32767 + 1e-12
+
+
+def test_above_matches_brute_force_and_actually_skips_blocks(tmp_path):
+    """A zone map that is correct but never skips is decorative."""
+    i, j, r = brute_pairs(min_r2=0.05)
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r))
+    rd.rows()
+    all_blocks = rd.blocks_read
+
+    rd.reset_counters()
+    t = 0.6
+    gi, gj, gr = rd.above(min_r2=t)
+    m = r ** 2 >= t
+    assert m.sum() > 0, "fixture has nothing above the cut"
+
+    # above() filters on the STORED r, which is quantised, so a pair whose true
+    # r^2 sits within one quantisation step of the cut may fall either side.
+    # That band is the honest comparison; anything outside it is a real defect.
+    got = set(zip(gi.tolist(), gj.tolist()))
+    want = set(zip(i[m].tolist(), j[m].tolist()))
+    step = 2.0 / 32767
+    band = {(int(a), int(b)) for a, b, rr in zip(i, j, r)
+            if abs(rr ** 2 - t) <= 2 * step}
+    assert (got ^ want) <= band, (
+        f"{len((got ^ want) - band)} pairs differ outside the quantisation "
+        f"band at the threshold")
+    assert rd.blocks_read < all_blocks, (
+        f"zone map skipped nothing: read {rd.blocks_read} of {all_blocks}")
+
+
+def test_reader_refuses_a_query_looser_than_what_was_stored(tmp_path):
+    """The file was written at min_r2=0.05. Everything below that is gone, so
+    above(0.01) cannot be answered -- and a short list would be a wrong answer,
+    not a partial one. LDmat's stated limitation is exactly that its lossy
+    parameters are fixed at creation with no record of them."""
+    i, j, r = brute_pairs(min_r2=0.05)
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r))
+    with pytest.raises(ValueError, match="looser|discarded|min_r2"):
+        rd.above(min_r2=0.01)
+    rd.above(min_r2=0.05)          # exactly the stored cut is fine
+    rd.above(min_r2=0.5)           # stricter is fine
+
+
+def test_reader_refuses_a_dense_request_against_a_thresholded_file(tmp_path):
+    """Reconstructing a dense R from a thresholded store would replace every
+    sub-threshold entry with 0 rather than its true small value."""
+    i, j, r = brute_pairs(min_r2=0.05)
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r))
+    with pytest.raises(ValueError, match="dense|threshold"):
+        rd.dense()
+
+
+def test_dense_is_served_from_an_unthresholded_file(tmp_path):
+    i, j, r = brute_pairs(min_r2=0.0)
+    params = dict(PARAMS, min_r2=0.0)
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r, params=params))
+    R = rd.dense()
+    assert R.shape == (400, 400)
+    np.testing.assert_allclose(np.diag(R), 1.0)
+    np.testing.assert_allclose(R, R.T, atol=1e-12)
+    assert np.abs(R[i, j] - r).max() <= 2.0 / 32767 + 1e-12
+
+
+def test_the_header_round_trips_the_test_space_and_retention_params(tmp_path):
+    """A run is only reproducible if both parameter families are recorded, and
+    the retention family is what the reader enforces."""
+    i, j, r = brute_pairs(min_r2=0.05)
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r))
+    for k, v in PARAMS.items():
+        assert rd.params[k] == v, f"{k}: {rd.params[k]!r} != {v!r}"
+
+
+def test_appends_out_of_variant_order_are_refused(tmp_path):
+    """Blocks are ordered by row variant; a backwards append would either
+    corrupt the index or force a global sort of 10^12 rows."""
+    w = ldio.LDShardWriter(str(tmp_path / "s.cugenld"), params=PARAMS)
+    w.append(np.array([5, 6]), np.array([9, 9]), np.array([0.5, 0.5]))
+    with pytest.raises(ValueError, match="order|decreasing"):
+        w.append(np.array([1]), np.array([9]), np.array([0.5]))
+
+
+@pytest.mark.parametrize("encoding", ["int16", "int8", "float32"])
+def test_every_encoding_round_trips_a_shard(tmp_path, encoding):
+    i, j, r = brute_pairs(min_r2=0.05)
+    tol = {"int16": 2 / 32767, "int8": 2 / 127, "float32": 1e-6}[encoding]
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r, encoding=encoding))
+    gi, gj, gr = rd.rows()
+    order = np.lexsort((gj, gi))
+    np.testing.assert_array_equal(gi[order], i)
+    assert np.abs(gr[order] - r).max() <= tol + 1e-12
+
+
+def test_bytes_per_pair_beats_the_dataframe_schema(tmp_path):
+    """The whole point. _empty_pairs is 76 B/row for stats=("r2","p")."""
+    import os
+    i, j, r = brute_pairs(min_r2=0.05)
+    path = write_shard(tmp_path, i, j, r)
+    per = os.path.getsize(path) / i.size
+    assert per < 12.0, f"{per:.2f} B/pair is no better than the 76 B schema"
+
+
+def sparse_trans_pairs(p=6000, n_hap=5008, seed=7):
+    """The all-by-all regime: almost every pair is null, a few are real.
+
+    r on a null pair is ~N(0, 1/sqrt(N)), so the distribution is bimodal and
+    strong pairs are scattered across the whole variant axis rather than
+    clustered -- which is exactly why a zone map keyed on position alone cannot
+    skip anything.
+    """
+    rng = np.random.default_rng(seed)
+    I, J, R = [], [], []
+    for v in range(p - 1):
+        k = min(int(rng.integers(20, 60)), p - v - 1)
+        j = np.sort(rng.choice(np.arange(v + 1, p), size=k, replace=False))
+        r = rng.normal(0, 1 / np.sqrt(n_hap), k)
+        hot = rng.random(k) < 0.02
+        r[hot] = rng.uniform(0.5, 0.99, int(hot.sum()))
+        I.append(np.full(k, v, dtype=np.int64))
+        J.append(j.astype(np.int64))
+        R.append(r)
+    i, j, r = np.concatenate(I), np.concatenate(J), np.concatenate(R)
+    keep = r ** 2 >= 1e-4
+    return i[keep], j[keep], r[keep]
+
+
+def test_tiering_makes_the_zone_map_skip_most_blocks(tmp_path):
+    """Blocks are cut by r^2 tier as well as by row-variant range.
+
+    Keyed on position alone the map was decorative -- measured at 94 of 95
+    blocks read on this fixture, because 4% strong pairs spread over the variant
+    axis put something strong in every block. Cutting by value makes each block
+    homogeneous, and the skip becomes proportional to the query.
+    """
+    i, j, r = sparse_trans_pairs()
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r, block_variants=256,
+                                  params=dict(PARAMS, min_r2=1e-4)))
+    rd.rows()
+    total = rd.blocks_read
+    assert total > 20, "fixture must produce enough blocks to skip any"
+
+    seen = {}
+    for t in (0.5, 0.8):
+        rd.reset_counters()
+        gi, gj, _ = rd.above(min_r2=t)
+        m = r ** 2 >= t
+        assert set(zip(gi.tolist(), gj.tolist())) == set(
+            zip(i[m].tolist(), j[m].tolist()))
+        seen[t] = rd.blocks_read
+
+    assert seen[0.8] <= 0.35 * total, (
+        f"r2>=0.8 read {seen[0.8]}/{total} blocks; tiering is not skipping")
+    assert seen[0.8] < seen[0.5], "a stricter cut must read fewer blocks"
+
+
+def test_a_whole_tier_above_the_cut_needs_no_per_pair_filter(tmp_path):
+    """Correctness check on the shortcut: when a block's tier floor is already
+    at or above the threshold, every pair in it qualifies and the filter is
+    skipped. Getting that wrong would emit sub-threshold pairs."""
+    i, j, r = sparse_trans_pairs()
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r, block_variants=256,
+                                  params=dict(PARAMS, min_r2=1e-4)))
+    for t in (0.2, 0.5, 0.8):
+        _, _, gr = rd.above(min_r2=t)
+        assert (gr ** 2 >= t).all(), f"above({t}) emitted a sub-threshold pair"
+
+
+def test_rows_returns_pairs_sitting_exactly_on_the_stored_threshold(tmp_path):
+    """rows() must not re-apply the stored cut.
+
+    r is quantised, so a pair written at true r^2 = min_r2 can come back with
+    stored r^2 a hair under it. Re-filtering on the way out would silently drop
+    pairs the file demonstrably contains -- and the drop would be invisible,
+    because the count would still look plausible.
+    """
+    t = 0.25
+    r_at = np.sqrt(t)
+    # a spread of pairs straddling the cut by less than one quantisation step
+    step = 1.0 / 32767
+    r = np.array([r_at, r_at + step / 4, r_at - step / 4, r_at + step,
+                  0.9, 0.5, -r_at, -(r_at + step / 4)])
+    i = np.zeros(r.size, dtype=np.int64)
+    j = np.arange(1, r.size + 1, dtype=np.int64)
+
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r,
+                                  params=dict(PARAMS, min_r2=t)))
+    gi, gj, gr = rd.rows()
+    assert gi.size == r.size, (
+        f"rows() returned {gi.size} of {r.size} stored pairs -- the stored cut "
+        f"is being re-applied to quantised values")
+    np.testing.assert_array_equal(np.sort(gj), j)
+
+    # and the boundary pairs really are within a step of the cut, so this
+    # fixture would not catch the bug by accident
+    assert np.abs(np.abs(r) ** 2 - t).min() < 2 * step * r_at

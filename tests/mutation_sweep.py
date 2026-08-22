@@ -18,6 +18,30 @@ import sys
 ROOT = pathlib.Path("/Users/bschilder/code/cugen")
 
 MUTATIONS = [
+    # ---- LD result storage (.cugenld) ----
+    ('r quantisation truncates instead of rounding', 'cugen/ldio.py',
+     """    return np.clip(np.rint(a * scale), -lim, lim).astype(_ENC_DTYPE[encoding])""",
+     """    return np.clip(np.trunc(a * scale), -lim, lim).astype(_ENC_DTYPE[encoding])""", "tests/test_ldio.py"),
+    ('delta coding does not reset at row boundaries', 'cugen/ldio.py',
+     """        d[rs] = 0                                # reset at each row start""",
+     """        pass""", "tests/test_ldio.py"),
+    ('delta decode drops the running sum', 'cugen/ldio.py',
+     """            c = np.cumsum(d.astype(np.int64))""",
+     """            c = d.astype(np.int64)""", "tests/test_ldio.py"),
+    ('zone map ignores max_abs_r and never skips', 'cugen/ldio.py',
+     """            if t is not None and t > 0.0 and b[\"max_abs_r\"] ** 2 < t:""",
+     """            if False:""", "tests/test_ldio.py"),
+    ('reader answers a too-loose threshold instead of raising', 'cugen/ldio.py',
+     """        if t < stored - 1e-12:""",
+     """        if False:""", "tests/test_ldio.py"),
+    ('rows() re-applies the stored cut to quantised r', 'cugen/ldio.py',
+     """        if min_r2 is None:
+            return None""",
+     """        if min_r2 is None:
+            return stored""", "tests/test_ldio.py"),
+    ('dense() fills a thresholded file with zeros', 'cugen/ldio.py',
+     """        if stored > 0.0:""",
+     """        if False:""", "tests/test_ldio.py"),
     # ---- GRM ----
     ('GRM standardises by p(1-p), not 2p(1-p)', 'cugen/popstruct.py',
      """        z = xp.where(obs, (x - two_p) / xp.sqrt(two_p * (1.0 - freq[:, None])),""",
