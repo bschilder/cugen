@@ -121,6 +121,12 @@ _CODEC = "zstd"
 # only the tiers it needs.
 DEFAULT_TIERS = (0.8, 0.5, 0.2, 0.05, 0.0)
 
+# A block is also capped by PAIRS, not only by row variants. zstd frames are not
+# seekable, so a single-variant lookup pays for the whole block it lands in: at
+# block_variants=4096 on real chr22 a block held 2.5 M pairs and variant() cost
+# 360 ms. Capping pairs bounds that cost directly.
+MAX_BLOCK_PAIRS = 1 << 16
+
 
 def _check_encoding(encoding: str) -> str:
     if encoding not in ENCODINGS:
@@ -414,12 +420,14 @@ class LDShardWriter:
 
     def __init__(self, path: str, *, encoding: str = DEFAULT_ENCODING,
                  block_variants: int = 4096, params: Optional[dict] = None,
-                 block_a: int = 0, block_b: int = 0, tiers=DEFAULT_TIERS):
+                 block_a: int = 0, block_b: int = 0, tiers=DEFAULT_TIERS,
+                 max_block_pairs: int = MAX_BLOCK_PAIRS):
         _check_encoding(encoding)
         self.tiers = tuple(sorted((float(t) for t in tiers), reverse=True))
         self.path = str(path)
         self.encoding = encoding
         self.block_variants = int(block_variants)
+        self.max_block_pairs = int(max_block_pairs)
         self.params = {k: (params or {}).get(k) for k in _PARAM_KEYS}
         self.block_a, self.block_b = int(block_a), int(block_b)
         self._f = open(self.path, "wb")
@@ -509,8 +517,22 @@ class LDShardWriter:
                 hi_edge = lo_edge
                 if not sel.any():
                     continue
-                self._write_block(gi[sel], gj[sel], gr[sel],
-                                  tier_lo=lo_edge)
+                ti, tj, tr = gi[sel], gj[sel], gr[sel]
+                # split on row-variant boundaries so a variant's partners never
+                # straddle two blocks within a tier
+                if ti.size > self.max_block_pairs:
+                    _, rs = np.unique(ti, return_index=True)
+                    cut = [0]
+                    for st in rs[1:]:
+                        if st - cut[-1] >= self.max_block_pairs:
+                            cut.append(int(st))
+                    cut.append(ti.size)
+                    for a, b in zip(cut[:-1], cut[1:]):
+                        if b > a:
+                            self._write_block(ti[a:b], tj[a:b], tr[a:b],
+                                              tier_lo=lo_edge)
+                else:
+                    self._write_block(ti, tj, tr, tier_lo=lo_edge)
 
         keep = int(starts[n_emit]) if n_emit < uniq.size else int(i.size)
         if keep < i.size:
@@ -599,6 +621,15 @@ class LDReader:
         self.payload_mix = foot["payload_mix"]
         self.n_pairs = self.header["n_pairs"]
         self.blocks_read = 0
+        # row variant -> [(block index, slot)]. Built once, because scanning
+        # every block's row_variants list per lookup made variant() cost 367 ms
+        # on a 66-block file -- linear in blocks and in Python. A variant's
+        # partners are spread across r^2 tiers, so a variant maps to several
+        # blocks and this has to be a multimap.
+        self._where: dict = {}
+        for bi, b in enumerate(self.blocks):
+            for slot, v in enumerate(b["row_variants"]):
+                self._where.setdefault(int(v), []).append((bi, slot))
 
     def reset_counters(self) -> None:
         self.blocks_read = 0
@@ -685,17 +716,11 @@ class LDReader:
         """
         v = int(gidx)
         oj, orr = [], []
-        for b in self.blocks:
-            rv = b["row_variants"]
-            if not rv or v < rv[0] or v > rv[-1]:
-                continue
-            try:
-                k = rv.index(v)
-            except ValueError:
-                continue
+        for bi, slot in self._where.get(v, ()):
+            b = self.blocks[bi]
             j, r = self._block(b)
-            s = b["row_starts"][k]
-            e = s + b["row_counts"][k]
+            s = b["row_starts"][slot]
+            e = s + b["row_counts"][slot]
             oj.append(j[s:e])
             orr.append(r[s:e])
         if not oj:

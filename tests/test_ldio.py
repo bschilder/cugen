@@ -535,3 +535,51 @@ def test_ld_matrix_can_write_the_native_format_directly(tmp_path, small_cugen):
     gi, gj, _ = rd.rows()
     assert set(zip(gi.tolist(), gj.tolist())) == set(
         zip(df["gidx_a"].tolist(), df["gidx_b"].tolist()))
+
+
+def test_variant_lookup_reads_only_the_blocks_that_hold_it(tmp_path):
+    """variant() must not scan the whole shard.
+
+    Scanning every block's row_variants list per lookup measured 367 ms on a
+    66-block file from real chr22 -- linear in blocks and in Python. The reader
+    builds a row-variant index at open instead.
+    """
+    i, j, r = sparse_trans_pairs()
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r, block_variants=256,
+                                  params=dict(PARAMS, min_r2=1e-4)))
+    rd.rows()
+    total = rd.blocks_read
+    assert total > 20
+
+    rd.reset_counters()
+    gj, gr = rd.variant(100)
+    want = j[i == 100]
+    np.testing.assert_array_equal(gj, want)
+    assert rd.blocks_read <= 6, (
+        f"one variant read {rd.blocks_read} of {total} blocks; the index is "
+        f"not being used")
+
+
+def test_blocks_are_capped_by_pair_count_not_only_by_variant_count(tmp_path):
+    """zstd frames are not seekable, so a one-variant lookup pays for the whole
+    block it lands in. On real chr22 a 4096-variant block held 2.5 M pairs and
+    variant() cost 360 ms -- the cap bounds that directly."""
+    i, j, r = brute_pairs(seed=5, p=1200, n=400, min_r2=0.0)
+    assert i.size > 400_000, "fixture must exceed the cap to test it"
+    cap = 1 << 14
+    path = tmp_path / "s.cugenld"
+    w = ldio.LDShardWriter(str(path), block_variants=100_000,
+                           max_block_pairs=cap,
+                           params=dict(PARAMS, min_r2=0.0))
+    w.append(i, j, r)
+    w.close()
+
+    rd = ldio.read_ld(str(path))
+    assert rd.n_pairs == i.size
+    biggest = max(b["n"] for b in rd.blocks)
+    # a single row variant can exceed the cap on its own; the guarantee is that
+    # blocks are cut at variant boundaries as soon as the cap is passed
+    assert biggest <= cap + int(np.bincount(i).max()), (
+        f"largest block holds {biggest} pairs against a cap of {cap}")
+    gi, gj, _ = rd.rows()
+    assert gi.size == i.size
