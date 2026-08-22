@@ -735,3 +735,194 @@ class LDReader:
 def read_ld(path: str) -> LDReader:
     """Open a .cugenld shard for querying."""
     return LDReader(path)
+
+
+# ---------------------------------------------------------------------------
+# Writer registry. The point is options: some people want a compact native
+# container, some want .npz they can open in one line with no new dependency,
+# some want parquet a downstream service already queries. All of them are
+# served, and the extension picks.
+# ---------------------------------------------------------------------------
+# Placeholder columns the device path fills with constants: POS is literal
+# zeros and ID is "." whenever annotation is None, which is exactly the
+# condition the fused path requires. Writing them is pure overhead.
+_DEAD_WHEN_PLACEHOLDER = ("POS_A", "POS_B", "ID_A", "ID_B")
+
+# One row group per this many rows. Small enough that a bp-range predicate
+# skips most of the file, large enough that per-group metadata stays cheap.
+PARQUET_ROW_GROUP = 1 << 20
+
+
+def _to_pandas(df):
+    return df.to_pandas() if hasattr(df, "to_pandas") else df
+
+
+def _drop_placeholder_columns(df):
+    """Drop columns that carry no information in this frame."""
+    out = df
+    for c in _DEAD_WHEN_PLACEHOLDER:
+        if c not in out.columns:
+            continue
+        col = out[c]
+        if c.startswith("POS"):
+            dead = bool((col == 0).all())
+        else:
+            dead = bool((col.astype(str) == ".").all())
+        if dead:
+            out = out.drop(columns=[c])
+    for c in ("CHR_A", "CHR_B"):
+        if c in out.columns and out[c].nunique(dropna=False) <= 1:
+            out = out.drop(columns=[c])
+    return out
+
+
+def write_ld(df, path: str, *, params: Optional[dict] = None,
+             encoding: str = DEFAULT_ENCODING, block_variants: int = 4096,
+             drop_dead: bool = False, tiers=DEFAULT_TIERS) -> None:
+    """Write an LD pairs frame, in the format the extension asks for.
+
+    ``.cugenld`` is the compact native container; the rest are interop formats.
+    ``params`` records the test-space and retention parameters of the run --
+    the native format needs them to answer queries honestly, and the others
+    keep them alongside where the container allows it.
+    """
+    p = str(path)
+    if p.endswith(".cugenld"):
+        return _write_cugenld(df, p, params=params, encoding=encoding,
+                              block_variants=block_variants, tiers=tiers)
+    if p.endswith(".npz"):
+        return _write_npz(df, p, params=params)
+    if p.endswith(".zarr"):
+        return _write_zarr(df, p, params=params)
+    if p.endswith(".parquet"):
+        return _write_parquet(df, p, drop_dead=drop_dead)
+    if p.endswith(".feather"):
+        h = _to_pandas(df)
+        return (_drop_placeholder_columns(h) if drop_dead else h).reset_index(
+            drop=True).to_feather(p)
+    if p.endswith((".tsv", ".csv", ".tsv.gz", ".csv.gz", ".gz")):
+        return _write_text(df, p, drop_dead=drop_dead)
+    raise ValueError(
+        f"no writer for {p!r}: unrecognised extension. Supported formats are "
+        f".cugenld (compact native), .parquet, .feather, .npz, .zarr, .tsv, "
+        f".csv, and the .gz variants of the last two.")
+
+
+def _r_column(h):
+    for c in ("R", "R_PHASED"):
+        if c in h.columns:
+            return c
+    raise ValueError(
+        "the native and array formats store signed r, from which r2, D, chi2 "
+        "and p are all derived -- so 'r' or 'r_phased' must be in stats=. Got "
+        f"columns {list(h.columns)}.")
+
+
+def _write_cugenld(df, path, *, params, encoding, block_variants, tiers):
+    h = _to_pandas(df)
+    rc = _r_column(h)
+    w = LDShardWriter(path, encoding=encoding, block_variants=block_variants,
+                      params=params, tiers=tiers)
+    i = h["gidx_a"].to_numpy(np.int64)
+    j = h["gidx_b"].to_numpy(np.int64)
+    r = h[rc].to_numpy(np.float64)
+    order = np.lexsort((j, i))
+    w.append(i[order], j[order], r[order])
+    w.close()
+
+
+def _write_npz(df, path, *, params):
+    import json                                              # noqa: PLC0415
+
+    h = _to_pandas(df)
+    arrays = {c: h[c].to_numpy() for c in h.columns
+              if h[c].dtype != object}
+    arrays["params_json"] = np.array(json.dumps(params or {}))
+    np.savez_compressed(path, **arrays)
+
+
+def _write_zarr(df, path, *, params):
+    import json                                              # noqa: PLC0415
+    try:
+        import zarr                                          # noqa: PLC0415
+    except ImportError as e:                                 # noqa: BLE001
+        raise ImportError(
+            "the .zarr backend needs the optional 'zarr' package: "
+            "pip install zarr") from e
+
+    h = _to_pandas(df)
+    g = zarr.open_group(path, mode="w")
+    for c in h.columns:
+        if h[c].dtype == object:
+            continue
+        g.create_array(c, shape=(len(h),), dtype=h[c].dtype,
+                       chunks=(min(len(h), 1 << 20),))[:] = h[c].to_numpy()
+    g.attrs["params"] = json.dumps(params or {})
+
+
+def _write_parquet(df, path, *, drop_dead):
+    import pyarrow as pa                                     # noqa: PLC0415
+    import pyarrow.parquet as pq                             # noqa: PLC0415
+
+    h = _to_pandas(df)
+    if drop_dead:
+        h = _drop_placeholder_columns(h)
+    tbl = pa.Table.from_pandas(h, preserve_index=False)
+    # zstd over snappy (19.0 vs 24.3 B/row measured), statistics on so a
+    # bp-range predicate can skip row groups instead of reading all of them,
+    # and dictionary encoding off for the wide integer keys where it only adds
+    # a level of indirection.
+    pq.write_table(tbl, path, compression="zstd",
+                   row_group_size=PARQUET_ROW_GROUP, write_statistics=True,
+                   use_dictionary=False)
+
+
+def _write_text(df, path, *, drop_dead):
+    h = _to_pandas(df)
+    if drop_dead:
+        h = _drop_placeholder_columns(h)
+    sep = "\t" if ".tsv" in path else ","
+    if not path.endswith(".gz"):
+        try:
+            import pyarrow as pa                             # noqa: PLC0415
+            from pyarrow import csv as pacsv                  # noqa: PLC0415
+            pacsv.write_csv(
+                pa.Table.from_pandas(h, preserve_index=False), path,
+                pacsv.WriteOptions(include_header=True, delimiter=sep,
+                                   quoting_style="none"))
+            return
+        except Exception:                                    # noqa: BLE001
+            pass
+    h.to_csv(path, sep=sep, index=False,
+             compression="gzip" if path.endswith(".gz") else None)
+
+
+def read_pairs(path: str):
+    """Read any container this module writes back into a pairs DataFrame.
+
+    Exists so a round-trip is testable across every backend with one call.
+    """
+    import pandas as pd                                      # noqa: PLC0415
+
+    p = str(path)
+    if p.endswith(".cugenld"):
+        rd = read_ld(p)
+        i, j, r = rd.rows()
+        return pd.DataFrame({"gidx_a": i, "gidx_b": j, "R": r})
+    if p.endswith(".npz"):
+        z = np.load(p, allow_pickle=False)
+        return pd.DataFrame({k: z[k] for k in z.files
+                             if k != "params_json" and z[k].ndim == 1})
+    if p.endswith(".zarr"):
+        import zarr                                          # noqa: PLC0415
+        g = zarr.open_group(p, mode="r")
+        return pd.DataFrame({k: g[k][:] for k in g.array_keys()})
+    if p.endswith(".parquet"):
+        return pd.read_parquet(p)
+    if p.endswith(".feather"):
+        return pd.read_feather(p)
+    if p.endswith((".tsv", ".tsv.gz")):
+        return pd.read_csv(p, sep="\t")
+    if p.endswith((".csv", ".csv.gz")):
+        return pd.read_csv(p)
+    raise ValueError(f"no reader for {p!r}")

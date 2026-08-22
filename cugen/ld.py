@@ -1204,7 +1204,18 @@ class _ChunkWriter:
             self._pq = None
 
 
-def _write_df(df: pd.DataFrame, path: str) -> None:
+def _write_df(df, path: str, *, params: Optional[dict] = None) -> None:
+    """Write an LD result, delegating to cugen.ldio.
+
+    One writer, so a format is added in one module rather than in branches
+    here. _ChunkWriter above is the streaming counterpart: it appends chunk by
+    chunk during a scan, where this writes a finished frame once.
+    """
+    from . import ldio                                       # noqa: PLC0415
+    return ldio.write_ld(df, str(path), params=params)
+
+
+def _write_df_legacy(df: pd.DataFrame, path: str) -> None:
     """Same output conventions as qc._write_df, but via pyarrow when possible.
 
     pandas.to_csv is the single largest cost in a large LD run -- 7.3 s to
@@ -3768,6 +3779,20 @@ def ld_matrix(
         if verbose:
             print(f"cugen.ld: max_p={max_p:.3g} over m={m_tests:,} tests -> "
                   f"min_r2={min_r2:.6g} at N={n_eff}")
+    # Both parameter families, recorded together: the test space determines m
+    # and so the correction thresholds, and the retention family is what a
+    # reader is allowed to be asked about. A run is only reproducible if both
+    # travel with the file.
+    _ld_params = {
+        "maf_min": float(maf_min), "maf_max": None,
+        "window": window, "window_kb": window_kb,
+        "min_dist_kb": None, "max_dist_kb": None, "scope": "all",
+        "min_r2": float(min_r2), "max_p": max_p, "correction": correction,
+        "alpha": float(alpha), "top_k": None,
+        "n_obs": (2 * int(reader.n_samples) if want_phased
+                  else int(reader.n_samples)),
+        "m_tests": int(m_tests),
+    }
     _screened = min_r2 > 0
     _sig_kw = dict(max_p=max_p, correction=correction, alpha=alpha,
                    m=m_tests, screened=_screened, verbose=verbose)
@@ -3880,7 +3905,7 @@ def ld_matrix(
         df = _assemble_device(pairs_local, (rr, n_dev), reader, rows, stats,
                               sign_reference, path, verbose, n_planned=n_pairs)
         df = _apply_significance_filters(df, **_sig_kw)
-        _write_df(df, str(output))
+        _write_df(df, str(output), params=_ld_params)
         if verbose:
             print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs "
                   f"planned, {len(df):,} emitted  (gpu, fused kernel)")
@@ -3898,7 +3923,7 @@ def ld_matrix(
             df = _assemble_device(pairs_local, payload, reader, rows, stats,
                                   sign_reference, path, verbose, n_planned=n_pairs)
             df = _apply_significance_filters(df, **_sig_kw)
-            _write_df(df, str(output))
+            _write_df(df, str(output), params=_ld_params)
             if verbose:
                 print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs "
                       f"planned, {len(df):,} emitted  (gpu, cudf device write)")
@@ -3996,5 +4021,5 @@ def ld_matrix(
         # last, because iloc/astype/concat do not reliably carry attrs
         df.attrs["lambda_gc"] = lam
     if output is not None:
-        _write_df(df, str(output))
+        _write_df(df, str(output), params=_ld_params)
     return df

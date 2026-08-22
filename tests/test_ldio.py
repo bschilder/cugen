@@ -439,3 +439,99 @@ def test_rows_returns_pairs_sitting_exactly_on_the_stored_threshold(tmp_path):
     # and the boundary pairs really are within a step of the cut, so this
     # fixture would not catch the bug by accident
     assert np.abs(np.abs(r) ** 2 - t).min() < 2 * step * r_at
+
+
+# ------------------------------------------------------- the writer registry
+# The user picks the format; the point is options, not one imposed container.
+
+def test_every_backend_round_trips_the_same_pairs(tmp_path, small_cugen):
+    """Write one LD result to every supported container and read each back.
+
+    A format that cannot reproduce the pairs it was given is not an option, it
+    is a data-loss bug with a file extension.
+    """
+    from cugen import ld as L
+    path, _ = small_cugen
+    df = L.ld_matrix(path, stats=("r", "r2"), backend="numpy", verbose=False)
+    want = set(zip(df["gidx_a"].tolist(), df["gidx_b"].tolist()))
+
+    for ext in (".tsv", ".csv", ".parquet", ".feather", ".npz", ".cugenld"):
+        out = tmp_path / f"ld{ext}"
+        ldio.write_ld(df, str(out), params=dict(PARAMS, min_r2=0.0))
+        assert out.exists(), f"{ext} wrote nothing"
+        got = ldio.read_pairs(str(out))
+        assert set(zip(got["gidx_a"].tolist(), got["gidx_b"].tolist())) == want, (
+            f"{ext} did not round-trip the pair set")
+        assert np.abs(np.sort(got["R"].to_numpy(np.float64))
+                      - np.sort(df["R"].to_numpy(np.float64))).max() < 1e-4, (
+            f"{ext} did not round-trip r")
+
+
+def test_npz_is_readable_with_plain_numpy(tmp_path, small_cugen):
+    """The reason .npz is on the menu: one line, no cugen, no new dependency."""
+    from cugen import ld as L
+    path, _ = small_cugen
+    df = L.ld_matrix(path, stats=("r", "r2"), backend="numpy", verbose=False)
+    out = tmp_path / "ld.npz"
+    ldio.write_ld(df, str(out), params=PARAMS)
+
+    z = np.load(out)
+    assert {"gidx_a", "gidx_b", "R"} <= set(z.files)
+    np.testing.assert_array_equal(z["gidx_a"], df["gidx_a"].to_numpy())
+
+
+def test_parquet_is_written_with_zstd_and_statistics(tmp_path, small_cugen):
+    """Untuned parquet was 24.3 B/row against 19.0 with zstd, and without row
+    statistics a bp-range predicate cannot be pushed down at all -- which is how
+    the live downstream consumer queries these files."""
+    import pyarrow.parquet as pq
+    from cugen import ld as L
+    path, _ = small_cugen
+    df = L.ld_matrix(path, stats=("r", "r2"), backend="numpy", verbose=False)
+    out = tmp_path / "ld.parquet"
+    ldio.write_ld(df, str(out), params=PARAMS)
+
+    md = pq.ParquetFile(out).metadata
+    codecs = {md.row_group(g).column(c).compression
+              for g in range(md.num_row_groups)
+              for c in range(md.num_columns)}
+    assert codecs <= {"ZSTD"}, f"expected zstd, got {codecs}"
+    assert md.row_group(0).column(0).statistics is not None, (
+        "no column statistics -- predicate pushdown will read every row group")
+
+
+def test_dead_columns_are_not_written(tmp_path, small_cugen):
+    """POS is literal zeros and ID is "." on the device path, and CHR is
+    constant per file. Writing them is pure overhead."""
+    from cugen import ld as L
+    path, _ = small_cugen
+    df = L.ld_matrix(path, stats=("r", "r2"), backend="numpy", verbose=False)
+    out = tmp_path / "ld.tsv"
+    ldio.write_ld(df, str(out), params=PARAMS, drop_dead=True)
+    # pyarrow's CSV writer quotes header names; that is pre-existing behaviour
+    # and not what this test is about
+    header = [c.strip('"') for c in out.read_text().splitlines()[0].split("\t")]
+    for dead in ("POS_A", "POS_B", "ID_A", "ID_B"):
+        assert dead not in header, f"{dead} is all-placeholder but was written"
+    assert "gidx_a" in header and "R" in header
+
+
+def test_an_unknown_extension_is_refused(tmp_path, small_cugen):
+    from cugen import ld as L
+    df = L.ld_matrix(small_cugen[0], stats=("r2",), backend="numpy",
+                     verbose=False)
+    with pytest.raises(ValueError, match="extension|format"):
+        ldio.write_ld(df, str(tmp_path / "ld.rubbish"), params=PARAMS)
+
+
+def test_ld_matrix_can_write_the_native_format_directly(tmp_path, small_cugen):
+    from cugen import ld as L
+    out = tmp_path / "chr22.cugenld"
+    df = L.ld_matrix(small_cugen[0], stats=("r", "r2"), min_r2=0.01,
+                     output=str(out), backend="numpy", verbose=False)
+    rd = ldio.read_ld(str(out))
+    assert rd.n_pairs == len(df)
+    assert rd.params["min_r2"] == 0.01
+    gi, gj, _ = rd.rows()
+    assert set(zip(gi.tolist(), gj.tolist())) == set(
+        zip(df["gidx_a"].tolist(), df["gidx_b"].tolist()))
