@@ -235,6 +235,62 @@ it retains while providing no error control at all, and it simultaneously admits
 the singleton pairs above that no error rate would tolerate. It is strict in the
 wrong place and permissive in the wrong place.
 
+## Bias-corrected r^2 — estimators, deliberately without p-values
+
+`r2_s`, `r2_v`, `r2_vs` implement Mangin et al. (2012) *Heredity* 108:285–291 —
+r^2 corrected for population structure, for relatedness, and for both. They are
+the other half of the robustness story: `lambda_gc` adjusts the *test* for
+inflation, these correct the *estimator*.
+
+All three are ratios of entries of a covariance-like matrix that is the Gram
+matrix of a linearly transformed genotype vector, so each reduces to **one n×n
+map applied once**, after which an ordinary uncentered r^2 is the answer:
+
+    r2_s   P = (I - H_S)(I - 11'/n)                centre, then residualise on S
+    r2_v   P = W (I - F),  F = 1 1' V^- / (1' V^- 1)   GLS-centre, then whiten
+    r2_vs  P = (I - H_Z) W (I - F)                 the same, in the V^- metric
+
+Validated against the authors' own R implementation (LDcorSV 1.3.3,
+`Measure.R2V` / `R2S` / `R2VS`) transcribed literally into numpy — max |diff|
+< 1e-6 over 190 pairs each. With V = I, `r2_v` collapses onto ordinary `r2`
+(atol 1e-6); with a structure matrix uncorrelated with the loci, `r2_s` leaves
+`r2` alone.
+
+Two independent checks of the correction actually correcting:
+
+    two populations, dAF = 0.70, no true LD within either (20 variants, n = 200)
+      mean r2    0.2719      (pure structure artefact)
+      mean r2_S  0.0074      (corrected)
+
+    Mangin Table 2 clone scenario, true r2 = 0.05, 80 independent + 20 clones
+      r2, independent samples only   0.0587
+      r2, with the clones            0.0769
+      r2_v, same sample + kinship    0.0587      (paper reports 0.060 / 0.063)
+
+**They carry no p-value, and asking for one raises.** The paper proves them
+unbiased for unlinked loci and links them to association-test power, but derives
+no null sampling distribution, so `chi2 = N * r^2` does not transfer: after GLS
+centering and rank-K residualization the effective sample size is not N and
+nothing in the paper says what it is. Emitting a p-value there would mean
+inventing a degrees-of-freedom.
+
+Note that the paper's Table 1 numbers are **not** reproduced here, and the reason
+is informative. Pooling two populations induces Hardy–Weinberg disequilibrium
+(Wahlund), so the composite genotypic r^2 exceeds the gametic one — a
+two-population sample with true r^2 = 0.01 and frequencies 0.9/0.1 at both loci
+gives 0.65 on dosages against the paper's 0.460, which is the gametic value. The
+paper does not say which its simulation produced, so matching that table would be
+testing a reconstruction of their simulation rather than an implementation of
+their formula. The structural claim is tested instead.
+
+Practical limits: `r2_v` needs an n×n eigendecomposition, which is fine at the
+hundreds-to-thousands scale the paper worked at (183 grapevine accessions; the
+authors note inverting V "drastically slowed down the computation") but not at
+biobank n. `r2_s` is rank-K and has no such limit. Both force the reference path.
+Dosage input only — the correction is defined between individuals, and a hap2bit
+file is indexed by haplotype. Which V to use is, in the authors' words, "an open
+question".
+
 ## Caveats that travel with these numbers
 
 - All timings are the **CPU reference path**. The asymptotic statistics also run

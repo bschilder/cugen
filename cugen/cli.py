@@ -68,6 +68,13 @@ def _add_ld(sp):
     p.add_argument("--exact", choices=("never", "auto", "always"),
                    default="never",
                    help="Fisher exact conditional test; hap2bit input only")
+    p.add_argument("--kinship", default=None,
+                   help="(n,n) kinship/covariance matrix for r2_v/r2_vs; "
+                        ".npy or whitespace-delimited text, sample order must "
+                        "match the .cugen file")
+    p.add_argument("--structure", default=None,
+                   help="(n,K) structure matrix for r2_s/r2_vs, e.g. admixture "
+                        "proportions or leading PCs; .npy or text")
     p.add_argument("--lambda-gc", action="store_true",
                    help="estimate the inflation factor and add adjusted "
                         "columns; structure makes raw p anti-conservative")
@@ -172,6 +179,13 @@ def _run_ld(args):
     # ld_matrix pulls in CuPy, so import it here rather than at module scope --
     # `cugen ld --help` must not need a GPU stack to print usage.
     from .ld import ld_matrix  # noqa: PLC0415
+
+    def _matrix(path):
+        if path is None:
+            return None
+        import numpy as np  # noqa: PLC0415
+        return np.load(path) if path.endswith(".npy") else np.loadtxt(path)
+
     ld_matrix(
         args.cugen_file,
         stats=tuple(s.strip() for s in args.stats.split(",") if s.strip()),
@@ -183,6 +197,8 @@ def _run_ld(args):
         alpha=args.alpha,
         exact=args.exact,
         lambda_gc=args.lambda_gc,
+        kinship=_matrix(args.kinship),
+        structure=_matrix(args.structure),
         maf_min=args.maf_min,
         annotation=args.annotation,
         tile_size=args.tile_size,

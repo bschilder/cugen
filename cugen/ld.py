@@ -4,6 +4,8 @@
                       and significance: chi2, -log10(p), an exact conditional
                       test, Bonferroni/BH-FDR filtering and inflation control
                       (alias: cg.r2; CLI: cugen ld)
+                      Also r2_S / r2_V / r2_VS -- r^2 corrected for population
+                      structure and relatedness (estimators only, no p-value)
     ld_prune(...)     prune to approximate linkage equilibrium  (alias:
                       cg.prune). plink2 --indep-pairwise parity. Same greedy
                       algorithm as ld_clump, ranked by allele frequency rather
@@ -214,7 +216,7 @@ Devlin & Roeder (1999) Biometrics 55(4):997     genomic control; lambda =
 Yang et al. (2011) AJHG 88(1):76-82             GCTA standardised GRM
     https://doi.org/10.1016/j.ajhg.2010.11.011  (cugen.popstruct.grm)
 
-Read but NOT implemented, and the reason is worth recording:
+Implemented as ESTIMATORS ONLY, and the reason for the qualifier matters:
 
 Mangin, Siberchicot, Nicolas, Doligez, This & Cierco-Ayrolles (2012)
     Heredity 108(3):285-291        r^2_S / r^2_V / r^2_VS -- LD corrected for
@@ -234,20 +236,22 @@ Their eqs (1)-(3), cross-checked against the authors' own R implementation
 All three reduce to ONE linear map applied to the genotype planes once, after
 which an ordinary UNCENTERED r^2 is the answer -- and ld_epilogue_compact
 already computes that if it is handed zero sum vectors, since
-(n*S - sA*sB)/sqrt(...) collapses to S/sqrt(qA*qB). So the compute would be
-nearly free here. V is only positive SEMI-definite in practice (the paper uses
+(n*S - sA*sB)/sqrt(...) collapses to S/sqrt(qA*qB). That is how they are computed here: _corrected_transform builds
+one n x n P per dataset and _corrected_r2 takes the Gram of P X. V is only positive SEMI-definite in practice (the paper uses
 the Moore-Penrose inverse V^-, and builds a PSD matrix by zeroing negative
 eigenvalues of an SVD), so the whitening must come from the eigendecomposition,
 V^-1/2 = U Lambda^-1/2 U'; there is no Cholesky factor.
 
-What stops it is the STATISTICS, not the code. The paper establishes that these
+What is NOT implemented is a p-value for them, and that is a statistics
+limit rather than a code one. The paper establishes that these
 measures are unbiased for unlinked loci (Appendix A, and Tables 1-3 by
 simulation) and that r^2_S is the factor by which sample size must grow to hold
 power at a linked marker -- a POWER result. It derives no null sampling
 distribution for the corrected measures. So chi2 = N * r^2 does not transfer to
 them: after GLS centring and rank-K residualisation the effective sample size is
-not N, and nothing here says what it is. Shipping p_adj on an r^2_V column would
-mean inventing a degrees-of-freedom, which is research, not implementation.
+not N, and nothing here says what it is. Shipping p on an r^2_V column would mean
+inventing a degrees-of-freedom, which is research, not implementation -- so
+asking for chi2/p beside a corrected measure raises.
 
 Two further cautions the authors state themselves: which V to use "remains an
 open question", and inverting V "drastically slowed down the computation" at
@@ -303,7 +307,8 @@ EPS = 1e-12
 # the result of an existing call.
 _STATS = ("r", "r2", "r2_signed", "d", "dp", "r_phased", "r2_phased",
           "d_phased", "dp_phased", "r2_phased_em",
-          "chi2", "p", "p_exact", "chi2_adj", "p_adj")
+          "chi2", "p", "p_exact", "chi2_adj", "p_adj",
+          "r2_s", "r2_v", "r2_vs")
 _DEFAULT_STATS = ("r", "r2", "r2_signed", "d", "dp")
 _STAT_COL = {"r": "R", "r2": "R2", "r2_signed": "R2_SIGNED", "d": "D", "dp": "DP",
              "r_phased": "R_PHASED", "r2_phased": "R2_PHASED",
@@ -311,7 +316,8 @@ _STAT_COL = {"r": "R", "r2": "R2", "r2_signed": "R2_SIGNED", "d": "D", "dp": "DP
              "r2_phased_em": "R2_PHASED_EM",
              "chi2": "CHI2", "p": "NEG_LOG10_P",
              "p_exact": "NEG_LOG10_P_EXACT",
-             "chi2_adj": "CHI2_ADJ", "p_adj": "NEG_LOG10_P_ADJ"}
+             "chi2_adj": "CHI2_ADJ", "p_adj": "NEG_LOG10_P_ADJ",
+             "r2_s": "R2_S", "r2_v": "R2_V", "r2_vs": "R2_VS"}
 # The significance pair. Derived from whichever correlation the path computed
 # and from N_OBS, so they cost no extra passes over the data. "p" emits
 # -log10(p), not p -- see _neglog10_chi2_1df for why p itself is unusable.
@@ -322,6 +328,14 @@ _CHI2_1DF_MEDIAN = 0.4549364
 # carry -- unlike chi2/p it is phased-only even though it is not a _PHASED_STATS
 # member (those name specific LD estimators; this names a test of any of them).
 _EXACT_MODES = ("never", "auto", "always")
+# Mangin et al. (2012) bias-corrected r^2. ESTIMATORS ONLY -- the paper derives
+# no null sampling distribution for them, so they cannot carry a p-value; see
+# the References block at the head of this module.
+_CORRECTED_STATS = frozenset(("r2_s", "r2_v", "r2_vs"))
+# LDcorSV's Inv.proj.matrix.sdp zeroes eigenvalues below this before inverting.
+# The Moore-Penrose inverse is the paper's prescription; the floor is the R
+# package's choice and is reproduced here for parity with it.
+_PSD_EIGEN_TOL = 1e-5
 # Statistics computed from TRUE haplotype counts, which only a HAP2BIT file
 # carries. Mixing these with the dosage statistics in one call is refused
 # rather than silently served: hap2bit and 2bit share bytes but not meaning
@@ -909,6 +923,124 @@ def _lambda_gc(chi2, separation=None, min_null=100):
         if far.sum() >= min_null:
             chi2 = chi2[far]
     return float(np.median(chi2) / _CHI2_1DF_MEDIAN)
+
+
+def _psd_pinv_and_sqrt(V, tol=_PSD_EIGEN_TOL):
+    """Moore-Penrose inverse of a PSD matrix, and its symmetric square root.
+
+    Kinship matrices are routinely singular -- and estimators of them routinely
+    return something not quite PSD -- so V has no Cholesky factor and V^-1 does
+    not exist. Mangin et al. prescribe the Moore-Penrose inverse V^-, "which is
+    always defined", and build a PSD matrix by zeroing negative eigenvalues of a
+    decomposition. Both come out of one eigendecomposition here.
+
+    Returns ``(V_inv, W)`` with ``W.T @ W == V_inv``, so a quadratic form
+    ``x' V^- y`` becomes an ordinary dot product ``(Wx) . (Wy)``.
+    """
+    w, U = np.linalg.eigh(np.asarray(V, dtype=np.float64))
+    dead = w < tol
+    inv = np.where(dead, 0.0, 1.0 / np.where(dead, 1.0, w))
+    V_inv = (U * inv) @ U.T
+    W = (U * np.sqrt(inv)) @ U.T
+    return V_inv, W
+
+
+def _corrected_transform(which, n, kinship=None, structure=None):
+    """The one n x n map that turns a corrected r^2 into an ordinary one.
+
+    Every measure in Mangin et al. (2012) is a ratio of entries of a
+    covariance-like matrix, and in each case that matrix is the GRAM matrix of a
+    linearly transformed genotype vector. So a single P, built once per dataset,
+    reduces all three to an UNCENTERED r^2 on ``P x``:
+
+      r2_s   (eq. 1)  P = (I - H_S)(I - 11'/n)
+                      centre, then residualise on the structure matrix. The
+                      published form is a Schur complement of the joint
+                      covariance of the two loci and S, which is the residual
+                      covariance after regressing the loci on S -- and since
+                      (I - H_S) is idempotent that equals the Gram of the
+                      residuals.
+      r2_v   (eq. 2)  P = W (I - F),  F = 1 1' V^- / (1' V^- 1)
+                      GLS-centre, then whiten. F is the projection onto the GLS
+                      mean; W'W = V^-, so x'V^-y becomes (Wx).(Wy).
+      r2_vs  (eq. 3)  P = (I - H_Z) W (I - F),  Z_S = W (I - F) S
+                      the same Schur complement, taken in the V^- metric.
+
+    H_S and H_Z are hat matrices built with the same pseudo-inverse, so a
+    rank-deficient or collinear structure matrix degrades gracefully instead of
+    raising.
+    """
+    eye = np.eye(n)
+    if which == "r2_s":
+        S = _as_covariate_block(structure, n)
+        Sc = S - S.mean(axis=0)
+        H = Sc @ _psd_pinv_and_sqrt(Sc.T @ Sc)[0] @ Sc.T
+        return (eye - H) @ (eye - np.full((n, n), 1.0 / n))
+
+    V_inv, W = _psd_pinv_and_sqrt(_as_square(kinship, n))
+    one = np.ones(n)
+    denom = float(one @ V_inv @ one)
+    if not np.isfinite(denom) or abs(denom) < 1e-300:
+        raise ValueError(
+            "1' V^- 1 vanished, so the GLS mean is undefined -- the kinship "
+            "matrix has no usable non-null space. Check it is the right matrix "
+            "and is positive semi-definite.")
+    P = W @ (eye - np.outer(one, one @ V_inv) / denom)
+    if which == "r2_v":
+        return P
+    Zs = P @ _as_covariate_block(structure, n)
+    Hz = Zs @ _psd_pinv_and_sqrt(Zs.T @ Zs)[0] @ Zs.T
+    return (eye - Hz) @ P
+
+
+def _as_square(M, n):
+    if M is None:
+        raise ValueError(
+            "r2_v/r2_vs need a kinship matrix; pass kinship= an (n_samples, "
+            "n_samples) array of genetic covariances between individuals.")
+    A = np.asarray(M, dtype=np.float64)
+    if A.shape != (n, n):
+        raise ValueError(
+            f"kinship shape {A.shape} does not match n_samples={n}; it must be "
+            f"({n}, {n}) and in the same sample order as the .cugen file.")
+    return A
+
+
+def _as_covariate_block(M, n):
+    if M is None:
+        raise ValueError(
+            "r2_s/r2_vs need a structure matrix; pass structure= an "
+            "(n_samples, K) array -- e.g. K-1 admixture proportions from "
+            "STRUCTURE, or leading principal components.")
+    A = np.atleast_2d(np.asarray(M, dtype=np.float64))
+    if A.shape[0] != n and A.shape[1] == n:
+        A = A.T
+    if A.shape[0] != n:
+        raise ValueError(
+            f"structure has {A.shape[0]} rows but n_samples={n}; it must be "
+            f"(n_samples, K) and in the same sample order as the .cugen file.")
+    return A
+
+
+def _corrected_r2(dosages, pairs, P):
+    """Uncentered r^2 of the transformed variant vectors, for every pair.
+
+    ``dosages`` is (n_variants, n_samples); P is applied on the sample axis, so
+    row v becomes ``P x_v``. The Gram matrix is (p, p) -- the same O(p^2) the
+    rest of this module lives with -- and every pair reads two diagonal entries
+    and one off-diagonal one.
+    """
+    X = np.asarray(dosages, dtype=np.float64)
+    Z = X @ P.T
+    G = Z @ Z.T
+    d = np.diag(G).copy()
+    a, b = pairs[:, 0], pairs[:, 1]
+    # LDcorSV returns 0 when a transformed variance underflows; mirror that
+    # rather than emitting inf or nan for a variant the transform annihilated.
+    floor = 1e-12 * max(float(d.max()), 1.0)
+    ok = (d[a] > floor) & (d[b] > floor)
+    den = np.where(ok, d[a] * d[b], 1.0)
+    return np.where(ok, np.clip(G[a, b] ** 2 / den, 0.0, 1.0), 0.0)
 
 
 def _bh_threshold_neglog10p(neglog10p, m, alpha):
@@ -3303,6 +3435,8 @@ def ld_matrix(
     alpha: float = 0.05,
     exact: str = "never",
     lambda_gc: bool = False,
+    kinship=None,
+    structure=None,
     stats: Sequence[str] = _DEFAULT_STATS,
     dprime_method: str = "phased",
     sign_reference: str = "alt",
@@ -3382,6 +3516,15 @@ def ld_matrix(
         significant despite no gametic LD existing at all. Estimated over the
         more distant half of pairs and always before any filtering, since
         filtering selects the tail. Forces the reference path.
+    kinship, structure
+        Matrices for the bias-corrected measures ``r2_s`` / ``r2_v`` /
+        ``r2_vs`` (Mangin et al. 2012): ``kinship`` is (n_samples, n_samples)
+        genetic covariances between individuals, ``structure`` is
+        (n_samples, K) -- admixture proportions or leading PCs. Both must be in
+        the .cugen file's sample order. Dosage input only, and they force the
+        reference path. These are ESTIMATORS: the paper derives no null
+        distribution for them, so requesting ``chi2``/``p`` alongside raises
+        rather than inventing a degrees-of-freedom.
     stats
         Any of ``r, r2, r2_signed, d, dp`` (dosage), ``r_phased, r2_phased,
         d_phased, dp_phased`` (true phase, hap2bit input), ``r2_phased_em`` (EM
@@ -3454,6 +3597,15 @@ def ld_matrix(
         raise ValueError(
             "lambda_gc adjusts the p-value, so 'p' must be in stats. "
             "Add it: stats=(..., 'p').")
+    want_corrected = [x for x in stats if x in _CORRECTED_STATS]
+    if want_corrected and (_SIG_STATS & set(stats)):
+        raise ValueError(
+            f"{want_corrected} are bias-corrected ESTIMATORS with no null "
+            f"distribution -- Mangin et al. (2012) prove them unbiased for "
+            f"unlinked loci and link them to association power, but derive no "
+            f"null sampling law, so chi2 = N * r^2 does not transfer to them. "
+            f"Emitting a p-value beside them would mean inventing a "
+            f"degrees-of-freedom. Request them on their own.")
     if exact not in _EXACT_MODES:
         raise ValueError(f"exact must be one of {_EXACT_MODES}, got {exact!r}")
     # exact= and stats=('p_exact',) are two doors to the same room: either one
@@ -3519,6 +3671,12 @@ def ld_matrix(
         raise ValueError(
             f"{want_phased} need TRUE phase, which a 2bit file does not carry. "
             f"Convert a phased VCF with cg.convert.vcf2cugenh().")
+    if enc == ENCODING_HAP2BIT and want_corrected:
+        raise ValueError(
+            f"{want_corrected} are defined on GENOTYPES -- Mangin et al. build "
+            f"the correction from a covariance matrix between individuals, and "
+            f"the kinship/structure matrices are indexed by individual, not by "
+            f"haplotype. Use a 2bit (dosage) file.")
     if enc != ENCODING_HAP2BIT and "p_exact" in stats:
         raise ValueError(
             "the exact conditional test conditions on the 2x2 HAPLOTYPE table, "
@@ -3598,6 +3756,15 @@ def ld_matrix(
     # D and D' need the 3x3 table; r-family statistics do not, and skipping it
     # avoids ~9x the memory traffic per tile.
     need_table = bool({"d", "dp"} & set(stats))
+    if want_corrected and use_gpu:
+        # The cost here is one n x n eigendecomposition plus a dense transform
+        # of the genotype matrix, neither of which the GPU scan is shaped for,
+        # and the paper's own scale is hundreds of individuals. Take the
+        # reference path and say so rather than pretending otherwise.
+        if verbose:
+            print(f"cugen.ld: {want_corrected} take the reference path "
+                  f"(dense sample-axis transform); backend={backend!r} ignored")
+        use_gpu = False
 
     use_tf32 = _resolve_precision(precision, int(reader.n_samples), verbose)
 
@@ -3727,6 +3894,23 @@ def ld_matrix(
             dos = _dosages_numpy(reader)[rows]
             tables = contingency_tables(dos, pairs_local)
             res = ld_from_counts(tables, dprime_method=dprime_method)
+            if want_corrected:
+                # Missing calls are mean-imputed here. The transform is a dense
+                # operation on the sample axis, so it cannot be done pairwise
+                # complete-case the way the counts above are; LDcorSV drops
+                # incomplete rows instead, which would change the sample set
+                # from pair to pair and with it the kinship matrix.
+                d = np.asarray(dos, dtype=np.float64)
+                miss = d == 3
+                if miss.any():
+                    mu = np.where(miss, np.nan, d)
+                    col = np.nanmean(mu, axis=1)
+                    d = np.where(miss, col[:, None], d)
+                for which in want_corrected:
+                    P = _corrected_transform(which, int(reader.n_samples),
+                                             kinship=kinship,
+                                             structure=structure)
+                    res[which] = _corrected_r2(d, pairs_local, P)
 
     # ---- orientation -----------------------------------------------------
     # Flipping BOTH variants leaves r unchanged; flipping exactly one negates
