@@ -2386,6 +2386,7 @@ def _r_only_result(r_arr, n_arr, reader, rows, pairs_local):
 
 
 def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
+                    count_only=False,
                     verbose=False, tf32=False, phased=False):
     """Fused scan: one kernel per tile, one output buffer, no per-tile sync.
 
@@ -2454,6 +2455,18 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
                     del S
         del bufA, bufB
         return out_i, out_j, out_r, int(counter[0])
+
+    # count_only: the kernel's atomicAdd is unconditional and it only writes
+    # when slot < capacity, so a zero-capacity run does every GEMM, writes
+    # nothing, and still counts exactly. That is the only way to measure
+    # genome-scale compute today -- chr22's full variant set alone emits
+    # 187,252,868 rows, and genome-wide extrapolates to ~630 GB of output
+    # arrays, far past both this buffer and the card.
+    if count_only:
+        _i, _j, _r, found = run(0)
+        del _i, _j, _r, packed
+        cp.get_default_memory_pool().free_all_blocks()
+        return int(found)
 
     # optimistic capacity, then one exact retry if it overflowed
     cap = min(int(200e6), max(1 << 20, p * (int(window) if window else 4096)))
@@ -2709,6 +2722,7 @@ def ld_matrix(
     precision: str = "auto",
     max_pairs: int = 100_000_000,
     device: int = 0,
+    count_only: bool = False,
     verbose: bool = True,
 ):
     """Pairwise LD (r, r^2, signed r^2, D, D') from a .cugen file.
@@ -2858,7 +2872,7 @@ def ld_matrix(
                              dtype=np.int64)
 
     n_pairs = _count_pairs(len(rows), positions, window, window_kb)
-    if n_pairs > max_pairs:
+    if n_pairs > max_pairs and not count_only:
         raise ValueError(
             f"plan would emit {n_pairs:,} pairs, above max_pairs={max_pairs:,}. "
             f"Narrow it with window= or window_kb=, raise min_r2, or raise "
@@ -2876,8 +2890,10 @@ def ld_matrix(
     # cuDF fast path: r-family stats only, and only when we are writing a file.
     # The survivors are already in device memory, so keeping them there and
     # letting cudf wrap them avoids a host round trip we would immediately undo.
-    on_device = (use_gpu and HAS_CUDF and not need_table
-                 and output is not None and annotation is None)
+    # The cuDF/output preconditions exist to avoid a host round trip when
+    # SERIALISING. count_only serialises nothing, so they do not apply.
+    on_device = (use_gpu and not need_table and annotation is None
+                 and (count_only or (HAS_CUDF and output is not None)))
     # The fused single-kernel scan handles the clean r-only case: no
     # missingness, no bp window, no D/D'. That is the hot path, and it is
     # where the device was sitting at 1-4% SM utilisation.
@@ -2888,8 +2904,25 @@ def ld_matrix(
     fused = (on_device and not reader.has_missing and window_kb is None
              and min_obs <= reader.n_samples and fused_ok_phased)
 
+    if count_only and not (use_gpu and fused):
+        raise ValueError(
+            "count_only needs the fused GPU scan, which is the only path with "
+            "a survivor counter. It is unavailable here because "
+            f"{'D/D-prime were requested' if need_table else ''}"
+            f"{'the file has missing calls' if reader.has_missing else ''}"
+            f"{'window_kb was set' if window_kb is not None else ''}"
+            f"{'no GPU is available' if not use_gpu else ''}"
+            f"{'an annotation was passed' if annotation is not None else ''}"
+            ". Returning a DataFrame instead of a count would be worse: the "
+            "caller would treat a frame as a number.")
+
     if use_gpu and fused:
         cp.cuda.Device(device).use()
+        if count_only:
+            return _scan_gpu_fused(reader, rows, window, min_r2,
+                                   tile_size=tile_size, verbose=verbose,
+                                   tf32=use_tf32, phased=bool(want_phased),
+                                   count_only=True)
         ii, jj, rr = _scan_gpu_fused(reader, rows, window, min_r2,
                                      tile_size=tile_size, verbose=verbose,
                                      tf32=use_tf32, phased=bool(want_phased))
