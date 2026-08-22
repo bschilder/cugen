@@ -2047,8 +2047,7 @@ def _plan_cand_tiles(cand, pos, span, max_cands, row_budget):
 
 
 def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
-                          tf32, verbose, cand_tile=256, nbr_tile=None,
-                          phased=False):
+                          tf32, verbose, cand_tile=256, nbr_tile=None):
     """Edges between index CANDIDATES and their kb windows. Device-resident.
 
     Complexity is O(n_candidates * window) rather than O(p * window), which is
