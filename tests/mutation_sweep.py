@@ -15,9 +15,20 @@ import shutil
 import subprocess
 import sys
 
-ROOT = pathlib.Path("/Users/bschilder/code/cugen")
+# Derived, not hardcoded: the sweep has to run wherever the GPU is, and an
+# absolute developer path made it unrunnable on a pod.
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 MUTATIONS = [
+    # ---- fine-mapping from a stored LD panel ----
+    ('from_ld accepts z and R of different lengths',
+     'cugen/_step5b_finemapping.py',
+     """    if z.size != R.shape[0]:""",
+     """    if False:""", "tests/test_finemap_from_ld.py"),
+    ('from_ld adds the ridge in place, mutating the caller\'s R',
+     'cugen/_step5b_finemapping.py',
+     """    R = R.astype(cp.float32, copy=True)""",
+     """    R = R.astype(cp.float32, copy=False)""", "tests/test_finemap_from_ld.py"),
     # ---- LD result storage (.cugenld) ----
     ('matrix output silently returns pairs', 'cugen/ld.py',
      """    if output_format == \"matrix\":""",
@@ -183,6 +194,10 @@ MUTATIONS = [
 # whole suite per mutation would be correct but slow; running one fixed file --
 # which this did, always tests/test_impute.py -- silently gives every mutation
 # outside that file a free pass. Both failure modes are worse than this.
+# The interpreter to test with: .venv locally, $CUGEN_PY where the venv lives
+# somewhere else (a pod mounts it outside the repo).
+PY = os.environ.get("CUGEN_PY", str(ROOT / ".venv/bin/python"))
+
 DEFAULT_TARGET = "tests/test_impute.py"
 
 
@@ -195,7 +210,7 @@ def run(target=DEFAULT_TARGET):
     # reports failures that are not in the working tree. That cost real
     # debugging time once; do not remove this.
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-    r = subprocess.run([".venv/bin/python", "-m", "pytest", target,
+    r = subprocess.run([PY, "-m", "pytest", target,
                         "-q", "--no-header", "-p", "no:cacheprovider"],
                        cwd=ROOT, capture_output=True, text=True, env=env)
     return (r.stdout + r.stderr).strip().splitlines()[-1]
