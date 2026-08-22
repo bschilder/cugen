@@ -1399,9 +1399,13 @@ def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
     _t_read = _time.perf_counter() - _t0_read
 
     # Per-variant moments once, streamed -- identical to the banded scan.
+    # Genotype-only on purpose: ns, _build_g and the kb-window logic below all
+    # assume dosages, so there is no phased variant of this scan to select.
+    # d5de783 copied a `if phased` branch in here from the fused scan, where
+    # `phased` is a parameter; here it is not bound, so every GPU rectangular
+    # clump raised NameError.
     _t0 = _time.perf_counter()
-    s_v, q_v = (_hap_moments(packed, p, ns, bpv) if phased
-                else _variant_moments(packed, p, ns, bpv))
+    s_v, q_v = _variant_moments(packed, p, ns, bpv)
     cp.cuda.Stream.null.synchronize()
     _t_mom = _time.perf_counter() - _t0
 
