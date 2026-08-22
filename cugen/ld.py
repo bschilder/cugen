@@ -1212,6 +1212,12 @@ def _write_df(df, path: str, *, params: Optional[dict] = None) -> None:
     chunk during a scan, where this writes a finished frame once.
     """
     from . import ldio                                       # noqa: PLC0415
+    # Everything routes through ldio, including text. The legacy path kept a
+    # separate cuDF branch with two defects from the same cause -- no feather
+    # case, so .feather got CSV written into it (visible as feather costing
+    # exactly as many bytes per pair as TSV, 77.57, which is how it was caught),
+    # and no compression= argument, so .tsv.gz got uncompressed bytes under a
+    # .gz name. Two writers meant two behaviours; there is now one.
     return ldio.write_ld(df, str(path), params=params)
 
 
@@ -3597,6 +3603,14 @@ def ld_matrix(
         raise ValueError(f"unknown stats {bad}; valid are {list(_STATS)}")
     if output_format not in ("pairs", "matrix"):
         raise ValueError(f"output_format must be 'pairs' or 'matrix', got {output_format!r}")
+    if output_format == "matrix" and (min_r2 > 0 or max_p is not None
+                                      or correction is not None):
+        raise ValueError(
+            "output_format='matrix' cannot be combined with a retention "
+            "threshold. A dense matrix built from a filtered scan would replace "
+            "every sub-threshold correlation with zero rather than its true "
+            "value, and nothing downstream could detect it. Drop min_r2/max_p/"
+            "correction, or use output_format='pairs'.")
     if dprime_method not in ("phased", "composite"):
         raise ValueError(f"dprime_method must be 'phased' or 'composite', got {dprime_method!r}")
     if sign_reference not in ("alt", "major"):
@@ -4023,4 +4037,59 @@ def ld_matrix(
         df.attrs["lambda_gc"] = lam
     if output is not None:
         _write_df(df, str(output), params=_ld_params)
+    if output_format == "matrix":
+        return _as_ld_matrix(df, reader, rows, gidx_all, maf_all, ann, stats,
+                             dprime_method, missing)
     return df
+
+
+def _as_ld_matrix(df, reader, rows, gidx_all, maf_all, ann, stats,
+                  dprime_method, missing) -> "LDMatrix":
+    """Scatter a pairs frame into the dense symmetric matrices of an LDMatrix.
+
+    LDMatrix was declared, exported, documented and validated, and never
+    constructed anywhere in the repo -- so output_format="matrix" silently
+    returned a pairs DataFrame. This is the missing half.
+
+    Only reachable with no retention threshold (checked in ld_matrix), because a
+    dense matrix assembled from a filtered scan would read as zero wherever the
+    filter bit rather than as the value that was there.
+    """
+    gidx = gidx_all[rows]
+    p = len(rows)
+    pos_of = {int(g): k for k, g in enumerate(gidx)}
+    ia = np.array([pos_of[int(g)] for g in df["gidx_a"]], dtype=np.int64)
+    ib = np.array([pos_of[int(g)] for g in df["gidx_b"]], dtype=np.int64)
+
+    def dense(col, diag):
+        if col not in df.columns:
+            return None
+        M = np.full((p, p), np.nan, dtype=np.float64)
+        v = df[col].to_numpy(np.float64)
+        M[ia, ib] = v
+        M[ib, ia] = v
+        np.fill_diagonal(M, diag)
+        return M
+
+    n_obs = np.full((p, p), float(reader.n_samples))
+    if "N_OBS" in df.columns:
+        n_obs[ia, ib] = df["N_OBS"].to_numpy(np.float64)
+        n_obs[ib, ia] = df["N_OBS"].to_numpy(np.float64)
+
+    chrom = np.zeros(p, dtype=np.int32)
+    posn = np.zeros(p, dtype=np.int64)
+    if ann is not None:
+        m = ann.set_index("gidx")
+        for k, g in enumerate(gidx):
+            if int(g) in m.index:
+                chrom[k] = int(m.at[int(g), "CHR"])
+                posn[k] = int(m.at[int(g), "POS"])
+
+    return LDMatrix(
+        r=dense("R", 1.0) if "R" in df.columns else dense("R_PHASED", 1.0),
+        r2=dense("R2", 1.0) if "R2" in df.columns else dense("R2_PHASED", 1.0),
+        r2_signed=dense("R2_SIGNED", 1.0),
+        d=dense("D", np.nan), d_prime=dense("DP", np.nan),
+        n_obs=n_obs, gidx=gidx, chrom=chrom, pos=posn,
+        maf=maf_all[rows], n_samples=int(reader.n_samples),
+        dprime_method=dprime_method, missing=missing)

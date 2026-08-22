@@ -911,3 +911,51 @@ def test_repeated_queries_do_not_reparse_every_shard_footer(tmp_path):
     np.testing.assert_array_equal(first[0], again[0])
     assert len(ds._cache) == n_cached, "the cache is not being reused"
     assert len(ds._cache) <= ds._cache_max
+
+
+# -------------------------------------------- loops opened earlier, now closed
+def test_gz_output_is_actually_compressed(tmp_path, small_cugen):
+    """The cuDF branch of the legacy writer never requested gzip, so a .tsv.gz
+    got uncompressed bytes under a .gz name. Detectable without a GPU by simply
+    asking whether the file is a gzip stream."""
+    import gzip
+    from cugen import ld as L
+    out = tmp_path / "ld.tsv.gz"
+    L.ld_matrix(small_cugen[0], stats=("r", "r2"), output=str(out),
+                backend="numpy", verbose=False)
+    assert out.read_bytes()[:2] == b"\x1f\x8b", "not a gzip stream"
+    with gzip.open(out, "rt") as f:
+        head = f.readline()
+    assert "gidx_a" in head.replace('"', "")
+
+
+def test_output_format_matrix_returns_an_LDMatrix(small_cugen):
+    """output_format="matrix" was validated and then ignored: LDMatrix was
+    declared, exported, documented, and never constructed anywhere in the repo,
+    so passing "matrix" silently returned a pairs DataFrame."""
+    from cugen import ld as L
+    path, dos = small_cugen
+    m = L.ld_matrix(path, stats=("r", "r2"), output_format="matrix",
+                    backend="numpy", verbose=False)
+    assert isinstance(m, L.LDMatrix), f"got {type(m).__name__}"
+    p = dos.shape[0]
+    assert m.r.shape == (p, p) and m.r2.shape == (p, p)
+    assert m.gidx.size == p and m.n_samples == dos.shape[1]
+
+    # unit diagonal, symmetric, and agreeing with the pairs path
+    np.testing.assert_allclose(np.diag(m.r), 1.0)
+    np.testing.assert_allclose(m.r, m.r.T, atol=1e-6)
+    df = L.ld_matrix(path, stats=("r",), backend="numpy", verbose=False)
+    pos = {int(g): k for k, g in enumerate(m.gidx)}
+    for a, b, r in zip(df["gidx_a"], df["gidx_b"], df["R"]):
+        assert abs(m.r[pos[int(a)], pos[int(b)]] - r) < 1e-6
+
+
+def test_matrix_output_refuses_a_threshold(small_cugen):
+    """A dense matrix built from a thresholded scan would silently replace every
+    sub-threshold correlation with zero rather than its true value -- the same
+    refusal LDReader.dense() makes, for the same reason."""
+    from cugen import ld as L
+    with pytest.raises(ValueError, match="matrix|threshold|min_r2"):
+        L.ld_matrix(small_cugen[0], stats=("r",), output_format="matrix",
+                    min_r2=0.2, backend="numpy", verbose=False)

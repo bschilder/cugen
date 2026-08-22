@@ -19,6 +19,12 @@ ROOT = pathlib.Path("/Users/bschilder/code/cugen")
 
 MUTATIONS = [
     # ---- LD result storage (.cugenld) ----
+    ('matrix output silently returns pairs', 'cugen/ld.py',
+     """    if output_format == \"matrix\":""",
+     """    if False:""", "tests/test_ldio.py"),
+    ('matrix output accepts a threshold', 'cugen/ld.py',
+     """    if output_format == \"matrix\" and (min_r2 > 0 or max_p is not None""",
+     """    if False and (min_r2 > 0 or max_p is not None""", "tests/test_ldio.py"),
     # Deliberately NOT included: replacing os.replace() with copy+remove.
     # Both complete identically in the absence of a crash, so it is an
     # equivalent mutant -- atomicity is only observable under fault
