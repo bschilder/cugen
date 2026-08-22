@@ -439,17 +439,21 @@ def _run_starts(a) -> np.ndarray:
 
 
 def _tier_of(r2, tiers) -> np.ndarray:
-    """Tier index per row, 0 = strongest. Vectorised over the whole flush.
+    """Tier index per row, 0 = strongest.
 
-    The alternative -- five boolean masks and fifteen fancy-indexed copies per
-    variant group -- measured 0.242 s at 8 M rows, 51% of all host write work
-    and by far the largest single term. One searchsorted plus one stable sort
-    replaces it, and the same two calls exist on a GPU.
+    Counts how many tier edges r^2 falls below, which is the tier index by
+    construction. With only a handful of tiers that beats a binary search
+    outright: np.searchsorted measured 0.208 s at 27.5 M rows against 0.041 s
+    here, 5.0x, for bit-identical output. searchsorted was 13% of all
+    serialisation time in a streamed write before this.
     """
-    edges = np.asarray(sorted(float(t) for t in tiers))      # ascending
-    # r2 in [edges[k], edges[k+1]) -> descending tier index
-    k = np.searchsorted(edges, np.asarray(r2), side="right") - 1
-    return (len(edges) - 1 - np.clip(k, 0, len(edges) - 1)).astype(np.int64)
+    a = np.asarray(r2)
+    edges = sorted((float(t) for t in tiers), reverse=True)
+    # descending edges, dropping the last (the open-ended floor)
+    out = np.zeros(a.shape, dtype=np.int64)
+    for e in edges[:-1]:
+        out += (a < e)
+    return out
 
 
 class LDShardWriter:

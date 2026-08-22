@@ -311,16 +311,18 @@ comparable with the A100 rows above; the ratios within this table are.
 
 | min_r2 | rows | parquet (#4) | `.cugenld` | size | vs parquet |
 |---:|---:|---:|---:|---:|---:|
-| 0.2 | 1,930,958 | 0.72 s | **0.40 s** | 22.6 -> **5.1 MB** | **1.81x** |
-| 0.05 | 27,541,325 | 5.52 s | **1.86 s** | 340.0 -> **55.4 MB** | **2.96x** |
+| 0.2 | 1,930,958 | 0.69 s | **0.38 s** | 22.7 -> **5.1 MB** | **1.82x** |
+| 0.05 | 27,541,325 | 5.16 s | **1.58 s** | 340.2 -> **55.4 MB** | **3.26x** |
 
 Progression of the writer changes at 27.5 M rows:
 
     masks + 15 gathers, np.unique, identity gather   2.23 s   (baseline)
     + per-group flatnonzero partition, _run_starts   2.06 s   1.08x
-    + no identity permutation gather                 1.86 s   1.20x total
+    + no identity permutation gather                 1.86 s   1.20x
+    + comparison-sum tier assignment                 1.58 s   1.41x total
 
-**The isolated host measurement said 1.66x; end to end it is 1.20x.** Scaling a
+**The isolated host measurement said 1.66x for the partition change alone; end
+to end that step was 1.08x.** Scaling a
 micro-benchmark by row count over-predicted, because the writer's host path is a
 smaller share of streaming time than that scaling assumed. Worth having, but the
 honest figure is the end-to-end one — and the larger half of it came from
@@ -330,8 +332,42 @@ That identity gather is worth naming: for presorted input `write_shard` built
 `np.arange(n)` and gathered all three arrays through it, copying ~216 MB per
 9 M-row flush to reorder nothing.
 
-Against the 0.25 s `count_only` scan floor, 1.61 s of the 1.86 s is still
-serialisation (87%). Where that goes is not yet itemised on this hardware.
+### Itemising the serialisation, and the one cheap thing in it
+
+`cProfile` on a streamed write of 27,541,325 rows (1.76 s wall, 0.28 s scan
+floor, 1.48 s serialisation), cumulative unless noted:
+
+    _scan_gpu_fused.run                 1.752 s   (tottime 0.339 s — tile loop)
+      on_flush -> write_shard           1.240 s
+        LDShardWriter.append            1.104 s
+          _flush                        1.091 s   (tottime 0.293 s)
+            _write_block                0.445 s
+              encode_block              0.383 s   (tottime 0.269 s)
+            _tier_of                    0.275 s   <- of which searchsorted 0.191 s
+            _run_starts                 0.061 s
+            flatnonzero                 0.060 s
+      cp.asnumpy (D2H)                  0.082 s
+      cp.lexsort                        0.053 s
+
+No single dominant term any more — it is spread across the flush body, the
+encode, and the tier assignment. But `_tier_of` stood out as pure waste:
+`np.searchsorted` does a binary search per element over **five** edges. Counting
+how many edges r² falls below is the same answer with four vectorised
+comparisons: **0.208 s -> 0.041 s at 27.5 M rows, 5.0x, bit-identical output.**
+
+Progression at 27.5 M rows, RTX 4090, median of 3:
+
+    masks + 15 gathers, np.unique, identity gather   2.23 s   (baseline)
+    + per-group flatnonzero partition, _run_starts   2.06 s   1.08x
+    + no identity permutation gather                 1.86 s   1.20x
+    + comparison-sum tier assignment                 1.58 s   1.41x total
+
+    vs #4's parquet streaming: 5.16 s -> 1.58 s, 3.26x, and 6.1x smaller
+
+1.32 s of the 1.58 s is still serialisation. What remains is genuinely
+distributed, so the next honest step is a bigger structural change (moving the
+tier assignment and packing onto the device, where r already lives) rather than
+another micro-fix.
 
 ### A measurement that had to be thrown away
 
