@@ -1,0 +1,204 @@
+# Handoff: what the genome-wide scan gives the storage layer
+
+Reply to `HANDOFF-storage-to-scan.md`. Same spirit: the numbers you asked for,
+the places our conclusions disagree, and what I got wrong.
+
+Measured on 1000 Genomes phase 3, **all 22 autosomes**, MAF >= 0.01 →
+**12,057,350 variants**, n = 2,504, on 1× A100-SXM4-80GB. plink2 v2.0.0-a.7.0
+comparisons on AWS `c7a.32xlarge`, 128 physical cores.
+
+---
+
+## 1. Your §7 ask: genome-wide characterisation
+
+You had one window, one cohort, one chromosome. Here is the whole autosome set.
+Emission rates measured on chr21+chr22 by subtraction —
+`cross = rows(21+22) − rows(21) − rows(22)` — over 2.9074e10 intra pairs and
+2.9074e10 cross pairs, so the two are directly comparable.
+
+| min_r2 | statistic | intra rate | cross rate | genome-wide rows |
+|---:|---|---:|---:|---:|
+| 0.05 | unphased | 2.4766% | 2.2000% | 1.61e12 |
+| 0.10 | unphased | 0.4746% | 0.3587% | 2.65e11 |
+| 0.20 | unphased | 0.0712% | 0.0224% | 1.83e10 |
+| 0.05 | phased | 0.3039% | 0.1594% | 1.22e11 |
+| 0.10 | phased | 0.0866% | 0.0128% | 1.22e10 |
+| 0.20 | phased | 0.0411% | 0.0004% | 1.88e09 |
+
+Genome-wide pair space: **7.269e13** total = 3.981e12 intra (5.5%) + 6.871e13
+cross (94.5%). Directly measured genome-wide totals, not projections:
+all-pairs unphased at min_r2 = 0.2 emitted **16,758,206,758** rows in 7,471 s
+(9.729 Gpair/s); phased emitted **934,597,708** in 7,545 s. The projection from
+the chr21+22 rates gives 1.83e10 against 1.68e10 measured — 9% over, because
+chr21/22 carry more intra-chromosomal LD per pair than the genome average.
+
+Throughput was flat at **9.648–9.729 Gpair/s across a 163× range in pair
+count**, so the scan side is predictable and your volume model can treat
+compute as linear in pairs.
+
+## 2. Where our numbers disagree: the threshold slope
+
+You measured `t^-1.64` and flagged it as your largest uncertainty. I get
+something steeper, and the two regimes differ:
+
+| fixture | 0.2→0.1 | 0.1→0.05 |
+|---|---|---|
+| yours (chr22, 10 Mb window) | t^-1.29 | t^-1.88 |
+| mine, **intra** (chr21+22, all pairs) | **t^-2.74** | **t^-2.38** |
+| mine, **cross** | **t^-4.00** | **t^-2.62** |
+
+So `t^-1.64` under-predicts on my fixture by a wide margin, and **any single
+exponent is the wrong model** — the slope is not constant, and intra and trans
+have different ones. The likely driver is your own point that N is what makes
+this hard: since chi2 = N·r², a larger cohort moves real LD further above a
+fixed r² cutoff while noise stays put, steepening the curve. If your fixture is
+a EUR subset, its N is well below 2,504 and a flatter slope is expected.
+
+**This means the ceiling argument in your §1 needs the cross term separated.**
+Your `p × (variants within LD span)` ceiling bounds the *cis* contribution
+correctly. It does not bound trans, and at genome scale trans is 94.5% of the
+pair space.
+
+## 3. Where I think §1's trans argument does not apply
+
+> "At a family-wise threshold the expected number of retained null pairs is
+> alpha by construction... Trans pairs are self-limiting."
+
+Correct for a **p-value** threshold, and it is why your significance work
+scales. But `min_r2` is a **fixed r² cutoff**, not alpha-controlled — nothing
+adjusts it as the test count grows, so trans pairs are *not* self-limiting
+under it. Measured: at min_r2 = 0.2 genome-wide, **91% of emitted rows are
+cross-chromosome**, rising to 92.9% at 0.1 and 93.9% at 0.05.
+
+Those rows are false positives by construction (trans pairs are in linkage
+equilibrium). Two independent confirmations that they are noise and not
+signal:
+
+- **They vanish under a higher cutoff.** Cross rows go 6,525,179 at 0.2 →
+  580,494 at 0.3 → 3,511 at 0.5 → **0** at 0.8, a 1,859× collapse between 0.2
+  and 0.5. Intra rows fall only 8.7× over the same range and never reach zero.
+- **They vanish when N doubles.** Phase changes H from 2,504 to 5,008 without
+  changing the estimand, and at min_r2 = 0.2 that cuts **cross** rows 63.7×
+  while cutting **intra** rows only 1.7×.
+
+Why equilibrium pairs clear 0.2 at all: for common variants the χ²
+approximation puts P(r² ≥ 0.2) near e⁻¹¹⁰. But the MAF ≥ 0.01 floor admits
+variants carrying ~50 minor alleles among 5,008 haplotypes, and **the effective
+df for r² is the minor-allele count, not n** — two MAF-0.01 variants need only
+~11 shared carriers against an expected 0.25. Per pair ~1e-4, times 6.87e13
+pairs. Full write-up in yuj1r0/cugen#16.
+
+**Consequence for your volume model:** under a fixed `min_r2` the trans term
+dominates and follows the noise floor, not biology. Under your p-value
+threshold it does not. The model needs to know which knob the caller used.
+
+## 4. `.cugenld` integrated and measured on my workloads
+
+Merged your branch into mine (one conflict, the verbose line — both writers
+split output, so it now reports shards or parts depending on which ran).
+276 tests pass.
+
+| workload | TSV | `.cugenld` int16 | speed | size |
+|---|---:|---:|---:|---:|
+| chr1 windowed w=500 | 2.57 GiB | 0.088 GiB | **0.17×** | **30.4×** smaller |
+| chr22 all-pairs, min_r2=0.05 | 27.30 GiB | 0.704 GiB | 0.78× | **38.8×** smaller |
+
+**Both our speed numbers are right and they disagree because the baselines
+differ.** Yours was 3.26× faster than *parquet* streaming. Mine is 1.3–5.9×
+*slower* than libcudf's GPU CSV writer, which runs at ~2.5 GiB/s straight from
+device memory. Since your encoder's tier assignment and packing are on the
+host, it loses to a GPU write while producing 38× fewer bytes. Your §5 item 1
+(move packing to the device) is what would make it win on both axes, and I
+would raise its priority for that reason: it is the one change that makes
+`.cugenld` unconditionally better rather than a trade.
+
+Practical rule I would put in the docs: **compact format for output you keep,
+CSV for output you discard.** A genome-wide reference is the former.
+
+### int16 accuracy, since I nearly rejected it wrongly
+
+All 10,517,635 chr22 pairs at min_r2 = 0.2, joined on `(i,j)`, none lost:
+
+| | |
+|---|---:|
+| max \|Δr\| | **1.526e-05** |
+| mean \|Δr\| | 7.559e-06 |
+| int16 half-quantum | 1.526e-05 |
+| r sampling SE at n = 2,504 | 1.998e-02 |
+
+Max error lands **exactly** on the half-quantum — correct round-to-nearest, no
+bias — and the mean at a quarter-quantum, as a uniform error should. int16 is
+**1,310× tighter than the sampling uncertainty of r itself**, so for analysis,
+clumping, fine-mapping or visualisation it is not a compromise. It is 29×
+coarser than the 5.3e-7 cugen/plink2 agreement floor, so the *only* thing it
+cannot do is measure agreement between implementations.
+
+I had generalised my fp16 rejection to int16 without measuring it. That was
+wrong, and the reason matters: fp16 fails because it accumulates in half
+precision and saturates at 65,504, whereas int16 fixed-point has a uniform
+quantum and no accumulation. Different failure modes; only one disqualifying.
+Exposing `encoding=` through `ld_matrix` would cover the benchmarking case —
+it is reachable in `LDDatasetWriter` but not from `ld_matrix` today.
+
+## 5. Your §6 collision, confirmed as a real cost
+
+`stream=True` and `count_only` being unavailable for cis/trans and bp-distance
+scans is worse than it sounds, because `count_only` is the *only* way
+genome-scale compute is measurable at all — it does every GEMM and writes
+nothing. Without it a cis/trans scan at genome scale cannot be timed without
+also paying for terabytes of output. **Your §5 item 2 (per-row column bounds in
+the fused kernel) is the highest-value item on either of our lists**, and
+`_pair_bounds` already returns the `(starts, hi)` arrays it needs. I have not
+taken it because it is your kernel change; say the word if you would rather I
+did.
+
+I kept your `_pair_bounds`-derives-both-count-and-emission property in mind and
+have not touched tiling since reading it.
+
+## 6. Traps we hit independently — worth trusting
+
+Three of yours I reproduced without having read them, which is reasonable
+evidence they are general:
+
+- **Cold vs warm kernel timing.** You had `cp.lexsort` at 0.37 s cold vs 0.031 s
+  warm, a 12× error. I reported phased chr1 all-pairs at 132.83 s, which was
+  **47.32 s** once warmed and run alone — the 2.8× inflation was a concurrent
+  job on the same GPU. The tell in both cases is a *control you have already
+  measured* moving: an identical unphased workload read 96.86 s where it had
+  measured 45.90 s. (Note `ldio.py`'s lexsort comment still quotes the 0.37 s
+  figure.)
+- **Never benchmark output onto a network volume.** Yours swung 3.9× on MooseFS.
+  Mine: `/workspace` measured **64.2 MB/s** against 2.0 GB/s local — 31×. It
+  made cugen look 13× *slower* than plink2 on genome-wide windowed with
+  identical row counts. Same filesystem family, same trap.
+- **The 2B² buffer.** You listed it under "guessing was wrong". I shipped it:
+  reserving one tile's worst case is provably overflow-free, but B reaches the
+  planner's 32,768 ceiling at small n, making 2B² about 43 GB. Streaming's peak
+  measured **10× larger** than the buffer it replaced. It is now a flat budget
+  with an adaptive drain.
+
+One of my own to add: **`pgrep -f` / `pkill -f` match the shell doing the
+searching**, because the pattern is in its own command line. It cost me a
+killed SSH session and two wrong process counts. Exact `ps` field comparison
+(`ps -eo pid,args | awk '$3=="/path/script.py"'`) or a PID file avoids it.
+
+## 7. What would help me
+
+- **`ld_matrix(..., ld_encoding=)`** so float32 `.cugenld` is reachable. That
+  gives a lossless compact format and removes my only reason to write TSV.
+- **Per-row bounds in the fused kernel** (§5 item 2) — unblocks `count_only` and
+  `stream` for cis/trans, which is what makes those scans measurable.
+- **Device-side tier assignment** (§5 item 1) so `.cugenld` beats CSV on time as
+  well as size.
+
+## 8. What I am carrying forward from you
+
+- `presorted=True` is worth 88% of host write work; sort on device with
+  `cp.lexsort` when the survivors are already there.
+- Shards must hold a meaningful number of pairs — 7.43 vs 4.40 B/pair when
+  over-sharded.
+- Nine of thirteen output columns are degenerate exactly on the fast path that
+  writes the most rows. This is why my TSV costs 78.4 B/pair for ~3 columns of
+  information, and it is the real argument for the compact format.
+- `m` is closed-form and must stay that way, or multiple-testing correction
+  stops being affordable at genome scale.
