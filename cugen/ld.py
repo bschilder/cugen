@@ -132,6 +132,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, Union
@@ -567,11 +568,27 @@ class _ChunkWriter:
             self._pq.write_table(tbl)
         else:
             sep = "\t" if self.path.endswith((".tsv", ".tsv.gz")) else ","
-            pdf = df.to_pandas() if hasattr(df, "to_pandas") else df
-            pdf.to_csv(self.path, sep=sep, index=False,
-                       header=(self.rows == 0),
-                       mode="w" if self.rows == 0 else "a",
-                       compression="gzip" if self.path.endswith(".gz") else None)
+            gz = self.path.endswith(".gz")
+            if hasattr(df, "to_pandas") and not gz:
+                # Keep libcudf's writer in the loop. Going through
+                # to_pandas().to_csv() per chunk cost 62.9 s to serialise
+                # 10,517,635 rows against 2.4 s for the whole buffered run --
+                # 26x, which would have made every streamed timing a
+                # measurement of pandas rather than of cugen. libcudf cannot
+                # append, so it writes a part file and the bytes are
+                # concatenated.
+                part = f"{self.path}.part"
+                df.to_csv(part, index=False, sep=sep, header=(self.rows == 0))
+                with open(part, "rb") as src, \
+                        open(self.path, "wb" if self.rows == 0 else "ab") as dst:
+                    shutil.copyfileobj(src, dst, 1 << 22)
+                os.remove(part)
+            else:
+                pdf = df.to_pandas() if hasattr(df, "to_pandas") else df
+                pdf.to_csv(self.path, sep=sep, index=False,
+                           header=(self.rows == 0),
+                           mode="w" if self.rows == 0 else "a",
+                           compression="gzip" if gz else None)
         self.rows += len(df)
 
     def close(self) -> None:
