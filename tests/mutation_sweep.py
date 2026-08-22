@@ -42,7 +42,7 @@ MUTATIONS = [
      """            if not (sh[\"min_i\"] <= v <= sh[\"max_i\"]):""",
      """            if False:""", "tests/test_ldio.py"),
     ('block pair cap is ignored', 'cugen/ldio.py',
-     """                if ti.size > self.max_block_pairs:""",
+     """                if m > self.max_block_pairs:""",
      """                if False:""", "tests/test_ldio.py"),
     ('r quantisation truncates instead of rounding', 'cugen/ldio.py',
      """    return np.clip(np.rint(a * scale), -lim, lim).astype(_ENC_DTYPE[encoding])""",
