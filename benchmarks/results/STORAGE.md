@@ -258,15 +258,47 @@ nvCOMP — a new dependency, plus a stream-compatibility risk for GPU-less reade
 Also measured, and also wrong: `argsort` on a packed `(i<<32)|j` key takes
 0.204 s against `lexsort`'s 0.031 s — **6.7x slower**, not faster.
 
-So the next target is to vectorise the block packing onto the device (segmented
-delta across row boundaries, quantise, build all block payloads in one pass, one
-D2H) and leave zstd on the host where it is already free. That addresses 72%
-rather than 1.7%, with no new dependency.
+### That profile was also wrong, and the gap is where the answer was
 
-One gap worth naming: scaling this profile to 27.5 M rows predicts ~1.0 s of
-serialisation against ~2.1 s measured, so roughly half is unaccounted for --
-likely `LDShardWriter._flush`'s `unique`/`concatenate`, the per-shard manifest
-rewrite, and file I/O. That should be located before optimising the visible half.
+The 0.207 s "host delta-pack + zstd" figure included an `np.sort` per block that
+the real path never performs — the data arrives presorted. Re-measuring the
+actual `encode_block` loop: **0.036 s**, not 0.207 s. So packing was never the
+target either, and the ~50% I had listed as unaccounted was in fact most of the
+cost. Itemised properly, at 8 M rows against a 0.472 s total:
+
+| stage | sec | % |
+|---|---:|---:|
+| **tier partition** — r² + 5 masks + 15 fancy-indexed copies per group | **0.242** | **51%** |
+| per-block `np.unique` (called again inside `_write_block`) | 0.066 | 14% |
+| `encode_block` loop | 0.025 | 5% |
+| outer `np.unique` | 0.020 | 4% |
+| footer JSON | 0.012 | 2.5% |
+| zstd | 0.002 | 0.4% |
+
+### What fixed it, and three things that did not
+
+The partition needed one permutation per group rather than five masks and fifteen
+gathers. Four candidates, measured at 8 M rows:
+
+    masks + 15 gathers (the original)              0.246 s
+    one global stable argsort over the flush       0.396 s   <- shipped, then reverted
+    per-group stable argsort, 3 gathers            0.350 s
+    per-group flatnonzero perm, 3 gathers          0.103 s   <- kept
+
+A full `argsort` of 8 M int64 costs more than the twenty linear passes it
+replaces, so **both sort-based forms are slower than doing nothing** — the
+global-argsort version shipped briefly and made the writer 0.80x before the
+measurement caught it. `flatnonzero` returns ascending indices, so the (i, j)
+order inside each tier survives without any sort.
+
+`np.unique(a, return_index=True)` also sorts internally, which is wasted on
+already-sorted input; an O(n) run-start scan replaced it in both call sites.
+
+**Result: 0.472 s -> 0.285 s, 1.66x, 28.1 M rows/s**, byte-identical output.
+
+Guessing where the time goes has now been wrong four times in this file: the
+`2B²` buffer, block size vs indexing, zstd vs packing, and packing vs
+partitioning. Every fix was cheap once measured.
 
 The lesson generalises past this format: at these row counts any per-row host
 work is the bottleneck, and the useful question is always which one -- guessing
