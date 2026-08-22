@@ -27,8 +27,22 @@ def _fixture(write_cugen_file, n=300, p=900, seed=21):
     return write_cugen_file(simulate_haplotypes(n, p, seed=seed))
 
 
+def _parts(path):
+    """Streamed output is multi-part once it exceeds one flush.
+
+    libcudf cannot append to a file. Writing a part and concatenating it cost
+    3.4x the write itself (0.729 s vs 0.214 s per 8.4M-row flush) because it
+    triples the disk I/O -- write, read, rewrite. os.sendfile only recovered
+    1.06x of that, confirming the cost is I/O rather than user-space copying.
+    So each flush writes its own file, as plink2 does with .vcor1/.vcor2.
+    """
+    import glob
+    return [path] + sorted(glob.glob(f"{path}.[0-9][0-9][0-9]"))
+
+
 def _rows(path):
-    df = pd.read_csv(path, sep="\t")
+    df = pd.concat([pd.read_csv(f, sep="\t") for f in _parts(path)],
+                   ignore_index=True)
     key = [c for c in ("gidx_a", "gidx_b") if c in df.columns]
     return df.sort_values(key).reset_index(drop=True), key
 
@@ -138,3 +152,50 @@ def test_stream_requires_an_output_path(tmp_path, write_cugen_file):
         L.ld_matrix(path, min_r2=0.2, stats=("r", "r2"),
                     sign_reference="major", output=None, stream=True,
                     max_pairs=10 ** 12, verbose=False)
+
+
+@requires_gpu
+@requires_cudf
+def test_streamed_output_is_multipart_and_each_part_is_readable(
+        tmp_path, write_cugen_file):
+    """Each flush must be its own file, with its own header.
+
+    Concatenating parts into one file triples the disk I/O for no benefit;
+    measured, it was 3.4x the cost of the write. Every part therefore carries a
+    header so it can be read on its own.
+    """
+    path = _fixture(write_cugen_file)
+    out = tmp_path / "multi.tsv"
+    n = L.ld_matrix(path, min_r2=0.05, stats=("r", "r2"),
+                    sign_reference="major", output=str(out), stream=True,
+                    flush_rows=1 << 15, tile_size=TILE,
+                    max_pairs=10 ** 12, verbose=False)
+    parts = _parts(str(out))
+    assert len(parts) > 1, f"{n:,} rows landed in a single file: {parts}"
+    total = 0
+    for f in parts:
+        d = pd.read_csv(f, sep="\t")
+        assert "R" in d.columns, f"{f} has no header"
+        assert len(d) > 0
+        total += len(d)
+    assert total == n, f"parts hold {total} rows, count said {n}"
+
+
+@requires_gpu
+@requires_cudf
+def test_single_flush_output_stays_one_unsuffixed_file(
+        tmp_path, write_cugen_file):
+    """A result that fits in one flush must not gain a .001 suffix.
+
+    Multi-part is for large output; the common case has to keep single-file
+    semantics or every downstream reader breaks for no reason.
+    """
+    import glob
+    path = _fixture(write_cugen_file, p=300, seed=31)
+    out = tmp_path / "one.tsv"
+    n = L.ld_matrix(path, min_r2=0.2, stats=("r", "r2"),
+                    sign_reference="major", output=str(out), stream=True,
+                    max_pairs=10 ** 12, verbose=False)
+    assert n > 0
+    assert out.exists()
+    assert glob.glob(f"{out}.[0-9][0-9][0-9]") == [], "single flush was split"

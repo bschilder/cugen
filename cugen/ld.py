@@ -542,53 +542,56 @@ def _empty_pairs(stats: Sequence[str]) -> pd.DataFrame:
 
 
 class _ChunkWriter:
-    """Appends successive frames to one output file.
+    """Writes each streamed flush as its own file.
 
-    Streaming exists because the result does not fit in device memory; it
-    must not then be accumulated in host memory either, so each chunk is
-    written and dropped. Parquet gets one row group per flush via
-    ParquetWriter, which keeps the file open and the schema fixed.
+    Streaming exists because the result does not fit in device memory; it must
+    not then be accumulated in host memory either, so each chunk is written and
+    dropped. libcudf cannot append to a file, and the obvious workaround --
+    write a part, concatenate, delete -- triples the disk I/O. Measured on one
+    8.4M-row flush (0.54 GiB):
+
+        to_csv(final) directly            0.214 s   2.51 GiB/s
+        to_csv(part) + copyfileobj        0.729 s   0.74 GiB/s   3.41x
+        to_csv(part) + os.sendfile        0.687 s   0.78 GiB/s   3.21x
+
+    os.sendfile recovering only 1.06x confirms the cost is the extra write and
+    read, not user-space copying, so no copy strategy can fix it. Each flush
+    therefore writes its own file -- the same convention plink2 uses for
+    .vcor1/.vcor2 -- and every part carries a header so it can be read alone.
+
+    The first flush writes ``path`` unsuffixed, so a result that fits in one
+    flush is a single file exactly as before; only larger output is split.
     """
 
     def __init__(self, path: str):
         self.path = str(path)
         self.rows = 0
+        self.flushes = 0
+        self.parts: list = []
         self._pq = None
+
+    def _part_path(self) -> str:
+        return self.path if self.flushes == 0 else f"{self.path}.{self.flushes:03d}"
 
     def write(self, df) -> None:
         if len(df) == 0:
             return
+        p = self._part_path()
         if self.path.endswith(".parquet"):
-            import pyarrow as pa
-            import pyarrow.parquet as pq
-            tbl = (df.to_arrow() if hasattr(df, "to_arrow")
-                   else pa.Table.from_pandas(df, preserve_index=False))
-            if self._pq is None:
-                self._pq = pq.ParquetWriter(self.path, tbl.schema)
-            self._pq.write_table(tbl)
+            # cuDF's own parquet writer, per part. Routing through
+            # to_arrow() + pyarrow.ParquetWriter to append row groups to one
+            # file measured 12.44 s against 1.54 s for the CSV path on the
+            # same 36,958,869 rows -- the arrow conversion dominates.
+            df.to_parquet(p, index=False)
+        elif self.path.endswith(".gz"):
+            sep = "\t" if ".tsv" in self.path else ","
+            pdf = df.to_pandas() if hasattr(df, "to_pandas") else df
+            pdf.to_csv(p, sep=sep, index=False, header=True, compression="gzip")
         else:
-            sep = "\t" if self.path.endswith((".tsv", ".tsv.gz")) else ","
-            gz = self.path.endswith(".gz")
-            if hasattr(df, "to_pandas") and not gz:
-                # Keep libcudf's writer in the loop. Going through
-                # to_pandas().to_csv() per chunk cost 62.9 s to serialise
-                # 10,517,635 rows against 2.4 s for the whole buffered run --
-                # 26x, which would have made every streamed timing a
-                # measurement of pandas rather than of cugen. libcudf cannot
-                # append, so it writes a part file and the bytes are
-                # concatenated.
-                part = f"{self.path}.part"
-                df.to_csv(part, index=False, sep=sep, header=(self.rows == 0))
-                with open(part, "rb") as src, \
-                        open(self.path, "wb" if self.rows == 0 else "ab") as dst:
-                    shutil.copyfileobj(src, dst, 1 << 22)
-                os.remove(part)
-            else:
-                pdf = df.to_pandas() if hasattr(df, "to_pandas") else df
-                pdf.to_csv(self.path, sep=sep, index=False,
-                           header=(self.rows == 0),
-                           mode="w" if self.rows == 0 else "a",
-                           compression="gzip" if gz else None)
+            sep = "\t" if self.path.endswith(".tsv") else ","
+            df.to_csv(p, index=False, sep=sep, header=True)
+        self.parts.append(p)
+        self.flushes += 1
         self.rows += len(df)
 
     def close(self) -> None:
@@ -2482,8 +2485,9 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
 
     def run(capacity, on_flush=None, tile_max=0):
         """Scan every tile. With on_flush, drain the buffer at tile
-        boundaries so it can never overflow; without it, fill one buffer."""
+        boundaries; without it, fill one buffer."""
         flushed = 0
+        hw = 0        # largest single-tile emission seen so far
         # Set the cuBLAS math mode ONCE for the whole scan. Doing it per GEMM
         # cost two cuBLAS calls per tile, which showed up as TF32 being
         # *slower* than fp32 at large n where tiles are many.
@@ -2518,7 +2522,16 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
                     held = 0
                     if on_flush is not None:
                         held = int(counter[0])
-                        if held > capacity // 2:
+                        # Drain only when the NEXT tile might not fit, using
+                        # the largest emission seen so far as the estimate.
+                        # Draining at half capacity doubled the flush count,
+                        # and each flush costs an _assemble_device plus a file
+                        # open: 9 flushes vs 5 was 0.5 s on chr1 windowed.
+                        # An under-estimate is cheap -- the exact single-tile
+                        # epilogue retry below catches it without redoing the
+                        # GEMM -- so the headroom can be adaptive rather than
+                        # a fixed half.
+                        if held and held + max(2 * hw, 1 << 16) > capacity:
                             on_flush(out_i[:held], out_j[:held], out_r[:held])
                             flushed += held
                             counter.fill(0)
@@ -2531,6 +2544,7 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
                           out_i, out_j, out_r, counter, np.int64(capacity)))
                     if on_flush is not None:
                         after = int(counter[0])
+                        hw = max(hw, after - held)
                         if after > capacity:
                             # This tile alone overflowed a half-empty buffer.
                             # atomicAdd is unconditional, so `after` is exact
@@ -2577,7 +2591,11 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
         # Sized from a memory budget, NOT from B: 8.4e6 rows is ~168 MB at
         # 20 B/row and is independent of both p and the tile size. An
         # oversized tile is handled by the exact epilogue retry above.
-        cap = max(1 << 16, int(flush_rows) if flush_rows else (1 << 23))
+        # 1<<24 rows is ~336 MB at 20 B/row -- a fixed cost independent of p
+        # and of the result size. 1<<23 measured 4.35 s on chr1 windowed
+        # against 3.91 s at 1<<24; past that the curve flattens (3.79 s at
+        # 1<<25) and the memory is not worth it.
+        cap = max(1 << 16, int(flush_rows) if flush_rows else (1 << 24))
         _a, _b, _c, total = run(cap, on_flush=on_flush, tile_max=0)
         del packed
         cp.get_default_memory_pool().free_all_blocks()
@@ -3083,7 +3101,9 @@ def ld_matrix(
             finally:
                 writer.close()
             if verbose:
-                print(f"cugen.ld: streamed {total:,} rows to {output}")
+                extra = (f" in {writer.flushes} parts" if writer.flushes > 1
+                         else "")
+                print(f"cugen.ld: streamed {total:,} rows to {output}{extra}")
             return int(total)
         ii, jj, rr = _scan_gpu_fused(reader, rows, window, min_r2,
                                      tile_size=tile_size, verbose=verbose,
