@@ -140,6 +140,50 @@ quantum and no accumulation. Different failure modes; only one disqualifying.
 Exposing `encoding=` through `ld_matrix` would cover the benchmarking case —
 it is reachable in `LDDatasetWriter` but not from `ld_matrix` today.
 
+## 4b. The size/speed frontier — and why your §5 item 1 wins outright
+
+One real flush (16,677,861 survivors from a chr1 windowed scan), every writer
+reachable today:
+
+| writer | time | B/pair | Mrow/s | vs CSV time | vs CSV size |
+|---|---:|---:|---:|---:|---:|
+| full 13-col CSV (today) | 0.399 s | 62.18 | 41.8 | 1.00x | 1.0x |
+| lean 3-col CSV | 0.158 s | 25.49 | 105.4 | 2.52x | 2.4x |
+| raw binary i64,i64,f32 | 0.273 s | 20.00 | 61.1 | 1.46x | 3.1x |
+| **raw binary i32,i32,f32** | **0.072 s** | **12.00** | **231.8** | **5.55x** | **5.2x** |
+| raw i32,i32 + GPU int16 r | 0.071 s | 10.00 | 233.6 | 5.59x | 6.2x |
+| `.cugenld` int16 (host enc) | 2.447 s | 2.64 | 6.8 | 0.16x | 23.5x |
+
+Two things fall out.
+
+**There is a strict Pareto win sitting unclaimed.** Raw binary with int32
+indices is 5.55x faster *and* 5.2x smaller than what cugen writes today, and
+lossless -- p < 2^31 always, and f32 is exactly what the kernel produces. No
+new algorithm, just not formatting to text and not storing a 12M-variant index
+in 64 bits.
+
+**The raw path is bandwidth-bound, so on it bytes ARE time.** i64 at 20 B/pair
+gives 1.46x; i32 at 12 B/pair gives 5.55x. Halving the index width bought 3.8x
+time for a 1.67x byte reduction, which only happens if D2H plus disk is the
+limit (~2.8 GB/s here).
+
+That inverts the conclusion about `.cugenld`. At 2.64 B/pair it should be the
+**fastest** writer, not the slowest: 44 MB at 2.8 GB/s is **0.016 s**, against
+CSV's 0.399 s. It measures 2.447 s, so **99.4% of it is host encoding rather
+than I/O**. Device-side tier assignment and packing would make `.cugenld`
+roughly **8-25x faster than CSV while staying 23.5x smaller** -- not a
+compromise between our two designs, but strictly better than both.
+
+So I would move your §5 item 1 to the top. The 3.26x you measured against
+parquet is a floor on what it is worth, not a ceiling: against the GPU CSV
+writer the same change is worth an order of magnitude, because it converts a
+host-bound encoder into a bandwidth-bound one at 1/24th the bytes.
+
+Meanwhile the cheap intermediate is worth taking: **9 of 13 columns are
+degenerate exactly on the fast path** (your finding), and dropping them is
+2.52x faster and 2.4x smaller with no format change and no precision question.
+A `cols=` selector, as plink2 has, keeps it opt-in.
+
 ## 5. Your §6 collision, confirmed as a real cost
 
 `stream=True` and `count_only` being unavailable for cis/trans and bp-distance
