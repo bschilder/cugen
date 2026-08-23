@@ -163,7 +163,32 @@ DEFAULT_TIERS = (0.8, 0.5, 0.2, 0.05, 0.0)
 # seekable, so a single-variant lookup pays for the whole block it lands in: at
 # block_variants=4096 on real chr22 a block held 2.5 M pairs and variant() cost
 # 360 ms. Capping pairs bounds that cost directly.
-MAX_BLOCK_PAIRS = 1 << 16
+#
+# The cap is a WRITE-versus-QUERY trade, and both sides are now measured. Real
+# chr22, 51,100 variants x 3,202 samples, all pairs at min_r2 = 0.05
+# (12.7 M rows), RTX 4090, output on local disk:
+#
+#   max_block_pairs   write   B/pair   blocks   variant()   above(r2>=0.8)
+#            65,536   1.83 s   2.011      458     1.68 ms         12.8 ms
+#           262,144   1.31 s   1.957      162     3.21 ms         13.0 ms
+#         1,048,576   1.17 s   1.944       89     7.95 ms         12.6 ms
+#         4,194,304   1.13 s   1.944       73    23.83 ms         12.7 ms
+#
+# 262,144 is the knee: it takes 86% of the available write win (1.40x of 1.62x)
+# and 82% of the byte win, for 1.9x on a point lookup. Past it the write curve
+# flattens while the lookup cost accelerates -- 4.7x then 14.2x -- because a
+# lookup decompresses whole blocks and nothing else about it changes. Raising
+# the cap to 4 M would undo the fix this constant exists for.
+#
+# Two things the sweep settled that guessing had not:
+#   * `above()` is FLAT across the whole range. The zone map is unharmed by
+#     coarser blocks because blocks are cut by r^2 TIER as well as position, so
+#     value homogeneity rather than block size is what makes the skip work.
+#   * The write win is 1.62x, not the 2.1x an ascending single pass showed. The
+#     first row of such a pass pays CUDA kernel compilation: the same
+#     configuration measured 12.90 s cold and 1.83 s warm, a 7.0x artifact.
+#     Ascending and descending orders then agree within 1.04x.
+MAX_BLOCK_PAIRS = 1 << 18
 
 
 def _check_encoding(encoding: str) -> str:
@@ -526,23 +551,54 @@ def encode_block_gpu(j, r, *, encoding: str = DEFAULT_ENCODING,
         if ja.size > 1:
             d[1:] = cp.diff(ja)
         d[rs] = 0                                # reset at each row start
-        # One transfer for every index-side scalar. Reading d.min(), d.max()
-        # and ja[0] separately is three device syncs per block, and a shard is
-        # hundreds of blocks -- that was 27% of the write before batching.
+        # ONE transfer for every scalar this block needs, index-side and
+        # value-side together. This is a SIMPLIFICATION, not a speedup, and the
+        # distinction is the interesting part.
+        #
+        # In isolation a reduce-and-sync costs ~0.44 ms and is flat across a 16x
+        # block-size range (0.434 ms at 65,536 pairs, 0.438 ms at 1,048,576) --
+        # latency, not bandwidth. Multiplying that by two syncs per block
+        # predicted ~17% of append_gpu at 94 blocks and ~29% at the old cap.
+        # An interleaved A/B against the two-sync shape, 7 reps each, measured
+        # the real effect at 1.001x on min and 1.003x on median against a
+        # 1.04-1.10x noise floor. Nothing.
+        #
+        # The prediction failed because an isolated sync measures a serialised
+        # round trip with nothing else in flight, while here there is always
+        # queued per-pair work to hide it behind. A sync's latency is not its
+        # cost in a pipeline. What remains in append_gpu is per-PAIR and
+        # bandwidth-bound -- quantise, diff, the three tier gathers, the D2H of
+        # the payload -- so the lever is fewer passes over the pair arrays, not
+        # fewer launches.
+        #
+        # Kept anyway: one transfer and one code path beats two of each at
+        # identical output and identical speed.
+        #
+        # float64 holds all five exactly: gaps and indices are far below 2^53,
+        # and int16/int8/float32 quantised values widen to float64 losslessly --
+        # which is what keeps the output byte-identical (tests/test_ldio_gpu.py).
         # min() also replaces (d < 0).any(): a negative gap is exactly min < 0.
-        idx_stats = cp.asnumpy(cp.stack([d.min(), d.max(), ja[0]]))
-        if int(idx_stats[0]) < 0:
+        five = cp.empty(5, dtype=cp.float64)
+        five[0] = d.min()
+        five[1] = d.max()
+        five[2] = ja[0]
+        five[3] = q.min()
+        five[4] = q.max()
+        sv = cp.asnumpy(five)
+        if int(sv[0]) < 0:
             raise ValueError(
                 "partner indices must ascend within each row variant; a "
                 "negative gap means the block was not sorted by (i, j)")
         firsts = ja[rs]
-        gap = int(idx_stats[1])
-        first_val = int(idx_stats[2])
+        gap = int(sv[1])
+        first_val = int(sv[2])
+        _qlo, _qhi = sv[3], sv[4]
     else:
         d = cp.zeros(0, dtype=cp.int64)
         firsts = cp.zeros(0, dtype=cp.int64)
         gap = 0
         first_val = 0
+        _qlo = _qhi = None
 
     width = next((w for w in (1, 2, 4)
                   if gap <= np.iinfo(_DELTA_DTYPE[w]).max), 8)
@@ -589,10 +645,15 @@ def encode_block_gpu(j, r, *, encoding: str = DEFAULT_ENCODING,
     # monotone, so min/max commute with it exactly, and
     # max|r| = max(|min q|, |max q|) / scale -- identical bytes, one array less
     # and one transfer instead of three.
-    if q.size:
+    if q.size and _qlo is not None:
+        # Already on the host from the single transfer above; no second sync.
+        min_r = float(dequantize_r(_qlo, encoding))
+        max_r = float(dequantize_r(_qhi, encoding))
+        max_abs_r = float(max(abs(min_r), abs(max_r)))
+    elif q.size:
         qs = cp.asnumpy(cp.stack([q.min(), q.max()]))
-        lo, hi = dequantize_r(qs[0], encoding), dequantize_r(qs[1], encoding)
-        min_r, max_r = float(lo), float(hi)
+        min_r = float(dequantize_r(qs[0], encoding))
+        max_r = float(dequantize_r(qs[1], encoding))
         max_abs_r = float(max(abs(min_r), abs(max_r)))
     else:
         min_r = max_r = max_abs_r = 0.0

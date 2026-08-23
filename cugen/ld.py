@@ -1348,7 +1348,8 @@ class _ChunkWriter:
             self._pq = None
 
 
-def _write_df(df, path: str, *, params: Optional[dict] = None) -> None:
+def _write_df(df, path: str, *, params: Optional[dict] = None,
+              encoding: str = "int16") -> None:
     """Write an LD result, delegating to cugen.ldio.
 
     One writer, so a format is added in one module rather than in branches
@@ -1362,7 +1363,7 @@ def _write_df(df, path: str, *, params: Optional[dict] = None) -> None:
     # exactly as many bytes per pair as TSV, 77.57, which is how it was caught),
     # and no compression= argument, so .tsv.gz got uncompressed bytes under a
     # .gz name. Two writers meant two behaviours; there is now one.
-    return ldio.write_ld(df, str(path), params=params)
+    return ldio.write_ld(df, str(path), params=params, encoding=encoding)
 
 
 def _write_df_legacy(df: pd.DataFrame, path: str) -> None:
@@ -2800,7 +2801,8 @@ void ld_epilogue_compact(
     const float  nsamp,
     const long long i0, const long long j0,
     const long long bi, const long long bj,
-    const long long window,            /* <= 0 means no index window   */
+    const long long* __restrict__ col_lo,  /* (p,) first legal column  */
+    const long long* __restrict__ col_hi,  /* (p,) exclusive bound     */
     const float min_r2,
     long long* __restrict__ out_i,
     long long* __restrict__ out_j,
@@ -2815,8 +2817,12 @@ void ld_epilogue_compact(
     long long b = t - a * bj;
     long long gi = i0 + a;
     long long gj = j0 + b;
-    if (gj <= gi) return;                      /* upper triangle only  */
-    if (window > 0 && (gj - gi) > window) return;
+    /* One range check for every test-space predicate. col_lo[i] is i+1 in the
+       unwindowed case, so the upper-triangle guard is not lost -- it is
+       expressed in the same array as window, window_kb, min_dist_kb,
+       max_dist_kb and cis/trans. These are the SAME arrays _count_pairs sums
+       to get m, so the emitted set cannot disagree with the test count. */
+    if (gj < col_lo[gi] || gj >= col_hi[gi]) return;
 
     double n  = (double)nsamp;
     double sa = (double)sA[a], sb = (double)sB[b];
@@ -3216,11 +3222,17 @@ def _r_only_result(r_arr, n_arr, reader, rows, pairs_local):
 
 def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
                     count_only=False, on_flush=None, flush_rows=None,
-                    verbose=False, tf32=False, phased=False):
+                    verbose=False, tf32=False, phased=False, bounds=None):
     """Fused scan: one kernel per tile, one output buffer, no per-tile sync.
 
-    Only for the clean r-only case (no missingness, no bp window). Everything
-    else falls back to _scan_gpu. Returns device arrays (idx_i, idx_j, r).
+    Only for the clean r-only case (no missingness). Everything else falls back
+    to _scan_gpu. Returns device arrays (idx_i, idx_j, r).
+
+    bounds is the (starts, hi) pair from _pair_bounds -- the same arrays
+    _count_pairs sums for m. The kernel takes them per row, so bp-distance and
+    cis/trans predicates reach this path instead of falling back; that is what
+    makes count_only and stream available for those scans, and count_only is
+    the only way to time a genome-scale run without writing its output.
     """
     # A phased file contributes 2 haplotype columns per sample; everything
     # downstream (tile planner, GEMM, epilogue) is a function of that width
@@ -3229,8 +3241,18 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
     build_plane = _build_h if phased else _build_g
     bpv = int(reader.bytes_per_variant)
     p = len(rows)
+    # Tile-size hint from the ACTUAL column span, not just an index window. A
+    # large B is actively harmful under a narrow band -- a tile evaluates
+    # B x (B + span) cells of which only B * span can survive -- and before
+    # this a bp window got no such benefit because the planner only saw the
+    # scalar 'window'.
+    _st, _hi = (bounds if bounds is not None
+                else _pair_bounds(len(rows), None, window, None))
+    _span = int(np.maximum(_hi - _st, 0).max()) if len(rows) else 0
+    _hint = window if window is not None else (
+        _span if _span and _span < len(rows) else None)
     B = int(tile_size) if tile_size else _tile_size_for(
-        ns, window=window, fused=True)
+        ns, window=_hint, fused=True)
     # Never size a tile larger than the problem. The planner bounds B by
     # MEMORY, not by p, so at p=4,000 with n=100,000 it happily picked
     # B=31,744 and then allocated a 31,744 x 100,000 plane buffer to hold
@@ -3247,6 +3269,8 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
     # bit-exact by accumulating in integers.
     s_v, q_v = (_hap_moments(packed, p, ns, bpv) if phased
                 else _variant_moments(packed, p, ns, bpv))
+    lo_d = cp.asarray(np.asarray(_st, dtype=np.int64))
+    hi_d = cp.asarray(np.asarray(_hi, dtype=np.int64))
 
     def run(capacity, on_flush=None, tile_max=0):
         """Scan every tile. With on_flush, drain the buffer at tile
@@ -3268,9 +3292,14 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
         with _Tf32(tf32):
             for i0 in range(0, p, B):
                 i1 = min(i0 + B, p)
-                hi = p if window is None else min(p, i1 - 1 + int(window) + 1)
+                # Widest column extent over this row block, and the first
+                # legal column, both from the same arrays the kernel checks.
+                # Skipping tiles below col_lo is what makes a long-range or
+                # trans scan cheap rather than merely correct.
+                hi = int(_hi[i0:i1].max())
+                j_lo = int(_st[i0:i1].min())
                 Ga = build_plane(packed, i0, i1, ns, bpv, out=bufA)
-                for j0 in range(i0, hi, B):
+                for j0 in range(max(i0, (j_lo // B) * B), hi, B):
                     j1 = min(j0 + B, hi)
                     if j0 == i0:
                         Gb = Ga
@@ -3305,7 +3334,7 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
                          (S, s_v[i0:i1], s_v[j0:j1], q_v[i0:i1], q_v[j0:j1],
                           np.float32(ns), np.int64(i0), np.int64(j0),
                           np.int64(bi), np.int64(bj),
-                          np.int64(window if window else 0), np.float32(min_r2),
+                          lo_d, hi_d, np.float32(min_r2),
                           out_i, out_j, out_r, counter, np.int64(capacity)))
                     if on_flush is not None:
                         after = int(counter[0])
@@ -3330,7 +3359,7 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
                                  (S, s_v[i0:i1], s_v[j0:j1], q_v[i0:i1],
                                   q_v[j0:j1], np.float32(ns), np.int64(i0),
                                   np.int64(j0), np.int64(bi), np.int64(bj),
-                                  np.int64(window if window else 0),
+                                  lo_d, hi_d,
                                   np.float32(min_r2), t_i, t_j, t_r, counter,
                                   np.int64(need)))
                             got = int(counter[0])
@@ -3663,6 +3692,7 @@ def ld_matrix(
     count_only: bool = False,
     stream: bool = False,
     flush_rows: Optional[int] = None,
+    ld_encoding: str = "int16",
     ld_block_variants: Optional[int] = None,
     ld_max_block_pairs: Optional[int] = None,
     verbose: bool = True,
@@ -3792,6 +3822,11 @@ def ld_matrix(
             f"(complete-case) is available.")
     if backend not in ("auto", "gpu", "numpy"):
         raise ValueError(f"backend must be 'auto', 'gpu' or 'numpy', got {backend!r}")
+    # Validate the value encoding HERE, not at the write. A genome-wide scan is
+    # hours of GPU time, and discovering a typo'd encoding after it is a
+    # uniquely annoying way to lose them.
+    from . import ldio as _ldio                              # noqa: PLC0415
+    _ldio._check_encoding(ld_encoding)
     if correction is not None and correction not in ("bonferroni", "fdr"):
         raise ValueError(
             f"correction must be None, 'bonferroni' or 'fdr', got {correction!r}")
@@ -4036,8 +4071,22 @@ def ld_matrix(
     # gammaln, so keeping the survivors on the device would buy nothing and
     # would leave a second implementation of the same test to keep in step.
     # Under exact='auto' the loop runs on a small subset by construction.
+    # An annotation blocks the device path only when the OUTPUT would carry
+    # annotation-derived columns, which is not the same as an annotation being
+    # PRESENT. The device epilogue emits (i, j, r) and writes CHR/POS/ID as
+    # placeholders, so joining them has to happen on the host -- but:
+    #   * count_only serialises nothing, so there is nothing to join;
+    #   * .cugenld stores only (i, j, r), with per-variant metadata living once
+    #     in varmeta rather than once per pair.
+    # In both cases the annotation is being used for the TEST SPACE -- positions
+    # for bp distance, chromosomes for cis/trans -- and never for columns. That
+    # distinction is what lets those predicates reach the fused kernel, and
+    # without it `annotation is None` silently excluded every scan that needs
+    # positions, i.e. exactly the ones count_only exists to make measurable.
+    _ann_for_output = (annotation is not None and not count_only
+                       and not (stream and str(output or "").endswith(".cugenld")))
     on_device = (use_gpu and not need_table and "p_exact" not in stats
-                 and not lambda_gc and annotation is None
+                 and not lambda_gc and not _ann_for_output
                  and (count_only or (HAS_CUDF and output is not None)))
     # The fused single-kernel scan handles the clean r-only case: no
     # missingness, no bp window, no D/D'. That is the hot path, and it is
@@ -4050,9 +4099,11 @@ def ld_matrix(
     # per-row bounds (bp distance, cis/trans) falls to the tiled path -- the
     # same way window_kb already does. Lifting this means giving the kernel the
     # starts/hi arrays; see the handoff note in benchmarks/results/STORAGE.md.
-    _needs_row_bounds = (window_kb is not None or min_dist_kb is not None
-                         or max_dist_kb is not None or scope != "all")
-    fused = (on_device and not reader.has_missing and not _needs_row_bounds
+    # No _needs_row_bounds exclusion any more: the fused kernel takes the
+    # per-row (col_lo, col_hi) arrays, so bp-distance and cis/trans scans reach
+    # this path and therefore reach stream= and count_only. count_only is the
+    # only way to time a genome-scale run without also paying for its output.
+    fused = (on_device and not reader.has_missing
              and min_obs <= reader.n_samples and fused_ok_phased)
 
     if stream and output is None:
@@ -4077,11 +4128,13 @@ def ld_matrix(
 
     if use_gpu and fused:
         cp.cuda.Device(device).use()
+        # The same bounds _count_pairs summed for m, handed to the kernel.
+        _bnd = _pair_bounds(len(rows), positions, window, window_kb, **_space)
         if count_only:
             return _scan_gpu_fused(reader, rows, window, min_r2,
                                    tile_size=tile_size, verbose=verbose,
                                    tf32=use_tf32, phased=bool(want_phased),
-                                   count_only=True)
+                                   count_only=True, bounds=_bnd)
         if stream:
             n_obs_s = (2 * int(reader.n_samples) if want_phased
                        else int(reader.n_samples))
@@ -4109,7 +4162,7 @@ def ld_matrix(
                 # since every block carries a footer entry. The cost is coarser
                 # zone-map skipping on read, so the defaults are left alone and
                 # the knobs are exposed instead.
-                _dsw_kw = {}
+                _dsw_kw = {"encoding": ld_encoding}
                 if ld_block_variants:
                     _dsw_kw["block_variants"] = int(ld_block_variants)
                 if ld_max_block_pairs:
@@ -4134,8 +4187,13 @@ def ld_matrix(
                     # Sort on the DEVICE. Profiling the host path at 8 M rows
                     # put np.lexsort at 2.03 s of 2.31 s total host work -- 88%,
                     # against 0.21 s for the delta+zstd encode. cp.lexsort does
-                    # the same sort in 0.37 s, and the D2H that follows is
+                    # the same sort in 0.031 s WARM, and the D2H that follows is
                     # 0.01 s because the payload is narrow.
+                    #
+                    # 0.031 s, not the 0.37 s an earlier version of this comment
+                    # claimed: that measurement was cold and included kernel
+                    # compilation, a 12x error. The tell for this class of
+                    # mistake is a control you have already measured moving.
                     o = cp.lexsort(cp.stack([g_j, g_i]))
                     # Device encode. write_shard() calls np.asarray on all
                     # three, forcing 24 B/pair (int64, int64, float64) to the
@@ -4162,7 +4220,7 @@ def ld_matrix(
                     reader, rows, window, min_r2, tile_size=tile_size,
                     verbose=verbose, tf32=use_tf32,
                     phased=bool(want_phased), on_flush=_flush,
-                    flush_rows=flush_rows)
+                    flush_rows=flush_rows, bounds=_bnd)
             finally:
                 if native:
                     dsw.mark_complete()
@@ -4181,7 +4239,8 @@ def ld_matrix(
             return int(total)
         ii, jj, rr = _scan_gpu_fused(reader, rows, window, min_r2,
                                      tile_size=tile_size, verbose=verbose,
-                                     tf32=use_tf32, phased=bool(want_phased))
+                                     tf32=use_tf32, phased=bool(want_phased),
+                                     bounds=_bnd)
         if ii.size == 0:
             return _empty_pairs(stats)
         pairs_local = cp.stack([ii, jj], axis=1)
@@ -4191,7 +4250,8 @@ def ld_matrix(
         df = _assemble_device(pairs_local, (rr, n_dev), reader, rows, stats,
                               sign_reference, path, verbose, n_planned=n_pairs)
         df = _apply_top_k(_apply_significance_filters(df, **_sig_kw), top_k)
-        _write_df(df, str(output), params=_ld_params)
+        _write_df(df, str(output), params=_ld_params,
+                  encoding=ld_encoding)
         if verbose:
             print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs "
                   f"planned, {len(df):,} emitted  (gpu, fused kernel)")
@@ -4210,7 +4270,8 @@ def ld_matrix(
             df = _assemble_device(pairs_local, payload, reader, rows, stats,
                                   sign_reference, path, verbose, n_planned=n_pairs)
             df = _apply_top_k(_apply_significance_filters(df, **_sig_kw), top_k)
-            _write_df(df, str(output), params=_ld_params)
+            _write_df(df, str(output), params=_ld_params,
+                  encoding=ld_encoding)
             if verbose:
                 print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs "
                       f"planned, {len(df):,} emitted  (gpu, cudf device write)")
@@ -4309,7 +4370,8 @@ def ld_matrix(
         # last, because iloc/astype/concat do not reliably carry attrs
         df.attrs["lambda_gc"] = lam
     if output is not None:
-        _write_df(df, str(output), params=_ld_params)
+        _write_df(df, str(output), params=_ld_params,
+                  encoding=ld_encoding)
     if output_format == "matrix":
         return _as_ld_matrix(df, reader, rows, gidx_all, maf_all, ann, stats,
                              dprime_method, missing)
