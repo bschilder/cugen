@@ -3663,6 +3663,8 @@ def ld_matrix(
     count_only: bool = False,
     stream: bool = False,
     flush_rows: Optional[int] = None,
+    ld_block_variants: Optional[int] = None,
+    ld_max_block_pairs: Optional[int] = None,
     verbose: bool = True,
 ):
     """Pairwise LD (r, r^2, signed r^2, D, D') from a .cugen file.
@@ -4094,7 +4096,26 @@ def ld_matrix(
                 # flushes land on tile boundaries, so each flush becomes one
                 # self-contained shard and nothing is ever accumulated.
                 from . import ldio                            # noqa: PLC0415
-                dsw = ldio.LDDatasetWriter(str(output), params=_ld_params)
+                # Block granularity dominates .cugenld write time, because
+                # the encoder pays a fixed cost per block. Measured on chr22
+                # all-pairs (368,376,042 rows), varying max_block_pairs only:
+                #     65,536  26.05 s  2.05 B/pair   (the default)
+                #  1,048,576  14.57 s  1.96 B/pair
+                #  4,194,304  12.37 s  1.95 B/pair
+                # and on chr1 windowed (36,958,869 rows), block_variants:
+                #      4,096   6.04 s  2.57 B/pair   (the default)
+                #     65,536   3.13 s  2.60 B/pair
+                # Bigger blocks are faster AND (for max_block_pairs) smaller,
+                # since every block carries a footer entry. The cost is coarser
+                # zone-map skipping on read, so the defaults are left alone and
+                # the knobs are exposed instead.
+                _dsw_kw = {}
+                if ld_block_variants:
+                    _dsw_kw["block_variants"] = int(ld_block_variants)
+                if ld_max_block_pairs:
+                    _dsw_kw["max_block_pairs"] = int(ld_max_block_pairs)
+                dsw = ldio.LDDatasetWriter(str(output), params=_ld_params,
+                                           **_dsw_kw)
                 _k = [0]
                 if sign_reference == "major":
                     af_dev = cp.asarray(
@@ -4116,9 +4137,13 @@ def ld_matrix(
                     # the same sort in 0.37 s, and the D2H that follows is
                     # 0.01 s because the payload is narrow.
                     o = cp.lexsort(cp.stack([g_j, g_i]))
-                    dsw.write_shard((_k[0], 0), cp.asnumpy(g_i[o]),
-                                    cp.asnumpy(g_j[o]), cp.asnumpy(r_d[o]),
-                                    presorted=True)
+                    # Device encode. write_shard() calls np.asarray on all
+                    # three, forcing 24 B/pair (int64, int64, float64) to the
+                    # host before any encoding, and then encodes there too.
+                    # write_shard_gpu keeps both on the device and moves only
+                    # the compressed blob -- byte-identical output, verified
+                    # against the host encoder in tests/test_ldio_gpu.py.
+                    dsw.write_shard_gpu((_k[0], 0), g_i[o], g_j[o], r_d[o])
                     _k[0] += 1
             else:
                 writer = _ChunkWriter(str(output))

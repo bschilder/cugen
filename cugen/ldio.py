@@ -418,6 +418,211 @@ def encode_block(j, r, *, encoding: str = DEFAULT_ENCODING,
     return bytes(comp), meta
 
 
+# ---------------------------------------------------------------------------
+# Device-side encoding.
+#
+# The host encoder is not slow because compact formats cost time -- it is slow
+# because it runs on the host. Measured on one real flush of 16,677,861
+# survivors: .cugenld holds 2.64 B/pair against 62.18 B/pair as CSV (23.5x
+# smaller) but takes 2.447 s against 0.399 s. Writing its 44 MB at the 2.8 GB/s
+# the raw device->disk path achieves would take 0.016 s, so 99.4% of that time
+# is encoding, not I/O.
+#
+# Every step except zstd is elementwise or a prefix operation over arrays that
+# are ALREADY on the device when a fused scan flushes: quantise, difference,
+# reset at row starts, pick a width, concatenate. Doing them here means one D2H
+# of ~2.6 B/pair instead of the host touching 20 B/pair. zstd stays on the host
+# deliberately: it measured 0.005 s of 0.287 s (1.7%), so moving it would buy
+# nothing and cost a dependency.
+#
+# The contract is byte-identical output, not merely equivalent output. The
+# format is already written and read in production, so anything else would fork
+# it; identical bytes mean the reader is untouched and the two encoders are
+# interchangeable per call.
+# ---------------------------------------------------------------------------
+def _run_starts_gpu(a):
+    """Device _run_starts. Indices where a SORTED array starts a new value."""
+    import cupy as cp                                        # noqa: PLC0415
+    if a.size == 0:
+        return cp.zeros(0, dtype=cp.int64)
+    return cp.concatenate(
+        (cp.zeros(1, dtype=cp.int64),
+         (cp.flatnonzero(a[1:] != a[:-1]) + 1).astype(cp.int64)))
+
+
+def _tier_of_gpu(r2, tiers):
+    """Device _tier_of. Counts tier edges r^2 falls below, as the host does.
+
+    Kept as a sum of comparisons rather than cp.searchsorted for the same
+    reason the host avoids np.searchsorted -- with a handful of edges the
+    comparisons win -- and, more importantly, because summing `<` in the same
+    order guarantees the same answer at an exact tier boundary.
+    """
+    import cupy as cp                                        # noqa: PLC0415
+    edges = sorted((float(t) for t in tiers), reverse=True)
+    out = cp.zeros(r2.shape, dtype=cp.int64)
+    for e in edges[:-1]:
+        out += (r2 < e)
+    return out
+
+
+_QUANT_KERNEL = {}
+
+
+def _quant_kernel(dtype_name: str):
+    """One fused pass for quantisation, cached per output width.
+
+    The composed form -- astype, multiply, rint, clip, astype -- is five full
+    passes over the block with four temporaries, and measured 4.30 s of the
+    12.67 s spent preparing blocks. CUDA's rint() rounds half to even exactly
+    as np.rint does, so fusing preserves the bytes.
+    """
+    import cupy as cp                                        # noqa: PLC0415
+    k = _QUANT_KERNEL.get(dtype_name)
+    if k is None:
+        k = cp.ElementwiseKernel(
+            f"float64 x, float64 scale, float64 lim", f"{dtype_name} y",
+            "double v = rint(x * scale);"
+            "v = v < -lim ? -lim : (v > lim ? lim : v);"
+            f"y = ({'short' if dtype_name == 'int16' else 'signed char'})v;",
+            f"cugen_quant_{dtype_name}")
+        _QUANT_KERNEL[dtype_name] = k
+    return k
+
+
+def quantize_r_gpu(r, encoding: str = DEFAULT_ENCODING):
+    """Device quantize_r. Same rounding and clipping as the host."""
+    import cupy as cp                                        # noqa: PLC0415
+    _check_encoding(encoding)
+    if encoding == "float32":
+        return r.astype(cp.float32)
+    scale = _ENC_SCALE[encoding]
+    lim = float(np.iinfo(_ENC_DTYPE[encoding]).max)
+    a = r if r.dtype == cp.float64 else r.astype(cp.float64)
+    out = cp.empty(a.shape, dtype=_ENC_DTYPE[encoding])
+    _quant_kernel(np.dtype(_ENC_DTYPE[encoding]).name)(a, scale, lim, out)
+    return out
+
+
+def encode_block_gpu(j, r, *, encoding: str = DEFAULT_ENCODING,
+                     payload: str = "banded", row_starts=None,
+                     n_deficit=None):
+    """encode_block for CuPy inputs. Byte-identical to the host version.
+
+    The whole raw buffer is assembled on the device and crosses PCIe once, as
+    bytes, so the host only ever sees the compressed-ready payload.
+    """
+    import cupy as cp                                        # noqa: PLC0415
+    import pyarrow as pa                                     # noqa: PLC0415
+
+    _check_encoding(encoding)
+    ja = cp.asarray(j, dtype=cp.int64)
+    q = quantize_r_gpu(cp.asarray(r), encoding)
+    rs = (cp.zeros(1, dtype=cp.int64) if row_starts is None
+          else cp.asarray(row_starts, dtype=cp.int64))
+    if ja.size and rs.size:
+        d = cp.empty(ja.size, dtype=cp.int64)
+        d[0] = 0
+        if ja.size > 1:
+            d[1:] = cp.diff(ja)
+        d[rs] = 0                                # reset at each row start
+        # One transfer for every index-side scalar. Reading d.min(), d.max()
+        # and ja[0] separately is three device syncs per block, and a shard is
+        # hundreds of blocks -- that was 27% of the write before batching.
+        # min() also replaces (d < 0).any(): a negative gap is exactly min < 0.
+        idx_stats = cp.asnumpy(cp.stack([d.min(), d.max(), ja[0]]))
+        if int(idx_stats[0]) < 0:
+            raise ValueError(
+                "partner indices must ascend within each row variant; a "
+                "negative gap means the block was not sorted by (i, j)")
+        firsts = ja[rs]
+        gap = int(idx_stats[1])
+        first_val = int(idx_stats[2])
+    else:
+        d = cp.zeros(0, dtype=cp.int64)
+        firsts = cp.zeros(0, dtype=cp.int64)
+        gap = 0
+        first_val = 0
+
+    width = next((w for w in (1, 2, 4)
+                  if gap <= np.iinfo(_DELTA_DTYPE[w]).max), 8)
+    if payload == "banded" and width == 8:
+        payload = "scatter"
+    if payload == "banded":
+        idx_parts = [d.astype(_DELTA_DTYPE[width]).view(cp.uint8),
+                     firsts.view(cp.uint8)]
+        first_len = int(firsts.nbytes)
+    else:
+        width, first_len = 8, 0
+        idx_parts = [ja.view(cp.uint8)]
+    idx_len = int(sum(int(p.size) for p in idx_parts))
+
+    n_width = 0
+    n_parts = []
+    if n_deficit is not None:
+        nd = cp.asarray(n_deficit, dtype=cp.int64).ravel()
+        if nd.size != ja.size:
+            raise ValueError(
+                f"n_deficit has {nd.size} entries but the block holds "
+                f"{ja.size} pairs")
+        if nd.size and int(nd.min()) < 0:
+            raise ValueError(
+                "n_deficit is negative, so n_obs exceeded n_samples; the "
+                "deficit encoding assumes n_obs <= n_samples")
+        mx = int(nd.max()) if nd.size else 0
+        n_width = next((w for w in (1, 2, 4)
+                        if mx <= np.iinfo(_DELTA_DTYPE[w]).max), 8)
+        if n_width == 8:
+            raise ValueError(
+                f"n deficit {mx} exceeds the 4-byte encoding; n_samples and "
+                f"n_obs are implausibly far apart")
+        n_parts = [nd.astype(_DELTA_DTYPE[n_width]).view(cp.uint8)]
+
+    # One contiguous device buffer, one transfer.
+    raw_d = cp.concatenate(idx_parts + [q.view(cp.uint8)] + n_parts)
+    raw = cp.asnumpy(raw_d).tobytes()
+    comp = pa.compress(raw, codec=_CODEC)
+
+    # Reduce over q, then dequantise three scalars on the host. Dequantising
+    # the whole block to float64 first allocated a second array the size of the
+    # block to produce three numbers. Division by a positive scale is
+    # monotone, so min/max commute with it exactly, and
+    # max|r| = max(|min q|, |max q|) / scale -- identical bytes, one array less
+    # and one transfer instead of three.
+    if q.size:
+        qs = cp.asnumpy(cp.stack([q.min(), q.max()]))
+        lo, hi = dequantize_r(qs[0], encoding), dequantize_r(qs[1], encoding)
+        min_r, max_r = float(lo), float(hi)
+        max_abs_r = float(max(abs(min_r), abs(max_r)))
+    else:
+        min_r = max_r = max_abs_r = 0.0
+    meta = {
+        "n_width": int(n_width),
+        "val_len": int(q.nbytes),
+        "n": int(ja.size),
+        "payload": payload,
+        "delta_width": int(width),
+        "first": first_val if ja.size else 0,
+        "raw_len": len(raw),
+        "idx_len": idx_len,
+        "first_len": int(first_len),
+        "comp_len": len(comp),
+        "min_r": min_r,
+        "max_r": max_r,
+        "max_abs_r": max_abs_r,
+    }
+    return bytes(comp), meta
+
+
+def dequantize_r_gpu(q, encoding: str = DEFAULT_ENCODING):
+    """Device dequantize_r."""
+    import cupy as cp                                        # noqa: PLC0415
+    _check_encoding(encoding)
+    if encoding == "float32":
+        return q.astype(cp.float64)
+    return q.astype(cp.float64) / _ENC_SCALE[encoding]
+
+
 def decode_block(blob: bytes, meta: dict, *,
                  encoding: str = DEFAULT_ENCODING, with_n: bool = False):
     """Inverse of encode_block. Raises on a truncated or corrupt blob.
@@ -760,6 +965,262 @@ class LDShardWriter:
                     row_counts=counts.astype(np.int64).tolist())
         self._blocks.append(meta)
         self.n_pairs += int(i.size)
+
+    def _write_blocks_gpu(self, blocks) -> None:
+        """Encode MANY blocks with two transfers total, not three per block.
+
+        The per-block form cost 4.9 ms a block regardless of size, and
+        max_block_pairs caps a block near 65 k pairs -- so a 368 M-row scan
+        became 5,701 blocks and 27.9 s, SLOWER than the host encoder it
+        replaced. The arithmetic was already on the device; the round trip was
+        not, and there were three of them per block.
+
+        Two passes, because a block's delta width depends on its own largest
+        gap and the width decides the byte layout:
+          1. deltas and quantised values for every block, with each block's
+             five scalars stacked -- ONE transfer for the whole shard.
+          2. every block's raw buffer built at its now-known width, all
+             concatenated -- ONE more transfer.
+        zstd stays per block on the host: it measured 1.7% of encode time, so
+        moving it would buy nothing and cost a dependency.
+        """
+        import cupy as cp                                    # noqa: PLC0415
+        import pyarrow as pa                                 # noqa: PLC0415
+        if not blocks:
+            return
+        enc = self.encoding
+        scale = _ENC_SCALE.get(enc)
+        prepped, scal = [], []
+        zero = cp.zeros((), dtype=cp.int64)
+        for (i, j, r, tier_lo, n) in blocks:
+            starts = _run_starts_gpu(i)
+            ja = j.astype(cp.int64)
+            q = quantize_r_gpu(r, enc)
+            d = cp.empty(ja.size, dtype=cp.int64)
+            d[0] = 0
+            if ja.size > 1:
+                d[1:] = cp.diff(ja)
+            d[starts] = 0
+            # Reduce on q itself. Widening the whole block to int64 just to
+            # take a min and a max was another full pass, 0.89 s across the
+            # shard set; casting the two scalars afterwards is free.
+            if enc != "float32":
+                qlo = q.min().astype(cp.int64)
+                qhi = q.max().astype(cp.int64)
+            else:
+                qlo = qhi = zero
+            scal.append(cp.stack([d.min(), d.max(), ja[0], qlo, qhi]))
+            prepped.append((i, ja, q, d, starts, tier_lo, n))
+        S = cp.asnumpy(cp.stack(scal))          # ONE transfer, whole shard
+
+        raws, metas = [], []
+        for k, (i, ja, q, d, starts, tier_lo, n) in enumerate(prepped):
+            dmin, gap, first_val = int(S[k, 0]), int(S[k, 1]), int(S[k, 2])
+            if dmin < 0:
+                raise ValueError(
+                    "partner indices must ascend within each row variant; a "
+                    "negative gap means the block was not sorted by (i, j)")
+            width = next((w for w in (1, 2, 4)
+                          if gap <= np.iinfo(_DELTA_DTYPE[w]).max), 8)
+            payload = "scatter" if width == 8 else "banded"
+            if payload == "banded":
+                firsts = ja[starts]
+                parts = [d.astype(_DELTA_DTYPE[width]).view(cp.uint8),
+                         firsts.view(cp.uint8)]
+                first_len = int(firsts.nbytes)
+            else:
+                width, first_len = 8, 0
+                parts = [ja.view(cp.uint8)]
+            idx_len = int(sum(int(p.size) for p in parts))
+            nd_parts, n_width = [], 0
+            if n is not None:
+                nd = (int(self.n_samples) - n.astype(cp.int64)).ravel()
+                mx = int(nd.max()) if nd.size else 0
+                n_width = next((w for w in (1, 2, 4)
+                                if mx <= np.iinfo(_DELTA_DTYPE[w]).max), 8)
+                if n_width == 8:
+                    raise ValueError(
+                        f"n deficit {mx} exceeds the 4-byte encoding")
+                nd_parts = [nd.astype(_DELTA_DTYPE[n_width]).view(cp.uint8)]
+            raws.append(cp.concatenate(parts + [q.view(cp.uint8)] + nd_parts))
+            if enc == "float32":
+                lo_v = float(cp.asnumpy(q.min())) if q.size else 0.0
+                hi_v = float(cp.asnumpy(q.max())) if q.size else 0.0
+            else:
+                lo_v = float(int(S[k, 3]) / scale)
+                hi_v = float(int(S[k, 4]) / scale)
+            # Key order matters: the footer is JSON, dicts preserve insertion
+            # order, so a different order is different bytes for identical
+            # content. raw_len and comp_len are placed here, not appended
+            # later, to match encode_block's literal exactly -- updating an
+            # existing key keeps its position. Getting this wrong left the
+            # payload byte-identical and the footer 1,955 bytes different.
+            metas.append(dict(
+                n_width=int(n_width), val_len=int(q.nbytes), n=int(ja.size),
+                payload=payload, delta_width=int(width),
+                first=first_val if ja.size else 0, raw_len=0,
+                idx_len=idx_len, first_len=first_len, comp_len=0,
+                min_r=lo_v if q.size else 0.0, max_r=hi_v if q.size else 0.0,
+                max_abs_r=float(max(abs(lo_v), abs(hi_v))) if q.size else 0.0,
+                _i=i, _starts=starts, _tier_lo=tier_lo))
+
+        lens = [int(rw.size) for rw in raws]
+        allbytes = cp.asnumpy(cp.concatenate(raws)).tobytes()   # ONE transfer
+
+        # The footer index, batched. Bringing row_variants/row_starts/row_counts
+        # over per block was three more transfers each, which is what made a
+        # 5,701-block shard set slower than the host encoder even after the
+        # payload was batched. Sizes are already known here -- pass 1's
+        # flatnonzero forced them -- so the whole index crosses in two
+        # transfers and is sliced on the host.
+        starts_all = cp.asnumpy(cp.concatenate([m["_starts"] for m in metas]))
+        uniq_all = cp.asnumpy(cp.concatenate(
+            [m["_i"][m["_starts"]] for m in metas]))
+        nrv = [int(m["_starts"].size) for m in metas]
+
+        pos = 0
+        rv_off = 0
+        for meta, ln, nv in zip(metas, lens, nrv):
+            raw = allbytes[pos:pos + ln]
+            pos += ln
+            comp = pa.compress(raw, codec=_CODEC)
+            meta.pop("_i")
+            meta.pop("_starts")
+            tier_lo = meta.pop("_tier_lo")
+            st = starts_all[rv_off:rv_off + nv].astype(np.int64)
+            uq = uniq_all[rv_off:rv_off + nv].astype(np.int64)
+            rv_off += nv
+            counts = np.diff(np.append(st, meta["n"]))
+            if meta["payload"] == "scatter":
+                self._payload_scatter += 1
+            else:
+                self._payload_banded += 1
+            off = self._f.tell()
+            self._f.write(bytes(comp))
+            meta.update(raw_len=ln, comp_len=len(comp), offset=off,
+                        tier_lo=float(tier_lo),
+                        row_variants=uq.tolist(),
+                        row_starts=st.tolist(),
+                        row_counts=counts.astype(np.int64).tolist())
+            self._blocks.append(meta)
+            self.n_pairs += int(meta["n"])
+
+    def _write_block_gpu(self, i, j, r, *, tier_lo: float, n=None) -> None:
+        """_write_block for device arrays. Same bytes, no host round trip.
+
+        Only the per-row-variant index (a few thousand entries per block) comes
+        back to the host, because it has to be JSON in the footer. The pairs
+        themselves -- the part that scales -- never leave the device except as
+        the compressed blob.
+        """
+        import cupy as cp                                    # noqa: PLC0415
+        starts = _run_starts_gpu(i)
+        uniq = i[starts]
+        counts = cp.diff(cp.append(starts, i.size))
+        deficit = None if n is None else (int(self.n_samples)
+                                          - n.astype(cp.int64))
+        blob, meta = encode_block_gpu(j, r, encoding=self.encoding,
+                                      row_starts=starts, n_deficit=deficit)
+        if meta["payload"] == "scatter":
+            self._payload_scatter += 1
+        else:
+            self._payload_banded += 1
+        off = self._f.tell()
+        self._f.write(blob)
+        meta.update(offset=off, tier_lo=float(tier_lo),
+                    row_variants=cp.asnumpy(uniq).astype(np.int64).tolist(),
+                    row_starts=cp.asnumpy(starts).astype(np.int64).tolist(),
+                    row_counts=cp.asnumpy(counts).astype(np.int64).tolist())
+        self._blocks.append(meta)
+        self.n_pairs += int(i.size)
+
+    def append_gpu(self, i, j, r, n=None) -> None:
+        """One shard's worth of survivors, straight from device arrays.
+
+        Assumes (i, j)-sorted input. Mirrors _flush exactly, including holding
+        back the highest row variant for close() to flush: that is what makes
+        the output byte-identical to the host writer rather than merely valid.
+        Emitting it here instead produced 15 blocks where the host produced 19
+        -- same bytes per block, different block boundaries -- because the host
+        splits the tail into its own group. The tail is one row variant's
+        partners, so staging it on the host costs a negligible copy.
+
+        Tiering matches _flush: per-group flatnonzero partition, one
+        permutation, three gathers.
+        """
+        import cupy as cp                                    # noqa: PLC0415
+        if i.size == 0:
+            return
+        if not (i.size == j.size == r.size):
+            raise ValueError(
+                f"append_gpu got {i.size} i, {j.size} j and {r.size} r values")
+        starts = _run_starts_gpu(i)
+        starts_h = cp.asnumpy(starts)
+        n_emit = int(starts.size) - 1            # hold back the last variant
+        if n_emit <= 0:                          # one variant: leave it all
+            self._buf_i = [cp.asnumpy(i)]
+            self._buf_j = [cp.asnumpy(j)]
+            self._buf_r = [cp.asnumpy(r)]
+            self._buf_n = [] if n is None else [cp.asnumpy(n)]
+            self._buf_rows = int(i.size)
+            self._block_lo = int(starts_h[0]) if starts_h.size else None
+            self._presorted = True
+            return
+        cut = int(starts_h[n_emit])
+        self._buf_i = [cp.asnumpy(i[cut:])]
+        self._buf_j = [cp.asnumpy(j[cut:])]
+        self._buf_r = [cp.asnumpy(r[cut:])]
+        self._buf_n = [] if n is None else [cp.asnumpy(n[cut:])]
+        self._buf_rows = int(i.size - cut)
+        self._block_lo = int(cp.asnumpy(i[cut:cut + 1])[0])
+        self._presorted = True
+        # Truncate to the emitted region, exactly as _flush does with
+        # i = i[:cut]. Leaving the full arrays here made the last group's end
+        # default to i.size, which re-emitted the tail that was just staged --
+        # 19 duplicate pairs, silently, with a readable file.
+        i, j = i[:cut], j[:cut]
+        r = r[:cut]
+        if n is not None:
+            n = n[:cut]
+        ntier = len(self.tiers)
+        tier_lo = sorted((float(t) for t in self.tiers), reverse=True)
+        pending = []            # every block, encoded in one batch
+        for lo in range(0, n_emit, self.block_variants):
+            hi = min(lo + self.block_variants, n_emit)
+            s0 = int(starts_h[lo])
+            s1 = int(starts_h[hi]) if hi < n_emit else int(i.size)  # == cut
+            if s1 <= s0:
+                continue
+            gi, gj, gr = i[s0:s1], j[s0:s1], r[s0:s1]
+            gn = None if n is None else n[s0:s1]
+            tl = _tier_of_gpu(gr * gr, self.tiers)
+            parts = [cp.flatnonzero(tl == k) for k in range(ntier)]
+            perm = cp.concatenate(parts) if ntier > 1 else parts[0]
+            pi, pj, pr = gi[perm], gj[perm], gr[perm]
+            pn = None if gn is None else gn[perm]
+            off = 0
+            for k, part in enumerate(parts):
+                m = int(part.size)
+                if m == 0:
+                    continue
+                ti, tj, tr = pi[off:off + m], pj[off:off + m], pr[off:off + m]
+                tn = None if pn is None else pn[off:off + m]
+                off += m
+                if m > self.max_block_pairs:
+                    rs = cp.asnumpy(_run_starts_gpu(ti))
+                    cutp = [0]
+                    for st in rs[1:]:
+                        if st - cutp[-1] >= self.max_block_pairs:
+                            cutp.append(int(st))
+                    cutp.append(m)
+                    for a, b in zip(cutp[:-1], cutp[1:]):
+                        if b > a:
+                            pending.append((
+                                ti[a:b], tj[a:b], tr[a:b], tier_lo[k],
+                                None if tn is None else tn[a:b]))
+                else:
+                    pending.append((ti, tj, tr, tier_lo[k], tn))
+        self._write_blocks_gpu(pending)
 
     def close(self) -> None:
         import json                                          # noqa: PLC0415
@@ -1301,6 +1762,44 @@ class LDDatasetWriter:
         self._flush_manifest()
 
     # -- writing ------------------------------------------------------------
+    def write_shard_gpu(self, key, i, j, r, n=None) -> str:
+        """write_shard for device arrays: nothing but the blob crosses PCIe.
+
+        write_shard() calls np.asarray on i, j and r, forcing 24 B/pair
+        (int64, int64, float64) to the host before any encoding happens -- on
+        top of the host doing the encode. This keeps both on the device.
+        """
+        import os                                            # noqa: PLC0415
+        import cupy as cp                                    # noqa: PLC0415
+
+        name = _shard_name(key)
+        final = os.path.join(self.path, name)
+        tmp = final + f".tmp{os.getpid()}"
+        ia = i.astype(cp.int64).ravel()
+        ja = j.astype(cp.int64).ravel()
+        ra = r.astype(cp.float64).ravel()
+        w = LDShardWriter(tmp, encoding=self.encoding,
+                          block_variants=self.block_variants,
+                          max_block_pairs=self.max_block_pairs,
+                          params=self.params, tiers=self.tiers,
+                          block_a=int(key[0]), block_b=int(key[1]))
+        w.append_gpu(ia, ja, ra, n=n)
+        w.close()
+        os.replace(tmp, final)
+        self._shards = [sh for sh in self._shards
+                        if tuple(sh["key"]) != tuple(key)]
+        self._shards.append({
+            "key": [int(key[0]), int(key[1])], "file": name,
+            "n_pairs": int(w.n_pairs),
+            "min_i": int(ia.min()) if ia.size else 0,
+            "max_i": int(ia.max()) if ia.size else -1,
+            "min_j": int(ja.min()) if ja.size else 0,
+            "max_j": int(ja.max()) if ja.size else -1,
+            "max_abs_r": float(cp.abs(ra).max()) if ra.size else 0.0,
+        })
+        self._flush_manifest()
+        return final
+
     def completed_shards(self):
         """Keys already durably written, so a resumed run can skip them."""
         return [tuple(sh["key"]) for sh in self._shards]
