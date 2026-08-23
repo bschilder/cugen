@@ -330,6 +330,17 @@ scan became **5,701 blocks**. Varying only that:
 | 1,048,576 | 14.57 s | 1.96 |
 | 4,194,304 | **12.37 s** | **1.95** |
 
+> **Storage-side note, added on closing §7.1.** If this sweep ran ascending in
+> one process without a discarded warm-up write, the 65,536 row is inflated and
+> the ratio here overstates the effect. On the chr22 fixture the identical
+> configuration measured **12.90 s cold and 1.83 s warm** — a 7.0× artifact
+> falling entirely on whichever setting is measured first. Warmed, and run in
+> both orders as a control, the same sweep gave **1.62×** end to end rather than
+> 2.1×, with ascending and descending agreeing within 1.04×. The *direction* and
+> the B/pair column both hold; only the magnitude moves. Worth re-running your
+> 368 M-row version with a warm-up, since it is the figure the reprioritisation
+> in §5 rests on.
+
 **Bigger blocks are faster *and* smaller**, because every block carries a footer
 entry with `row_variants`/`row_starts`/`row_counts`. That is the mirror image of
 your §4 trap #5 about over-*sharding*: over-*blocking* inverts the size win too,
@@ -391,29 +402,107 @@ your own §4 trap #1 corrects to 0.031 s warm.
 Ordered by value within each column. Nothing here is blocked on the other side
 except where it says so.
 
-### Yours (storage)
+### Yours (storage) — ALL FIVE CLOSED
 
-1. **Decide the block-granularity defaults.** Needs the read-side number I do
-   not have: how much a threshold or region query pays for coarser zone-map
-   skipping. Worth **2.1× on write and 5% on size** if the read cost is
-   tolerable, which makes it the highest-value item on either list. Note the
-   optimum is a peak — `block_variants=262,144` is worse than 65,536 on *both*
-   axes — so this wants a sweep, not a maximum.
-2. **Fuse pass1's remaining per-block work.** `run_starts`, `diff`, the five
-   scalar reductions and two `astype` calls are ~12 s of the encode, all
-   per-block. One or two kernels with a segmented reduction (atomicMin/Max over
-   a block-id array) would collapse it. This is the next real win after
-   granularity, and it is kernel writing rather than plumbing.
-3. **Per-row column bounds in the fused kernel** (your §5 item 2). Still the
-   thing that unblocks `stream=True` and `count_only` for cis/trans and
-   bp-distance scans, and `count_only` is the only way those are measurable at
-   genome scale without paying for terabytes of output. `_pair_bounds` already
-   returns the arrays.
-4. **Expose `encoding=` through `ld_matrix`.** `LDDatasetWriter` takes it;
-   `ld_matrix` does not, so float32 `.cugenld` is unreachable from the scan.
-   That is the lossless option, needed for cross-tool parity work where int16's
-   3.05e-5 quantum is 29× too coarse.
-5. Fix the stale `cp.lexsort` comment (0.37 s cold → 0.031 s warm).
+Done on this branch. Full reply, with every table, in
+`HANDOFF-storage-to-scan-2.md`; 498 tests pass on an RTX 4090 and `.cugenld`
+byte-identity is intact. Summary and the two corrections it forced:
+
+1. ~~**Decide the block-granularity defaults.**~~ **DONE — `MAX_BLOCK_PAIRS`
+   65,536 → 262,144.** The read-side number you were missing, real chr22,
+   12.7 M rows, output on local disk:
+
+   | `max_block_pairs` | write | B/pair | `variant()` | `above(r2>=0.8)` |
+   |---:|---:|---:|---:|---:|
+   | 65,536 *(was)* | 1.83 s | 2.011 | **1.68 ms** | 12.8 ms |
+   | **262,144** *(now)* | **1.31 s** | **1.957** | **3.21 ms** | 13.0 ms |
+   | 1,048,576 | 1.17 s | 1.944 | 7.95 ms | 12.6 ms |
+   | 4,194,304 | 1.13 s | 1.944 | **23.83 ms** | 12.7 ms |
+
+   262,144 is the knee: 86% of the write win and 82% of the byte win for 1.9× on
+   a point lookup. Past it the write curve flattens while lookup cost
+   accelerates to 14.2×, which walks back the fix the constant exists for
+   (`variant()` was 360 ms before the cap, 2.94 ms after).
+
+   **Two corrections to this item as written.** First, `above()` is *flat*
+   across the whole 64× range — coarser blocks do not hurt the zone map at all,
+   because blocks are cut by **r² tier** as well as by position, so value
+   homogeneity rather than block size is what makes the skip work. The read cost
+   is purely a point-lookup cost. Second, **the write win is 1.62×, not 2.1×**:
+   the first row of an ascending sweep pays CUDA kernel compilation, and the
+   identical configuration measured **12.90 s cold against 1.83 s warm**.
+   Warmed and run in both orders, ascending and descending agree within 1.04×.
+   That is trap #1 with a new face — it bites *inside a sweep*, penalising
+   whichever configuration is measured first.
+
+   `block_variants` left at 4,096: inert on an all-pairs fixture (2.011 B/pair
+   flat from 4,096 to 262,144) because the pair cap binds first. Your windowed
+   finding stands; it stays a knob because which one binds depends on the scan.
+
+2. ~~**Fuse pass1's remaining per-block work.**~~ **MEASURED, THEN DECLINED —
+   the named target is worth 1.001×.** Granularity had already taken half the
+   prize (`append_gpu` 1.183 s → 0.565 s on a 16.8 M-row flush, since every
+   term you listed scales with block count). For the rest: an isolated
+   reduce-and-sync costs ~0.44 ms and is *flat across a 16× block-size range*
+   (0.434 ms at 65,536 pairs, 0.438 ms at 1,048,576) — latency, not bandwidth —
+   so two per block at 94 blocks predicted ~17%. I merged the two syncs into one
+   and A/B'd it interleaved, 7 reps each:
+
+   | cap | one sync | two syncs | effect | noise floor |
+   |---|---|---|---|---|
+   | 65,536 | 0.771 s | 0.772 s | **1.001×** | 1.10× |
+   | 262,144 | 0.481 s | 0.484 s | **1.006×** | 1.09× |
+
+   **A sync's latency is not its cost in a pipeline.** An isolated sync measures
+   a serialised round trip with nothing else in flight; in the encoder there is
+   always queued per-pair work to hide it behind. Add that to your §3 list of
+   wrong guesses — it is a different failure mode from the four there, and it
+   makes microbenchmarks of latency-bound operations actively misleading.
+
+   So this item is **withdrawn in its current form**. What remains in
+   `append_gpu` is per-PAIR and bandwidth-bound, so the lever is fewer passes
+   over the pair arrays, not fewer launches — the tier partition
+   (one `flatnonzero` per tier per group plus three gathers, over 20 B/pair) is
+   the candidate. The sync merge is kept as a simplification, not a speedup, and
+   its comment says so.
+
+3. ~~**Per-row column bounds in the fused kernel.**~~ **DONE.** Two guards
+   collapse to one range check; `col_lo[i]` is `i+1` unwindowed so the
+   upper-triangle guard is not lost, and these are the same arrays
+   `_count_pairs` sums for `m`, so emission cannot disagree with the test count.
+   The tile loop now skips whole tiles below `col_lo.min()`, and the tile-size
+   planner takes its hint from the actual span rather than the scalar `window`,
+   so a bp-windowed scan finally gets narrow-band tile sizing.
+
+   **`_pair_bounds` was not the only blocker.** `on_device` was also gated on
+   `annotation is None` — and cis/trans *require* an annotation, so that clause
+   excluded exactly the scans `count_only` exists to make measurable. It also
+   contradicted the comment two lines above it, which says these conditions
+   apply because they change what is **serialised**. An annotation now blocks
+   the device path only when the *output* would carry annotation-derived
+   columns: never for `count_only`, never for `.cugenld`, which stores only
+   `(i, j, r)` with per-variant metadata in `varmeta`.
+
+   `stream=` and `count_only` verified against the numpy reference on `cis`,
+   `trans`, `max_dist_kb`, `min_dist_kb`, a two-sided band and `window_kb`.
+   `count_only` succeeding *is* the path assertion, since it raises rather than
+   falling back — no verbose-string matching. A control asserts the gate still
+   refuses D/D′, which genuinely cannot be fused.
+
+4. ~~**Expose `encoding=` through `ld_matrix`.**~~ **DONE — `ld_encoding=`,**
+   reaching both the streaming and non-streaming writers. float32 round-trips
+   **bit-exact** (asserted, not approximated). Validated up front next to the
+   `backend` check: a genome-wide scan is hours of GPU time, and finding a
+   typo'd encoding at the write is a bad way to lose them.
+
+5. ~~Fix the stale `cp.lexsort` comment.~~ **DONE** — it was in **`ld.py:4137`**,
+   not `ldio.py`, whose `append` docstring already said 0.031 s warm.
+
+**One item I deliberately did not take.** `ld_clump` converts a bp window into a
+*superset* index window, scans that, then post-filters by position — it prints
+the superset factor. With per-row bounds it could pass exact bounds and drop the
+post-filter, doing strictly less work. Left alone because it is your benchmark
+surface; the waste is now measurable rather than invisible.
 
 ### Mine (scan)
 
@@ -437,16 +526,52 @@ except where it says so.
    done, 22/22 in 1.51 h) and plink2's `inter-chr` chr1–22 rung — then tear down
    the two hosts.
 
-### Needs a joint decision
+### Needs a joint decision — both answered, one still open for objection
 
 - **Should `.cugenld` become the default `output=` format for genome-scale
-  runs?** It is now faster *and* 30–40× smaller, so the only argument for CSV is
-  that a human can read it. My inclination: keep CSV the default for small
-  output, switch above some row count, and say so in the docstring rather than
-  guessing silently.
-- **int16 vs float32 as the default encoding.** int16 is 1,310× tighter than the
-  sampling SE of r, so it is right for analysis, clumping, fine-mapping and
-  visualisation. It is 29× too coarse for measuring agreement between
-  implementations. Whichever way it defaults, the other needs to be one keyword
-  away and documented — silently quantising a parity benchmark is the failure
-  mode to avoid.
+  runs?** *Storage side: not yet, and not on a row count.* The case is strong —
+  faster and 30–40× smaller — but a default that flips at a threshold is a
+  default that surprises people, and `.cugenld` has a real read-side cost CSV
+  does not: streamed it is a *directory* with a manifest, and it needs cugen to
+  read at all. Proposal: keep the extension authoritative, and have the verbose
+  line **name the size a compact format would have saved** once a run writes
+  more than a few GB of text. That teaches the choice without taking it. If you
+  want a hard switch anyway, put it on **projected bytes** rather than rows —
+  `count_only` is exactly the projector, and bytes are what runs out. Say if you
+  disagree; this is the one item here still genuinely open.
+
+- **int16 vs float32 as the default encoding.** *Settled: int16 stays the
+  default, float32 is now one keyword away.* Your measurement decides it — max
+  |Δr| 1.526e-05 landing exactly on the half-quantum, 1,310× tighter than the
+  sampling SE of r at n = 2,504. The failure mode we both named was silently
+  quantising a parity benchmark; that is now expressible rather than absent
+  (`ld_encoding="float32"`, bit-exact), and the refusal message for an unknown
+  encoding explains why fp16 is deliberately not offered.
+
+---
+
+## Status of this handoff
+
+**Closed.** Storage items 1–5 are done or explicitly withdrawn with the
+measurement that withdrew them; both joint decisions are answered. Landed on
+`ld-integrate`, 498 tests passing on an RTX 4090, `.cugenld` byte-identity
+intact. Detail in `HANDOFF-storage-to-scan-2.md`.
+
+Scan-side items (§7 "Mine") are untouched and still yours. Two things to carry:
+
+- **`max_pairs` counts CANDIDATE pairs.** The granularity sweep tripped the 1e8
+  default at 1.3e9 candidates while emitting 1.3e7 rows. Your `max_output_gb`
+  item is right and the unit is the whole problem.
+- **A pre-existing intermittent failure, not from either side's new work.**
+  `tests/test_ld_corrected.py` (the Mangin r²ᵥ/r²ᵥₛ oracles) fails **~1 run in
+  12**, measured identically on `2fb76cc` and on the storage branch. Not test
+  ordering (no pytest plugins, and it fails running *first*), not LAPACK
+  threading (fails at `OMP_NUM_THREADS=1`), not the fixture. The magnitudes give
+  the mechanism: passing runs give worst |diff| **5.35e-09**, stable to three
+  digits across six reps; the failing run gives **3.624e-05**, 6,800× larger — a
+  *discrete jump*, not tolerance drift. That is an eigenvalue crossing the
+  pseudo-inverse cutoff in `_psd_pinv_and_sqrt`, so a component is kept on some
+  runs and dropped on others. Storage-side bug; the fix is a **relative** cutoff
+  scaled by the largest eigenvalue, which is a numerical-policy choice in shared
+  code and not one to make unilaterally mid-handoff. Independent of everything
+  above.
