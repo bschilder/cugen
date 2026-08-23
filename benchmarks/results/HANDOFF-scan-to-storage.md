@@ -385,3 +385,68 @@ only an `assert count == 1` caught it.
 
 Also: `ldio.py`'s lexsort comment still quotes `cp.lexsort` at 0.37 s, which
 your own §4 trap #1 corrects to 0.031 s warm.
+
+## 7. Next steps, with owners
+
+Ordered by value within each column. Nothing here is blocked on the other side
+except where it says so.
+
+### Yours (storage)
+
+1. **Decide the block-granularity defaults.** Needs the read-side number I do
+   not have: how much a threshold or region query pays for coarser zone-map
+   skipping. Worth **2.1× on write and 5% on size** if the read cost is
+   tolerable, which makes it the highest-value item on either list. Note the
+   optimum is a peak — `block_variants=262,144` is worse than 65,536 on *both*
+   axes — so this wants a sweep, not a maximum.
+2. **Fuse pass1's remaining per-block work.** `run_starts`, `diff`, the five
+   scalar reductions and two `astype` calls are ~12 s of the encode, all
+   per-block. One or two kernels with a segmented reduction (atomicMin/Max over
+   a block-id array) would collapse it. This is the next real win after
+   granularity, and it is kernel writing rather than plumbing.
+3. **Per-row column bounds in the fused kernel** (your §5 item 2). Still the
+   thing that unblocks `stream=True` and `count_only` for cis/trans and
+   bp-distance scans, and `count_only` is the only way those are measurable at
+   genome scale without paying for terabytes of output. `_pair_bounds` already
+   returns the arrays.
+4. **Expose `encoding=` through `ld_matrix`.** `LDDatasetWriter` takes it;
+   `ld_matrix` does not, so float32 `.cugenld` is unreachable from the scan.
+   That is the lossless option, needed for cross-tool parity work where int16's
+   3.05e-5 quantum is 29× too coarse.
+5. Fix the stale `cp.lexsort` comment (0.37 s cold → 0.031 s warm).
+
+### Mine (scan)
+
+1. **Re-run the genome-wide arms on `.cugenld` with tuned blocks.** My published
+   genome-wide numbers (yuj1r0/cugen#11) are all CSV-based, so every write-bound
+   figure in them is now pessimistic — including the 47.36 s windowed result
+   that reversed the plink2 comparison. This is the first thing I will do.
+2. **Re-price the storage projections in yuj1r0/cugen#16.** Already corrected
+   once from 78.4 to 2.05 B/pair; the tuned 1.95 B/pair moves them again, and
+   the genome-wide all-pairs figure at `min_r2=0.2` is now ~33 GB rather than
+   the 1.20 TB the issue originally claimed.
+3. **Drop tile-local `uint16` indices from bschilder/cugen#2.** It was worth
+   20 → 8 B/row against a CSV baseline. `.cugenld` already achieves 1.95 B/pair,
+   so the item is now nearly pointless — better to say so than leave it on a
+   plan.
+4. **`max_output_gb` replacing `max_pairs`.** Still valid: `max_pairs` counts
+   candidate pairs, which is why `genomewide.sh` passes `10**15`. Bytes are what
+   runs out, and with a 40× smaller format the right threshold is very
+   different.
+5. Finish the outstanding genome-wide measurements — qLD Arm A (preprocessing is
+   done, 22/22 in 1.51 h) and plink2's `inter-chr` chr1–22 rung — then tear down
+   the two hosts.
+
+### Needs a joint decision
+
+- **Should `.cugenld` become the default `output=` format for genome-scale
+  runs?** It is now faster *and* 30–40× smaller, so the only argument for CSV is
+  that a human can read it. My inclination: keep CSV the default for small
+  output, switch above some row count, and say so in the docstring rather than
+  guessing silently.
+- **int16 vs float32 as the default encoding.** int16 is 1,310× tighter than the
+  sampling SE of r, so it is right for analysis, clumping, fine-mapping and
+  visualisation. It is 29× too coarse for measuring agreement between
+  implementations. Whichever way it defaults, the other needs to be one keyword
+  away and documented — silently quantising a parity benchmark is the failure
+  mode to avoid.
