@@ -246,3 +246,142 @@ killed SSH session and two wrong process counts. Exact `ps` field comparison
   information, and it is the real argument for the compact format.
 - `m` is closed-form and must stay that way, or multiple-testing correction
   stops being affordable at genome scale.
+
+---
+
+# Update: device-side .cugenld encoding is in, and it is now both
+
+Your §5 item 1 asked for tier assignment and packing on the device. Done, plus
+the rest of the encoder, on branch `ld-integrate` (`f7cc862`). `.cugenld` is now
+**smaller *and* faster** than the GPU CSV writer, which it was not before.
+
+**But the win was not where either of us expected, and it changes one of your
+defaults.** Read §4 before §2 if you only read one part.
+
+## 1. What landed
+
+New in `ldio.py`, all device-side: `_run_starts_gpu`, `_tier_of_gpu`,
+`quantize_r_gpu` (one fused `ElementwiseKernel`), `encode_block_gpu`,
+`_write_blocks_gpu` (batched across blocks), `append_gpu`, and
+`LDDatasetWriter.write_shard_gpu`. `ld.py`'s native branch calls the last of
+those instead of `write_shard`, which was doing `np.asarray` on i, j and r --
+24 B/pair to the host before any encoding, on top of encoding there.
+
+zstd stays on the host, exactly as you argued: 1.7% of encode time, so moving it
+buys nothing and costs a dependency.
+
+**The contract is byte-identical output**, not equivalent output, because the
+format is already written and read in production. Verified across all three
+encodings, at shard level, and at two block sizes (`tests/test_ldio_gpu.py`,
+12 tests). 440 of 446 pass overall; the 6 failures are
+`test_ld_significance.py` needing `tests/data/ld_1kg_chr22_eur.cugen`, which I
+did not copy to the GPU box.
+
+## 2. Measured, against the multi-part CSV writer, both to local disk
+
+| chr22 all-pairs, min_r2=0.05, 368,376,042 rows | wall | B/pair | size |
+|---|---:|---:|---:|
+| csv | 15.70 s | 79.58 | 27.301 GiB |
+| **`.cugenld`, `max_block_pairs=4,194,304`** | **11.38 s** | **1.95** | **0.669 GiB** |
+| | **1.38× faster** | | **40.8× smaller** |
+
+| chr1 windowed w=500, 36,958,869 rows | wall | B/pair | size |
+|---|---:|---:|---:|
+| csv | 3.85 s | 78.07 | 2.687 GiB |
+| **`.cugenld`, `block_variants=65,536`** | **3.13 s** | **2.60** | **0.088 GiB** |
+| | **1.23× faster** | | **30.0× smaller** |
+
+## 3. Four wrong guesses, so you do not repeat them
+
+Every one looked obviously right. Recorded with numbers because the *pattern*
+matters more than any single result -- this is your §4 trap #3, and I walked
+into it three more times.
+
+| attempt | reasoning | result |
+|---|---|---|
+| batch the payload into one transfer per shard | "host encoder" implies PCIe round trips | 29.52 → 27.61 s |
+| batch the footer index too | three more transfers per block | 27.61 → 25.99 s |
+| fuse the quantiser | it made 5 full passes with 4 temporaries | 25.99 → **26.05 s**, nothing |
+| **raise block granularity** | — | 26.05 → **12.37 s** |
+
+The quantiser fusion is worth keeping on its own terms (CUDA's `rint()` rounds
+half to even exactly as `np.rint` does, so the bytes hold), but it bought
+nothing here.
+
+What finally worked was instrumenting the prep loop line by line, which showed
+the cost was **intrinsic per-block work, not transfers**:
+
+```
+pass1 total 12.67 s   quantize 4.30  run_starts 2.22  scalar_reductions 2.06
+                      diff 1.94  q_astype_i64 0.89  j_astype_i64 0.82
+                      scatter_reset 0.45
+```
+
+## 4. The finding that touches your defaults
+
+**The encoder pays a fixed cost per block, and the defaults produce a great
+many blocks.** `max_block_pairs` caps a block near 65 k pairs, so a 368 M-row
+scan became **5,701 blocks**. Varying only that:
+
+| `max_block_pairs` | wall | B/pair |
+|---:|---:|---:|
+| 65,536 (default) | 26.05 s | 2.05 |
+| 262,144 | 17.31 s | 1.97 |
+| 1,048,576 | 14.57 s | 1.96 |
+| 4,194,304 | **12.37 s** | **1.95** |
+
+**Bigger blocks are faster *and* smaller**, because every block carries a footer
+entry with `row_variants`/`row_starts`/`row_counts`. That is the mirror image of
+your §4 trap #5 about over-*sharding*: over-*blocking* inverts the size win too,
+by 5% here.
+
+The windowed regime binds on the other knob, because a row variant has only ~39
+partners so the pair cap never engages:
+
+| `block_variants` | wall | B/pair |
+|---:|---:|---:|
+| 4,096 (default) | 6.04 s | 2.57 |
+| 16,384 | 3.79 s | 2.57 |
+| 65,536 | **3.13 s** | 2.60 |
+| 262,144 | 3.29 s | 2.63 |
+
+Note 262,144 is *worse* on both axes -- this is a peak, not a plateau, so it
+wants choosing rather than maximising.
+
+**I did not change the defaults.** Larger blocks mean coarser zone-map skipping
+on read, and how much a threshold or region query pays for that is your call,
+not mine -- I have no read-side benchmark. `ld_matrix` gains
+`ld_block_variants` and `ld_max_block_pairs` so a writer can opt in meanwhile.
+If you have query numbers, this is worth a default change: 2.1× on write and 5%
+on size is a lot to leave on the floor.
+
+## 5. Reprioritisation I would suggest
+
+Your §5 ranked device-side packing first. Having done it: **block granularity
+was worth more than the device port** (2.1× vs the ~1.3× the port contributed
+once granularity was fixed). The port was still necessary -- without it the
+larger blocks would just make the host encoder slower -- but if you are choosing
+what to do next, the remaining per-block work in pass1 (`run_starts`, `diff`,
+the five scalar reductions, two `astype` calls) is ~12 s that could fuse into
+one or two kernels with a segmented reduction. That is the next real win, and it
+is a kernel-writing job rather than a plumbing one.
+
+## 6. One gotcha that cost me an hour
+
+Byte identity failed at first with the **payload byte-identical and the footer
+1,955 bytes different**. Cause: `dict(...)` insertion order. The footer is JSON,
+dicts preserve insertion order, so building the same keys in a different order
+is different bytes for identical content. `raw_len` and `comp_len` have to be
+placed in the literal where `encode_block` puts them, not appended by a later
+`update()` -- updating an existing key keeps its position.
+
+Two smaller ones: `_run_starts_gpu` uses `cp.flatnonzero`, whose output size is
+data-dependent, so it **synchronises** -- one per block, unavoidable without a
+composite-key rewrite. And `append_gpu` mirrors your `_flush` line for line
+(including holding back the highest row variant, which is what makes the
+blocking match), so **file-wide string anchors are ambiguous between them** --
+an unscoped edit patches the host path. My first attempt did exactly that and
+only an `assert count == 1` caught it.
+
+Also: `ldio.py`'s lexsort comment still quotes `cp.lexsort` at 0.37 s, which
+your own §4 trap #1 corrects to 0.031 s warm.
