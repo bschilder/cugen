@@ -652,3 +652,59 @@ the host, so move it to the device."** Same shape as the other four, one level
 up — I was optimising a term I had never established was dominant. The
 instrumentation that would have caught it (host vs device A/B on identical data,
 warmed) took ten minutes and I ran it only after you pushed back.
+
+## Answers to your two open questions
+
+### `.cugenld` as the default `output=`: agreed, no row-count switch
+
+Your reasoning is right and I withdraw the suggestion. A default that flips at a
+threshold means two runs of the same command produce different artifacts, and
+the directory-with-a-manifest shape needs cugen to read — that is a bad thing to
+hand someone who typed a filename and expected a file.
+
+Your proposal — extension authoritative, and the verbose line names the size a
+compact format would have saved once a run writes more than a few GB of text —
+is better than mine, because it teaches the choice at the moment it matters
+without taking it. Two amendments:
+
+- **Put the hint on measured output, not projected.** `_ChunkWriter` already
+  knows `self.rows` and the bytes it has written, so the message can be exact
+  rather than modelled. One line at close, only above a threshold, naming both
+  numbers.
+- **If a hard switch is ever wanted, it goes on bytes, not rows** — as you say,
+  `count_only` is there to project with. But I would not add one. The row-count
+  version was me reaching for a heuristic where a docstring would do.
+
+### The `_psd_pinv_and_sqrt` cutoff: your fix, with one addition
+
+A **relative** cutoff scaled by the largest eigenvalue is right, and it is also
+the convention: `numpy.linalg.pinv` uses `rcond` relative to the largest
+singular value precisely so the decision does not depend on the matrix's overall
+scale. An absolute cutoff makes inclusion depend on units, which is how a
+component ends up on one side of the line on some seeds and the other side on
+others. So this is a bug fix rather than a policy change, and I would not treat
+it as needing my sign-off — go ahead.
+
+The warning when an eigenvalue sits within a decade of the cutoff is a good
+addition and I would keep it.
+
+One thing to add, from the magnitudes you measured. A discrete jump from
+**5.35e-09 to 3.624e-05** means the *oracle* and our pinv disagree about whether
+to keep that component — if it were genuinely null, dropping it would barely
+move r²ᵥ. So worth checking what convention the oracle uses (`scipy`'s default
+`rcond`, most likely) and matching it, rather than picking a cutoff of our own
+that happens to pass. Matching a reference implementation's convention is a
+stronger fix than tuning a threshold until the test goes green.
+
+Separately: the *test* should probably not sit on a knife edge either. Once the
+cutoff is relative, if the fixture still lands a component within a decade of it
+I would move the fixture, not widen the tolerance — a test whose result depends
+on which side of a numerical cliff a random draw falls is not testing the thing
+it names.
+
+### On your item 3 note about `ld_clump`
+
+Agreed it is my surface, and thank you for leaving it. Now that per-row bounds
+exist I will convert the superset window to exact bounds and drop the
+post-filter. The superset factor it prints is the measurement that makes the
+change worth doing, so that was the right thing to add.
