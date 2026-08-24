@@ -4195,13 +4195,24 @@ def ld_matrix(
                     # compilation, a 12x error. The tell for this class of
                     # mistake is a control you have already measured moving.
                     o = cp.lexsort(cp.stack([g_j, g_i]))
-                    # Device encode. write_shard() calls np.asarray on all
-                    # three, forcing 24 B/pair (int64, int64, float64) to the
-                    # host before any encoding, and then encodes there too.
-                    # write_shard_gpu keeps both on the device and moves only
-                    # the compressed blob -- byte-identical output, verified
-                    # against the host encoder in tests/test_ldio_gpu.py.
-                    dsw.write_shard_gpu((_k[0], 0), g_i[o], g_j[o], r_d[o])
+                    # Host encode, deliberately. write_shard_gpu exists, is
+                    # byte-identical (tests/test_ldio_gpu.py) and keeps the
+                    # pairs on the device -- and it is SLOWER. Warmed,
+                    # alternated, 3 reps, on one real 16,677,861-row flush,
+                    # with the host path charged for the device->host copy it
+                    # really pays:
+                    #     host    1.156 s
+                    #     device  1.636 s   -> 0.71x
+                    # The encoder is bound by per-block host work (the footer
+                    # index, zstd, the Python loop), not by where the
+                    # arithmetic runs, so moving the arithmetic to the GPU adds
+                    # launch and transfer overhead without touching the
+                    # dominant term. My earlier 2.97x claim compared a cold
+                    # host run against a warm device one. Revisit only if the
+                    # per-block host work goes away.
+                    dsw.write_shard((_k[0], 0), cp.asnumpy(g_i[o]),
+                                    cp.asnumpy(g_j[o]), cp.asnumpy(r_d[o]),
+                                    presorted=True)
                     _k[0] += 1
             else:
                 writer = _ChunkWriter(str(output))

@@ -575,3 +575,80 @@ Scan-side items (§7 "Mine") are untouched and still yours. Two things to carry:
   scaled by the largest eigenvalue, which is a numerical-policy choice in shared
   code and not one to make unilaterally mid-handoff. Independent of everything
   above.
+
+---
+
+# Retraction: the device encoder is slower, and my "both" claim was an artifact
+
+Your cold-start finding applies to my headline numbers, and correcting for it
+reverses them. Everything in "Update: device-side .cugenld encoding is in, and
+it is now both" that claims a speed win is **withdrawn**. The size numbers hold.
+
+## What the controlled measurement says
+
+Warmed both writers before any timing, alternated rather than grouped, 3 reps,
+and repeated with the order reversed:
+
+| workload | csv (min) | `.cugenld` (min) | ratio | size |
+|---|---:|---:|---:|---:|
+| chr1 windowed w=500, 36.9 M rows | **2.47 s** | 4.61 s | **0.53×** | 30.4× smaller |
+| chr22 all-pairs min_r2=0.05, 368 M rows | **13.88 s** | 15.91 s | **0.87×** | 40.3× smaller |
+
+Both orders agree to within 0.03×, so this is not an ordering effect. **`.cugenld`
+is 1.15–1.9× slower than the GPU CSV writer**, not faster. My earlier claim of
+1.38× / 1.23× faster came from running csv first — so csv absorbed the scan's
+kernel compilation — with no warm-up and a single rep.
+
+## And the device port itself is a regression
+
+One real 16,677,861-row flush, same data to both encoders, warmed, alternated,
+3 reps, with the host path charged for the device→host copy the real pipeline
+pays:
+
+| encoder | min | median |
+|---|---:|---:|
+| host (`write_shard`) | **1.156 s** | 1.158 s |
+| device (`write_shard_gpu`) | 1.636 s | 1.668 s |
+| | **0.71×** | 0.69× |
+
+So the port is **1.41× slower**. My commit claimed 2.97× faster; that compared a
+cold host run against a later warm device run. `ld.py` is back on
+`write_shard`, with the numbers in a comment at the call site.
+
+## Why it was never going to work, which I should have checked first
+
+**The encoder is bound by per-block host work, not by where the arithmetic
+runs.** The footer index, zstd and the Python per-block loop dominate; the
+arithmetic I moved was a small share of a small share. Moving it to the GPU
+added launch and transfer overhead without touching the dominant term.
+
+That is your withdrawn item 2 generalised, and you got there with one A/B where
+I spent four attempts. It also explains why every transfer-shaped fix I tried
+was worthless (29.52 → 27.61 → 25.99 → 26.05 s) while your granularity change
+was worth 1.62×: **granularity reduces the number of times the dominant cost is
+paid, which is the only lever that was ever attached to it.**
+
+## What survives
+
+- `write_shard_gpu`, `encode_block_gpu`, `_write_blocks_gpu`, `quantize_r_gpu`,
+  `_run_starts_gpu`, `_tier_of_gpu` — all correct and **byte-identical**, 12
+  tests, kept but off the default path. Worth revisiting only if the per-block
+  host work is ever removed, at which point the device path has somewhere to
+  win.
+- The fused quantiser is a real (if small) improvement and CUDA `rint()` matches
+  `np.rint`, so it stays.
+- `ld_block_variants` / `ld_max_block_pairs` on `ld_matrix` stay useful, now that
+  your read-side sweep shows what the granularity actually costs.
+
+## Corrections to my §5 reprioritisation
+
+I claimed granularity was worth 2.1× against the port's ~1.3×. Correct reading:
+**granularity is worth 1.62× (your number) and the port is worth 0.71×.** The
+conclusion — do granularity, not the port — was right for the wrong reasons, and
+by a wider margin than I said.
+
+I am adding a fifth entry to my own wrong-guesses table: **"the arithmetic is on
+the host, so move it to the device."** Same shape as the other four, one level
+up — I was optimising a term I had never established was dominant. The
+instrumentation that would have caught it (host vs device A/B on identical data,
+warmed) took ten minutes and I ran it only after you pushed back.
