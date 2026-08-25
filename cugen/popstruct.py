@@ -33,8 +33,9 @@ def _unpack_tile(packed, n_samples):
 
 
 def grm(cugen: Union[str, Path], *, variant_range=None, variants=None,
-        maf_min: float = 0.0, tile_size: Optional[int] = None,
-        backend: str = "auto", device: int = 0, verbose: bool = True):
+        maf_min: float = 0.0, standardize: str = "yang",
+        tile_size: Optional[int] = None, backend: str = "auto",
+        device: int = 0, verbose: bool = True):
     """Genomic relationship matrix, (n_samples, n_samples).
 
     The GCTA/Yang (2011) standardised form, which is what `--make-grm` produces
@@ -77,6 +78,21 @@ def grm(cugen: Union[str, Path], *, variant_range=None, variants=None,
     maf_min
         Drop variants below this minor allele frequency. Monomorphic variants
         are always dropped -- their standardisation divides by zero.
+    standardize
+        ``'yang'`` (default) is the GCTA form above, dividing by
+        ``sqrt(2p(1-p))`` so every marker contributes equal variance.
+        ``'center'`` mean-centres only, which is plink2 ``--make-rel cov``.
+
+        This matters most on an LD-pruned marker set, which is the main input
+        here. Pruning at a fixed r^2 preferentially retains LOW-frequency
+        markers, because the maximum attainable r^2 between markers of
+        frequency a < b is a(1-b)/(b(1-a)) -- a rare marker cannot exceed the
+        threshold against a common one, so it survives. Under ``'yang'`` every
+        one of those survivors is then upweighted by 1/sqrt(2p(1-p)), and the
+        GRM is dominated by its rarest markers. ``'center'`` weights by
+        frequency naturally and defuses that without discarding markers.
+        Eigenvectors are invariant to a scalar, so this is a genuine change of
+        relative marker weighting, not a rescaling.
     backend
         ``'auto'``, ``'gpu'`` or ``'numpy'``.
 
@@ -85,6 +101,9 @@ def grm(cugen: Union[str, Path], *, variant_range=None, variants=None,
     (n_samples, n_samples) float64 ndarray, symmetric.
     """
     path = str(cugen)
+    if standardize not in ("yang", "center"):
+        raise ValueError(
+            f"standardize must be 'yang' or 'center', got {standardize!r}")
     if backend not in ("auto", "gpu", "numpy"):
         raise ValueError(
             f"backend must be 'auto', 'gpu' or 'numpy', got {backend!r}")
@@ -155,8 +174,10 @@ def grm(cugen: Union[str, Path], *, variant_range=None, variants=None,
         x, obs, freq = x[keep], obs[keep], freq[keep]
 
         two_p = 2.0 * freq[:, None]
-        z = xp.where(obs, (x - two_p) / xp.sqrt(two_p * (1.0 - freq[:, None])),
-                     0.0)
+        centred = x - two_p
+        z = centred if standardize == "center" else \
+            centred / xp.sqrt(two_p * (1.0 - freq[:, None]))
+        z = xp.where(obs, z, 0.0)
         A += z.T @ z
         m_used += int(keep.sum())
 
@@ -167,7 +188,8 @@ def grm(cugen: Union[str, Path], *, variant_range=None, variants=None,
     A /= float(m_used)
     if verbose:
         print(f"cugen.popstruct: GRM {n} x {n} from {m_used:,} of "
-              f"{hi - lo:,} variants  (backend={'gpu' if xp is not np else 'numpy'})")
+              f"{hi - lo:,} variants  (standardize={standardize}, "
+              f"backend={'gpu' if xp is not np else 'numpy'})")
     return xp.asnumpy(A) if xp is not np else A
 
 

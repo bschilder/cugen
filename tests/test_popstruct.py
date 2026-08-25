@@ -183,3 +183,68 @@ def test_grm_variants_composes_with_variant_range(panel):
     got = popstruct.grm(path, variants=want, variant_range=(0, 100), **CPU)
     np.testing.assert_allclose(got, oracle_grm(dos[:, [5, 10]]),
                                rtol=1e-6, atol=1e-9)
+
+
+def oracle_grm_cov(dos):
+    """Mean-centred (covariance) GRM: no 1/sqrt(2p(1-p)) variance weighting."""
+    x = np.asarray(dos, dtype=np.float64)
+    p = x.mean(axis=0) / 2.0
+    keep = (p > 0.0) & (p < 1.0)
+    x, p = x[:, keep], p[keep]
+    z = x - 2.0 * p
+    return z @ z.T / z.shape[1]
+
+
+@pytest.fixture
+def maf_skewed(tmp_path):
+    """Half the markers common, half rare -- the shape LD pruning produces.
+
+    Pruning at a fixed r2 preferentially retains LOW-MAF markers, because the
+    maximum attainable r2 between markers of frequency a < b is a(1-b)/(b(1-a)),
+    so a rare marker simply cannot exceed the threshold against a common one.
+    """
+    rng = np.random.default_rng(101)
+    n, m = 60, 400
+    freq = np.concatenate([rng.uniform(0.30, 0.50, m // 2),
+                           rng.uniform(0.01, 0.05, m // 2)])
+    dos = (rng.random((n, m)) < freq).astype(np.uint8) + \
+          (rng.random((n, m)) < freq).astype(np.uint8)
+    path = tmp_path / "skew.cugen"
+    write_cugen(str(path), dos)
+    return str(path), dos
+
+
+def test_center_standardisation_matches_the_covariance_definition(panel):
+    path, dos = panel
+    got = popstruct.grm(path, standardize="center", **CPU)
+    np.testing.assert_allclose(got, oracle_grm_cov(dos), rtol=1e-6, atol=1e-9)
+
+
+def test_center_is_not_merely_a_rescaling_of_yang(maf_skewed):
+    """If it were, the option would be pointless for PCA -- eigenvectors are
+    invariant to a scalar. It must change the RELATIVE marker weighting."""
+    path, _ = maf_skewed
+    yang = popstruct.grm(path, **CPU)
+    cent = popstruct.grm(path, standardize="center", **CPU)
+    s = np.trace(cent) / np.trace(yang)
+    assert not np.allclose(cent, yang * s, rtol=1e-3), (
+        "center differs from yang only by a scalar; no reweighting happened")
+
+
+def test_center_gives_rare_markers_less_weight_than_yang(maf_skewed):
+    """The reason the option exists.
+
+    Yang divides by sqrt(2p(1-p)), so a MAF-0.02 marker gets ~13x the variance
+    weight of a MAF-0.40 one and a pruned, rare-enriched marker set produces a
+    GRM dominated by its rarest markers. Measured as the spread of the diagonal,
+    which is what carries into the leading eigenvectors.
+    """
+    path, dos = maf_skewed
+    spread = lambda A: float(np.diag(A).max() / np.diag(A).min())
+    assert spread(popstruct.grm(path, standardize="center", **CPU)) < \
+           spread(popstruct.grm(path, **CPU))
+
+
+def test_an_unknown_standardisation_raises_rather_than_silently_defaulting(panel):
+    with pytest.raises(ValueError, match="standardize"):
+        popstruct.grm(panel[0], standardize="gcta2", **CPU)
