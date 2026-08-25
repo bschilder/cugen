@@ -101,6 +101,25 @@ def vcf2cugen(vcf, out, region=None, keep=None, gidx_start=0,
     Two passes: one to count variants (the header does not carry the count),
     one to write. Pass --region to convert a chromosome at a time, which is how
     the rest of cugen expects the data laid out (chr<N>.cugen).
+
+    INPUT MUST BE BIALLELIC. A record with more than one ALT is refused, with
+    the bcftools command to fix it. cugen does not split multi-allelic sites and
+    should not: splitting renormalises REF/ALT against the reference sequence,
+    which is information cugen never sees. Do it upstream, once:
+
+        bcftools norm -m -any in.vcf.gz -Oz -o split.vcf.gz
+        bcftools index -t split.vcf.gz
+
+    That is lossless for per-allele dosage -- a 1|2 genotype at a triallelic
+    site becomes dosage 1 at each of the two resulting records -- and it is what
+    most reference panels already ship. The 1kGP 30x GRCh38 panel, for one,
+    carries zero records with more than one ALT (chr21: 1,002,753 records, 0
+    multi-allelic); its multi-allelic sites appear as several biallelic records
+    sharing a POS, which is exactly the post-split form.
+
+    Note what survives splitting: the per-ALT records still share a coordinate,
+    so a pair of them sits at distance 0 with LD forced by the representation
+    rather than by haplotype structure. See yuj1r0/cugen#18.
     """
     try:
         from cyvcf2 import VCF
@@ -141,8 +160,42 @@ def vcf2cugen(vcf, out, region=None, keep=None, gidx_start=0,
 
     it = (v(region) if region else v) if backend == "cyvcf2" else \
         (v.fetch(region=region) if region else v)
-    n_var = sum(1 for _ in it)
+
+    def _alts(rec):
+        return list(rec.ALT if backend == "cyvcf2" else (rec.alts or ()))
+
+    def _where(rec):
+        return (f"{rec.CHROM}:{rec.POS}" if backend == "cyvcf2"
+                else f"{rec.chrom}:{rec.pos}")
+
+    # The counting pass already visits every record, so the multi-allelic check
+    # is free here and fails before a single byte is written.
+    n_var = n_multi = 0
+    first_multi = None
+    for rec in it:
+        n_var += 1
+        if len(_alts(rec)) > 1:
+            n_multi += 1
+            if first_multi is None:
+                first_multi = _where(rec)
     v.close() if backend == "cyvcf2" else v.close()
+    if n_multi:
+        raise ValueError(
+            f"{vcf}: {n_multi:,} multi-allelic record(s), first at "
+            f"{first_multi}. A site with more than one ALT has no honest "
+            f"0/1/2 dosage column, and the two backends disagree about how to "
+            f"force one. Measured on REF=G ALT=A,C: cyvcf2 pools every ALT "
+            f"into a single non-reference allele (0|2 -> 1, 1|2 -> 1, mu_x "
+            f"1.1111), while pysam writes the 0|2 heterozygote as a homozygote "
+            f"and loses 1|2 and 2|2 to the missing code (mu_x 1.3333) -- so "
+            f"the same file used to convert differently depending on which "
+            f"library happened to be installed. Split upstream instead; that "
+            f"renormalises REF/ALT, which cannot be done from genotypes "
+            f"alone:\n"
+            f"    bcftools norm -m -any {vcf} -Oz -o split.vcf.gz\n"
+            f"    bcftools index -t split.vcf.gz\n"
+            f"Splitting is lossless for per-allele dosage: a 1|2 genotype "
+            f"becomes dosage 1 at each of the two records.")
     if verbose:
         print(f"vcf2cugen [{backend}]: {n_samples:,} samples x {n_var:,} "
               f"variants{f' in {region}' if region else ''} -> {out}")
@@ -258,9 +311,14 @@ def vcf2cugenh(vcf, out, region=None, keep=None, gidx_start=0,
     a way no downstream check can detect. Stock 1000 Genomes VCFs are phased;
     many other sources are not, and some are phased for homozygotes only.
 
-    Multi-allelic records are skipped: hap2bit stores one bit per haplotype and
-    so is biallelic by construction. Split them first with
-    `bcftools norm -m -any` if you need them.
+    Multi-allelic records are SKIPPED (counted in the verbose line), not
+    refused: hap2bit stores one bit per haplotype and so is biallelic by
+    construction, and a reference panel missing a site still imputes correctly
+    at the sites it has. Skipping does drop them silently from the panel, so
+    split first if you need them -- see vcf2cugen for why cugen does not do
+    this itself:
+
+        bcftools norm -m -any in.vcf.gz -Oz -o split.vcf.gz
 
     `gidx` gives an explicit global index per written record, which matters
     whenever this file will be matched against another: cugen.impute pairs a
