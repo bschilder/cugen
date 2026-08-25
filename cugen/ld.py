@@ -331,7 +331,7 @@ EPS = 1e-12
 _STATS = ("r", "r2", "r2_signed", "d", "dp", "r_phased", "r2_phased",
           "d_phased", "dp_phased", "r2_phased_em",
           "chi2", "p", "p_exact", "chi2_adj", "p_adj",
-          "r2_s", "r2_v", "r2_vs")
+          "r2_s", "r2_v", "r2_vs", "r_adj", "r2_adj")
 _DEFAULT_STATS = ("r", "r2", "r2_signed", "d", "dp")
 _STAT_COL = {"r": "R", "r2": "R2", "r2_signed": "R2_SIGNED", "d": "D", "dp": "DP",
              "r_phased": "R_PHASED", "r2_phased": "R2_PHASED",
@@ -340,7 +340,8 @@ _STAT_COL = {"r": "R", "r2": "R2", "r2_signed": "R2_SIGNED", "d": "D", "dp": "DP
              "chi2": "CHI2", "p": "NEG_LOG10_P",
              "p_exact": "NEG_LOG10_P_EXACT",
              "chi2_adj": "CHI2_ADJ", "p_adj": "NEG_LOG10_P_ADJ",
-             "r2_s": "R2_S", "r2_v": "R2_V", "r2_vs": "R2_VS"}
+             "r2_s": "R2_S", "r2_v": "R2_V", "r2_vs": "R2_VS",
+             "r_adj": "R_ADJ", "r2_adj": "R2_ADJ"}
 # The significance pair. Derived from whichever correlation the path computed
 # and from N_OBS, so they cost no extra passes over the data. "p" emits
 # -log10(p), not p -- see _neglog10_chi2_1df for why p itself is unusable.
@@ -354,7 +355,20 @@ _EXACT_MODES = ("never", "auto", "always")
 # Mangin et al. (2012) bias-corrected r^2. ESTIMATORS ONLY -- the paper derives
 # no null sampling distribution for them, so they cannot carry a p-value; see
 # the References block at the head of this module.
-_CORRECTED_STATS = frozenset(("r2_s", "r2_v", "r2_vs"))
+#
+# r_adj / r2_adj are ANCESTRY-adjusted LD (Bercovich et al. 2025, Genetics
+# 229:iyaf009), which removes the two-locus Wahlund effect: loci in LD in no
+# ancestral population appear linked once the populations are pooled. Their
+# estimator residualises the genotypes on PC-derived individual allele
+# frequencies, and that is the SAME map as r2_s with structure= the leading
+# PCs -- with U an orthonormal basis of [1 | S] and P_hat = U U', the fact that
+# 1 lies in col(P_hat) makes (I - P_hat)(I - 11'/n)(I - P_hat) = (I - P_hat),
+# so their middle centring is redundant. They are named separately because the
+# INTENT differs (ancestry, not the Mangin correction family) and because they
+# are the pair the fused GPU path implements; they inherit the same refusal of
+# a p-value, for the same reason.
+_ANCESTRY_STATS = frozenset(("r_adj", "r2_adj"))
+_CORRECTED_STATS = frozenset(("r2_s", "r2_v", "r2_vs")) | _ANCESTRY_STATS
 # LDcorSV's Inv.proj.matrix.sdp zeroes eigenvalues below this before inverting.
 # The Moore-Penrose inverse is the paper's prescription; the floor is the R
 # package's choice and is reproduced here for parity with it.
@@ -1092,9 +1106,14 @@ def _corrected_transform(which, n, kinship=None, structure=None):
     raising.
     """
     eye = np.eye(n)
-    if which == "r2_s":
+    if which in ("r2_s", "r_adj", "r2_adj"):
         S = _as_covariate_block(structure, n)
         Sc = S - S.mean(axis=0)
+        if Sc.shape[1] == 0:
+            # K = 0 is the no-correction case and must reproduce the plain scan
+            # exactly. Sc.T @ Sc is (0, 0) here, which eigh handles but which
+            # reads as an accident; say it deliberately instead.
+            return eye - np.full((n, n), 1.0 / n)
         H = Sc @ _psd_pinv_and_sqrt(Sc.T @ Sc)[0] @ Sc.T
         return (eye - H) @ (eye - np.full((n, n), 1.0 / n))
 
@@ -1143,13 +1162,17 @@ def _as_covariate_block(M, n):
     return A
 
 
-def _corrected_r2(dosages, pairs, P):
-    """Uncentered r^2 of the transformed variant vectors, for every pair.
+def _corrected_r2(dosages, pairs, P, signed=False):
+    """Uncentered r^2 (or signed r) of the transformed variant vectors.
 
     ``dosages`` is (n_variants, n_samples); P is applied on the sample axis, so
     row v becomes ``P x_v``. The Gram matrix is (p, p) -- the same O(p^2) the
     rest of this module lives with -- and every pair reads two diagonal entries
     and one off-diagonal one.
+
+    ``signed=True`` returns r rather than r^2, for ``r_adj``. The sign is
+    meaningful in the same way the unadjusted r's is: it survives
+    ``sign_reference`` orientation downstream.
     """
     X = np.asarray(dosages, dtype=np.float64)
     Z = X @ P.T
@@ -1158,9 +1181,14 @@ def _corrected_r2(dosages, pairs, P):
     a, b = pairs[:, 0], pairs[:, 1]
     # LDcorSV returns 0 when a transformed variance underflows; mirror that
     # rather than emitting inf or nan for a variant the transform annihilated.
+    # This is also what keeps a PC-annihilated variant -- one that is an exact
+    # linear function of the structure matrix, so its residual is identically
+    # zero -- from being reported at r = +-1.
     floor = 1e-12 * max(float(d.max()), 1.0)
     ok = (d[a] > floor) & (d[b] > floor)
     den = np.where(ok, d[a] * d[b], 1.0)
+    if signed:
+        return np.where(ok, np.clip(G[a, b] / np.sqrt(den), -1.0, 1.0), 0.0)
     return np.where(ok, np.clip(G[a, b] ** 2 / den, 0.0, 1.0), 0.0)
 
 
@@ -4197,7 +4225,8 @@ def ld_matrix(
                     P = _corrected_transform(which, int(reader.n_samples),
                                              kinship=kinship,
                                              structure=structure)
-                    res[which] = _corrected_r2(d, pairs_local, P)
+                    res[which] = _corrected_r2(d, pairs_local, P,
+                                               signed=(which == "r_adj"))
 
     # ---- orientation -----------------------------------------------------
     # Flipping BOTH variants leaves r unchanged; flipping exactly one negates

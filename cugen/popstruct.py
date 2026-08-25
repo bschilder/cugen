@@ -1,6 +1,8 @@
 """Population structure: PCA / KING / GRM.
 
-`grm` is implemented. `pca`, `king` and `pc_project` remain v0.2 stubs.
+`grm` and `pcs_from_grm` are implemented. `pca` (variant-axis), `king` and
+`pc_project` remain v0.2 stubs -- `pcs_from_grm` covers the case cugen.ld
+needs, which is a `structure=` basis for ancestry-adjusted LD.
 """
 
 from typing import Optional, Union
@@ -11,7 +13,7 @@ import numpy as np
 from ._stubs import _stub
 from .io import ENCODING_2BIT, read_cugen
 
-__all__ = ["grm", "king", "pca", "pc_project"]
+__all__ = ["grm", "pcs_from_grm", "king", "pca", "pc_project"]
 
 # 2-bit codes are big-endian within the byte: sample 0 is the HIGH pair. Same
 # convention as the LD kernels (see cugen/ld.py) and cugen/write.pack_2bit.
@@ -135,6 +137,58 @@ def grm(cugen: Union[str, Path], *, variant_range=None, maf_min: float = 0.0,
         print(f"cugen.popstruct: GRM {n} x {n} from {m_used:,} of "
               f"{hi - lo:,} variants  (backend={'gpu' if xp is not np else 'numpy'})")
     return xp.asnumpy(A) if xp is not np else A
+
+
+def pcs_from_grm(grm_matrix, k: int, return_eigenvalues: bool = False):
+    """Top-k principal components from a GRM, for `structure=` in cugen.ld.
+
+    A GRM is already the sample-by-sample cross-product PCA decomposes, so this
+    is one `eigh` -- trivial at cohort n (2,504 x 2,504 in well under a second)
+    and the reason `pca` on the variant axis is not needed for this purpose.
+    Eigenvectors come back in DESCENDING eigenvalue order, which `eigh` does not
+    give.
+
+    The columns are mean-centred to machine precision because `grm` is built
+    from centred genotypes, so `1` already lies in their span's orthogonal
+    complement. `cugen.ld._ancestry_basis` re-orthonormalises `[1 | PCs]`
+    regardless rather than relying on that.
+
+    FEED IT AN LD-PRUNED SUBSET. This is the failure that actually bites: on an
+    unpruned panel a tight LD block acts like a large set of near-duplicate
+    markers and dominates the leading eigenvectors, so the "PCs" describe local
+    haplotype structure instead of ancestry. Residualising LD on such a basis
+    then removes real LD and leaves the population term behind -- the exact
+    opposite of the intent. Prune with `cugen.ld.ld_prune` first; a few hundred
+    thousand markers is ample.
+
+    Parameters
+    ----------
+    grm_matrix
+        (n_samples, n_samples) from :func:`grm`, or any symmetric PSD matrix in
+        the same sample order as the .cugen file.
+    k
+        Number of components. ``k = 0`` returns an (n, 0) array, which is the
+        no-correction case and is accepted deliberately.
+    return_eigenvalues
+        Also return the k leading eigenvalues, for a scree plot or for choosing
+        k. There is no rule for k; report the sensitivity rather than picking
+        one silently.
+    """
+    A = np.asarray(grm_matrix, dtype=np.float64)
+    if A.ndim != 2 or A.shape[0] != A.shape[1]:
+        raise ValueError(
+            f"grm must be square (n_samples, n_samples), got {A.shape}")
+    n = A.shape[0]
+    k = int(k)
+    if k < 0 or k > n:
+        raise ValueError(f"k must be in [0, n_samples={n}], got {k}")
+    if k == 0:
+        empty = np.zeros((n, 0), dtype=np.float64)
+        return (empty, np.zeros(0)) if return_eigenvalues else empty
+    w, V = np.linalg.eigh(A)
+    order = np.argsort(w)[::-1][:k]
+    pcs = np.ascontiguousarray(V[:, order])
+    return (pcs, w[order]) if return_eigenvalues else pcs
 
 
 def pca(*a, **kw):
