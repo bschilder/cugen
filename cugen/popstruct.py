@@ -32,9 +32,9 @@ def _unpack_tile(packed, n_samples):
     return codes.reshape(packed.shape[0], -1)[:, :n_samples]
 
 
-def grm(cugen: Union[str, Path], *, variant_range=None, maf_min: float = 0.0,
-        tile_size: Optional[int] = None, backend: str = "auto",
-        device: int = 0, verbose: bool = True):
+def grm(cugen: Union[str, Path], *, variant_range=None, variants=None,
+        maf_min: float = 0.0, tile_size: Optional[int] = None,
+        backend: str = "auto", device: int = 0, verbose: bool = True):
     """Genomic relationship matrix, (n_samples, n_samples).
 
     The GCTA/Yang (2011) standardised form, which is what `--make-grm` produces
@@ -60,6 +60,20 @@ def grm(cugen: Union[str, Path], *, variant_range=None, maf_min: float = 0.0,
 
     Parameters
     ----------
+    variants
+        Restrict to these variants, resolved the same way ``cugen.ld`` resolves
+        its own ``variants=``: an array of gidx, a DataFrame with a ``gidx``
+        column, or a path to one. Matching is on the STORED gidx, not on row
+        position -- a per-chromosome file written with ``gidx_start`` has gidx
+        that do not equal row positions, and reading them as positions builds
+        the GRM from the wrong markers while still returning a plausible PSD
+        matrix. This is how an LD-pruned subset gets in; see
+        :func:`pcs_from_grm`. Composes with ``variant_range``: both apply, so
+        the result is the intersection.
+
+        The scan stays sequential and masks within each tile rather than
+        seeking per variant. Reading a pruned tenth of a file costs the whole
+        file's sequential I/O, which still beats a million scattered preads.
     maf_min
         Drop variants below this minor allele frequency. Monomorphic variants
         are always dropped -- their standardisation divides by zero.
@@ -101,12 +115,30 @@ def grm(cugen: Union[str, Path], *, variant_range=None, maf_min: float = 0.0,
     bpv = int(reader.bytes_per_variant)
     tile = int(tile_size) if tile_size else 8192
 
+    keep_rows = None
+    if variants is not None:
+        from .ld import _resolve_gidx  # noqa: PLC0415  (lazy: ld is heavy)
+        want = _resolve_gidx(variants)
+        gidx_all = np.asarray(reader.gidx, dtype=np.int64)
+        keep_rows = np.isin(gidx_all, want)
+        if not keep_rows[lo:hi].any():
+            raise ValueError(
+                f"none of the {want.size:,} requested gidx are in {path}"
+                f"{f' within variant_range {(lo, hi)}' if variant_range else ''}"
+                f"; its gidx run {gidx_all.min():,}..{gidx_all.max():,}. A GRM "
+                f"over zero markers is undefined, and returning one would hide "
+                f"the mismatch.")
+
     A = xp.zeros((n, n), dtype=xp.float64)
     m_used = 0
     for s0 in range(lo, hi, tile):
         s1 = min(s0 + tile, hi)
+        if keep_rows is not None and not keep_rows[s0:s1].any():
+            continue
         raw = np.frombuffer(reader.read_packed_bytes(s0, s1), dtype=np.uint8)
         codes = _unpack_tile(raw.reshape(s1 - s0, bpv), n)
+        if keep_rows is not None:
+            codes = codes[keep_rows[s0:s1]]
         codes = xp.asarray(codes)
 
         obs = codes != 3
@@ -158,8 +190,9 @@ def pcs_from_grm(grm_matrix, k: int, return_eigenvalues: bool = False):
     markers and dominates the leading eigenvectors, so the "PCs" describe local
     haplotype structure instead of ancestry. Residualising LD on such a basis
     then removes real LD and leaves the population term behind -- the exact
-    opposite of the intent. Prune with `cugen.ld.ld_prune` first; a few hundred
-    thousand markers is ample.
+    opposite of the intent. Prune with `cugen.ld.ld_prune` first and pass the
+    result straight through -- `grm(path, variants=keep)` takes the gidx frame
+    ld_prune returns. A few hundred thousand markers is ample.
 
     Parameters
     ----------

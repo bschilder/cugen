@@ -110,3 +110,76 @@ def test_grm_rejects_a_phased_file(tmp_path):
     write_cugen_phased(str(path), hap)
     with pytest.raises(ValueError, match="hap2bit|phased|dosage"):
         popstruct.grm(str(path), **CPU)
+
+
+@pytest.fixture
+def offset_panel(tmp_path):
+    """Same data, but gidx PERMUTED rather than equal to row position.
+
+    A .cugen written by cugen.convert with gidx_start set -- the normal case for
+    a per-chromosome file -- already has gidx that differ from row positions,
+    but an offset alone is a weak control: the offset gidx are out of range as
+    positions, so a positional misreading would crash rather than mislead. A
+    permutation keeps every value a VALID row position while sending it to a
+    different row, so the two readings both succeed and disagree.
+    """
+    rng = np.random.default_rng(23)
+    n, m = 30, 40
+    freq = rng.uniform(0.15, 0.85, size=m)
+    dos = (rng.random((n, m)) < freq).astype(np.uint8) + \
+          (rng.random((n, m)) < freq).astype(np.uint8)
+    g = rng.permutation(m)
+    path = tmp_path / "offset.cugen"
+    write_cugen(str(path), dos, gidx=g)
+    return str(path), dos, g
+
+
+def test_grm_accepts_a_scattered_variant_subset(panel):
+    """The workflow pcs_from_grm's docstring prescribes.
+
+    Its docstring says to feed an LD-pruned subset, and ld_prune returns a
+    scattered set of gidx. Without this, that instruction was unfollowable:
+    variant_range takes a contiguous slice only.
+    """
+    path, dos = panel
+    want = np.array([3, 11, 12, 40, 41, 99, 500, 599])
+    got = popstruct.grm(path, variants=want, **CPU)
+    np.testing.assert_allclose(got, oracle_grm(dos[:, want]),
+                               rtol=1e-6, atol=1e-9)
+
+
+def test_grm_variants_selects_by_gidx_not_row_position(offset_panel):
+    """The bug this test exists for.
+
+    ld_matrix resolves `variants` against the STORED gidx, so grm must too.
+    Treating them as row positions silently builds the GRM from the wrong
+    markers -- and it still returns a plausible PSD matrix.
+    """
+    path, dos, g = offset_panel
+    rows = [0, 2, 4, 6]
+    want = [int(g[r]) for r in rows]          # the gidx stored at those rows
+    got = popstruct.grm(path, variants=want, **CPU)
+    np.testing.assert_allclose(got, oracle_grm(dos[:, rows]),
+                               rtol=1e-6, atol=1e-9)
+    # The positional misreading is a different, still-valid selection. If it
+    # were not, this test would pass under the bug it exists to catch.
+    assert sorted(want) != sorted(rows), "fixture permutation is too tame"
+    assert not np.allclose(got, oracle_grm(dos[:, want]))
+
+
+def test_grm_refuses_a_variant_selection_that_matches_nothing(offset_panel):
+    """Silently returning a GRM over zero markers would be worse than raising;
+    the caller cannot tell an empty selection from a valid one."""
+    path, _, _ = offset_panel
+    with pytest.raises(ValueError, match="none of the"):
+        popstruct.grm(path, variants=[900, 901, 902], **CPU)
+
+
+def test_grm_variants_composes_with_variant_range(panel):
+    """Both filters apply, so a subset outside the range yields the
+    intersection -- not the union, and not the subset alone."""
+    path, dos = panel
+    want = np.array([5, 10, 300, 400])
+    got = popstruct.grm(path, variants=want, variant_range=(0, 100), **CPU)
+    np.testing.assert_allclose(got, oracle_grm(dos[:, [5, 10]]),
+                               rtol=1e-6, atol=1e-9)
