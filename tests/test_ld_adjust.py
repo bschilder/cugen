@@ -272,9 +272,22 @@ def test_r2_adj_requires_a_structure_matrix(structured):
 
 
 @pytest.mark.skipif(not L.HAS_CUPY, reason="needs a GPU")
+@pytest.mark.xfail(strict=True, reason="Track A2 (fused adjusted GPU scan) "
+                                       "not implemented; cugen/ld.py:4031 "
+                                       "forces use_gpu=False for corrected "
+                                       "stats. Remove this marker when it lands.")
 def test_gpu_agrees_with_the_reference_path(structured):
-    """The fused path is the point of all this. It must match the CPU oracle."""
+    """The fused path is the point of all this. It must match the CPU oracle.
+
+    The first call is load-bearing. `backend="gpu"` is silently downgraded to
+    the reference path for corrected stats -- ld.py announces it only under
+    verbose=True -- so without a probe that the GPU path is actually reachable,
+    the comparison below is CPU against CPU and proves nothing. count_only is
+    the observable: it is available on the fused path and raises on any other.
+    """
     path, dos, pcs, _ = structured
+    L.ld_matrix(path, stats=("r2_adj",), structure=pcs, min_r2=0.0,
+                count_only=True, backend="gpu", verbose=False)
     cpu = L.ld_matrix(path, stats=("r2_adj",), structure=pcs, **CPU)
     gpu = L.ld_matrix(path, stats=("r2_adj",), structure=pcs,
                       backend="gpu", verbose=False)
@@ -286,6 +299,10 @@ def test_gpu_agrees_with_the_reference_path(structured):
 
 
 @pytest.mark.skipif(not L.HAS_CUPY, reason="needs a GPU")
+@pytest.mark.xfail(strict=True, reason="Track A2 (fused adjusted GPU scan) "
+                                       "not implemented; count_only requires "
+                                       "the fused path. Remove this marker "
+                                       "when it lands.")
 def test_count_only_matches_the_streamed_row_count(structured, tmp_path):
     """Catches a q_adj omitted from the OVERFLOW-RETRY kernel launch.
 
