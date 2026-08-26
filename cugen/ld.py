@@ -1162,6 +1162,77 @@ def _as_covariate_block(M, n):
     return A
 
 
+def _ancestry_basis(structure, n):
+    """Orthonormal basis of the centred covariates, ORTHOGONAL TO 1.
+
+    The intercept is deliberately excluded. Including it costs accuracy rather
+    than buying anything: its column of Y is g'1/sqrt(n) = s/sqrt(n), which at
+    n = 2,504 is ~99 while the genotype columns are 0/1/2, so the augmented
+    GEMM would compute G G' - s_i s_j / n as a difference of two ~1e4 terms
+    IN THE FLOAT32 ACCUMULATOR. Measured cost of doing that: max |dr| = 1.6e-3
+    at K = 1 against the unadjusted scan, which should be exact.
+
+    The epilogue already subtracts s_i s_j in DOUBLE. So leave the intercept to
+    it and send only the PC downdate through the GEMM:
+
+        r_adj = (n S' - s_i s_j) / sqrt((n q'_i - s_i^2)(n q'_j - s_j^2))
+
+    with S' = g_i'g_j - Y_i.Y_j and q' = q - ||Y||^2 -- which is exactly the
+    epilogue's existing formula, unmodified, fed a downdated S and q. K = 0
+    then reduces to the ordinary scan bit-for-bit rather than approximately.
+    """
+    S = _as_covariate_block(structure, n)
+    if S.shape[1] == 0:
+        return np.zeros((n, 0), dtype=np.float64)
+    Z = np.asarray(S, dtype=np.float64) - np.asarray(S, dtype=np.float64).mean(0)
+    # centring already puts the columns in 1's orthogonal complement; do it
+    # explicitly so a caller passing pre-centred-but-drifted input is safe
+    one = np.ones((n, 1)) / np.sqrt(n)
+    Z = Z - one @ (one.T @ Z)
+    Q, R = np.linalg.qr(Z)
+    d = np.abs(np.diag(R))
+    keep = d > (1e-10 * max(1.0, float(d.max()))) if d.size else np.zeros(0, bool)
+    return np.ascontiguousarray(Q[:, keep], dtype=np.float64)
+
+
+def _fused_basis(packed, p, ns, bpv, U, phased, q_v, tile=None,
+                 verbose=False):
+    """Y = G U and q_adj = q_v - ||Y||^2, as device arrays.
+
+    One streamed pass over the packed rows, reusing the same plane builder the
+    scan uses. This is the only extra work the adjusted path does beyond the
+    unadjusted one, and it is O(p n K) against the scan's O(p^2 n).
+
+    q_adj is NOT floored here. A variant that is an exact linear function of
+    the basis has q_adj <= 0, and the epilogue's existing `vA > 0` guard drops
+    it -- with s = 0 that test reads n * q_adj > 0, which is exactly the right
+    predicate. Flooring to a small positive number would instead emit it at
+    r = +/-1, which at genome scale is billions of spurious rows.
+    """
+    K = int(U.shape[1])
+    Ud = cp.asarray(U, dtype=cp.float32)
+    Y = cp.empty((p, K), dtype=cp.float32)
+    build = _build_h if phased else _build_g
+    # Match the SCAN's tile size. Chunking at a fixed 4096 while the scan
+    # tiles at ~32768 made this pre-pass do more plane building than the scan
+    # itself -- 18 builds against 9 at p = 70,000 -- and it showed up as a
+    # flat ~20% overhead that looked like the GEMM but was not.
+    T = max(256, min(int(tile) if tile else 4096, p))
+    buf = cp.empty((T, ns), dtype=cp.float32)
+    for a in range(0, p, T):
+        e = min(a + T, p)
+        G = build(packed, a, e, ns, bpv, out=buf)
+        Y[a:e] = G @ Ud
+    del buf
+    q_adj = q_v - (Y * Y).sum(axis=1)
+    if verbose:
+        bad = int((q_adj <= 0).sum())
+        print(f"cugen.ld: ancestry basis K={K}; q_adj min "
+              f"{float(q_adj.min()):.4g}"
+              + (f", {bad:,} variant(s) annihilated and dropped" if bad else ""))
+    return Y, q_adj
+
+
 def _corrected_r2(dosages, pairs, P, signed=False):
     """Uncentered r^2 (or signed r) of the transformed variant vectors.
 
@@ -2890,7 +2961,8 @@ extern "C" __global__
 void build_g_plane(const unsigned char* packed, float* G,
                    const long long n_samples,
                    const long long n_variants,
-                   const long long bytes_per_variant)
+                   const long long bytes_per_variant,
+                   const long long ld_out)
 {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long total = n_variants * n_samples;
@@ -2899,7 +2971,10 @@ void build_g_plane(const unsigned char* packed, float* G,
     long long s = idx - v * n_samples;
     unsigned char byte = packed[v * bytes_per_variant + (s >> 2)];
     int code = (byte >> (6 - 2 * (s & 3))) & 3;
-    G[idx] = (code == 3) ? 0.0f : (float)code;
+    /* ld_out is the ROW STRIDE of the destination, not n_samples: the
+       ancestry-adjusted path decodes into the first n_samples columns of a
+       (B, n_samples + K) buffer whose trailing K columns hold +/- Y. */
+    G[v * ld_out + s] = (code == 3) ? 0.0f : (float)code;
 }
 '''
 
@@ -2913,7 +2988,8 @@ extern "C" __global__
 void build_h_plane(const unsigned char* packed, float* H,
                    const long long n_haps,
                    const long long n_variants,
-                   const long long bytes_per_variant)
+                   const long long bytes_per_variant,
+                   const long long ld_out)
 {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long total = n_variants * n_haps;
@@ -2921,7 +2997,7 @@ void build_h_plane(const unsigned char* packed, float* H,
     long long v = idx / n_haps;
     long long j = idx - v * n_haps;
     unsigned char byte = packed[v * bytes_per_variant + (j >> 3)];
-    H[idx] = (float)((byte >> (7 - (j & 7))) & 1);
+    H[v * ld_out + j] = (float)((byte >> (7 - (j & 7))) & 1);
 }
 
 extern "C" __global__
@@ -2972,20 +3048,22 @@ def _get_h_moments_kernel():
     return _LD_H_MOMENTS_KERNEL
 
 
-def _build_h(packed2d, lo, hi, n_haps, bytes_per_variant, out=None):
+def _build_h(packed2d, lo, hi, n_haps, bytes_per_variant, out=None,
+             ld_out=None):
     """Haplotype plane (0/1) for the CONTIGUOUS row range [lo, hi).
 
     The dosage twin of this is _build_g; the same slice-not-fancy-index rule
     applies and for the same measured reason.
     """
     b, nh = int(hi - lo), int(n_haps)
+    ld = int(ld_out) if ld_out else nh
     blk = packed2d[lo:hi].ravel()                  # view, not a copy
-    H = out if out is not None else cp.empty((b, nh), dtype=cp.float32)
+    H = out if out is not None else cp.empty((b, ld), dtype=cp.float32)
     tpb = 256
     total = b * nh
     _get_h_only_kernel()(((total + tpb - 1) // tpb,), (tpb,),
                          (blk, H, np.int64(nh), np.int64(b),
-                          np.int64(bytes_per_variant)))
+                          np.int64(bytes_per_variant), np.int64(ld)))
     return H[:b] if out is not None else H
 
 
@@ -3006,7 +3084,8 @@ def _get_g_only_kernel():
     return _LD_G_ONLY_KERNEL
 
 
-def _build_g(packed2d, lo, hi, n_samples, bytes_per_variant, out=None):
+def _build_g(packed2d, lo, hi, n_samples, bytes_per_variant, out=None,
+             ld_out=None):
     """Dosage plane for the CONTIGUOUS row range [lo, hi).
 
     Takes a range rather than an index array on purpose. The rows are always
@@ -3019,13 +3098,14 @@ def _build_g(packed2d, lo, hi, n_samples, bytes_per_variant, out=None):
     tile was costing about as much again as the kernel.
     """
     b, ns = int(hi - lo), int(n_samples)
+    ld = int(ld_out) if ld_out else ns
     blk = packed2d[lo:hi].ravel()                  # view, not a copy
-    G = out if out is not None else cp.empty((b, ns), dtype=cp.float32)
+    G = out if out is not None else cp.empty((b, ld), dtype=cp.float32)
     tpb = 256
     total = b * ns
     _get_g_only_kernel()(((total + tpb - 1) // tpb,), (tpb,),
                          (blk, G, np.int64(ns), np.int64(b),
-                          np.int64(bytes_per_variant)))
+                          np.int64(bytes_per_variant), np.int64(ld)))
     return G[:b] if out is not None else G
 
 
@@ -3241,7 +3321,7 @@ def _r_only_result(r_arr, n_arr, reader, rows, pairs_local):
 
 def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
                     count_only=False, on_flush=None, flush_rows=None,
-                    verbose=False, tf32=False, phased=False):
+                    verbose=False, tf32=False, phased=False, basis_u=None):
     """Fused scan: one kernel per tile, one output buffer, no per-tile sync.
 
     Only for the clean r-only case (no missingness, no bp window). Everything
@@ -3273,6 +3353,68 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
     s_v, q_v = (_hap_moments(packed, p, ns, bpv) if phased
                 else _variant_moments(packed, p, ns, bpv))
 
+    # ---- ancestry adjustment via an AUGMENTED GEMM ------------------------
+    # COST, measured (RTX 4090, n=2504, K=20, count_only, against the same
+    # scan without a basis):
+    #
+    #     p        overhead
+    #     10,000     +21.8%
+    #     20,000     +26.3%
+    #     40,000     +20.8%
+    #     70,000     +17.0%
+    #
+    # The plan for this predicted +K/n = +0.8%, which is the GEMM FLOP cost
+    # alone and is not what dominates. Two other costs are real: the diagonal
+    # tile can no longer alias Gb = Ga (B carries -Y), so it needs a second
+    # plane build; and cuBLAS is measurably less efficient at the widened
+    # inner dimension (2524 against 2504). Matching the pre-pass tile size to
+    # the scan's was tried and changed nothing, so the plane builds are not
+    # the bulk of it -- they account for ~4 ms of a 60 ms gap at p = 70,000.
+    # Padding the augmented width to a 128-byte boundary is the obvious next
+    # thing to try and has not been.
+    # g_i'(I-P)g_j = g_i'g_j - (U'g_i)'(U'g_j), so with Y = G U the planes
+    # A = [G | Y] and B = [G | -Y] give A B' = G G' - Y Y' in ONE GEMM, at
+    # K/n extra flops and no extra pass over S. Handing the epilogue zero sum
+    # vectors then collapses (n S - sA sB)/sqrt(...) to S/sqrt(qA qB), which
+    # is exactly r_adj -- so the epilogue kernel is untouched. See the module
+    # docstring's note on zero sum vectors.
+    # PRECISION, measured (RTX 4090, n=400, m=120, K in {2,5}, against the
+    # float64 CPU oracle, differences in r):
+    #
+    #   precision='fp32'   max|dr| 1.55e-05   == the int16 storage quantum
+    #                                            (1/32767/2 = 1.53e-05), i.e.
+    #                                            exact to what .cugenld holds
+    #   precision='auto'   max|dr| 4.42e-04   29x the storage quantum
+    #     (TF32)
+    #
+    # The module's TF32 note (see _Tf32) records max|err| = 0.0, but that
+    # guarantee is specific to INTEGER genotype planes: two mantissa bits are
+    # enough for {0,1,2}. Y = G U is float, so TF32 truncates it to 10 bits and
+    # the guarantee does not extend. Identical error at K=2 and K=5 confirms
+    # per-element truncation rather than accumulation growth. Pass
+    # precision='fp32' when exactness matters more than the ~6x GEMM
+    # throughput TF32 buys.
+    K = 0
+    s_use, q_use = s_v, q_v
+    Y = None
+    if basis_u is not None and int(np.asarray(basis_u).shape[1]) > 0:
+        # Built HERE, from the packed rows and moments this function already
+        # holds. Doing it in ld_matrix meant a second _load_packed_rows and a
+        # second _variant_moments over the same data -- twice the packed read
+        # for a projection that is O(p n K) against the scan's O(p^2 n).
+        Y, q_adj = _fused_basis(packed, p, ns, bpv, np.asarray(basis_u),
+                                phased, q_v, tile=B, verbose=verbose)
+        K = int(Y.shape[1])
+        # s_v is NOT zeroed: the intercept is not in Y, so the epilogue must
+        # still subtract s_i s_j -- and it does so in double, which is the
+        # whole point of leaving it there. Only q is downdated.
+        q_use = q_adj
+        if K and tf32 and verbose:
+            print("cugen.ld: TF32 is on and a rank-%d ancestry basis is "
+                  "active; Y is float so |dr| ~ 4e-4 rather than exact. Pass "
+                  "precision='fp32' for storage-exact r_adj." % K)
+    W = ns + K
+
     def run(capacity, on_flush=None, tile_max=0):
         """Scan every tile. With on_flush, drain the buffer at tile
         boundaries so it can never overflow; without it, fill one buffer."""
@@ -3287,19 +3429,30 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
         kern = _get_epilogue_kernel()
         # Two reusable plane buffers for the whole scan. A fresh B x n
         # allocation per tile cost roughly as much as the unpack kernel.
-        bufA = cp.empty((B, ns), dtype=cp.float32)
-        bufB = cp.empty((B, ns), dtype=cp.float32)
+        bufA = cp.empty((B, W), dtype=cp.float32)
+        bufB = cp.empty((B, W), dtype=cp.float32)
         with _Tf32(tf32):
             for i0 in range(0, p, B):
                 i1 = min(i0 + B, p)
                 hi = p if window is None else min(p, i1 - 1 + int(window) + 1)
-                Ga = build_plane(packed, i0, i1, ns, bpv, out=bufA)
+                Ga = build_plane(packed, i0, i1, ns, bpv, out=bufA,
+                                 ld_out=W)
+                if K:
+                    Ga[:, ns:] = Y[i0:i1]
                 for j0 in range(i0, hi, B):
                     j1 = min(j0 + B, hi)
-                    if j0 == i0:
+                    # The diagonal tile cannot alias when a basis is in play:
+                    # B carries -Y where A carries +Y, so Gb = Ga would
+                    # compute G G' + Y Y' -- the Wahlund term ADDED rather
+                    # than removed, which looks plausible and is exactly
+                    # backwards.
+                    if j0 == i0 and not K:
                         Gb = Ga
                     else:
-                        Gb = build_plane(packed, j0, j1, ns, bpv, out=bufB)
+                        Gb = build_plane(packed, j0, j1, ns, bpv, out=bufB,
+                                         ld_out=W)
+                        if K:
+                            Gb[:, ns:] = -Y[j0:j1]
                     S = Ga @ Gb.T
                     bi, bj = i1 - i0, j1 - j0
                     nthread = bi * bj
@@ -3317,7 +3470,8 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
                             counter.fill(0)
                             held = 0
                     kern(((nthread + 255) // 256,), (256,),
-                         (S, s_v[i0:i1], s_v[j0:j1], q_v[i0:i1], q_v[j0:j1],
+                         (S, s_use[i0:i1], s_use[j0:j1], q_use[i0:i1],
+                          q_use[j0:j1],
                           np.float32(ns), np.int64(i0), np.int64(j0),
                           np.int64(bi), np.int64(bj),
                           np.int64(window if window else 0), np.float32(min_r2),
@@ -3341,8 +3495,9 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
                             t_j = cp.empty(need, dtype=cp.int64)
                             t_r = cp.empty(need, dtype=cp.float32)
                             kern(((nthread + 255) // 256,), (256,),
-                                 (S, s_v[i0:i1], s_v[j0:j1], q_v[i0:i1],
-                                  q_v[j0:j1], np.float32(ns), np.int64(i0),
+                                 (S, s_use[i0:i1], s_use[j0:j1],
+                                  q_use[i0:i1],
+                                  q_use[j0:j1], np.float32(ns), np.int64(i0),
                                   np.int64(j0), np.int64(bi), np.int64(bj),
                                   np.int64(window if window else 0),
                                   np.float32(min_r2), t_i, t_j, t_r, counter,
@@ -3447,6 +3602,13 @@ def _assemble_device(pairs_dev, payload, reader, rows, stats, sign_reference,
         g["R2_SIGNED"] = cp.clip(r * cp.abs(r), -1.0, 1.0).astype(cp.float32)
     # the fused epilogue returns one correlation; which column it IS depends on
     # whether the plane it ran over was dosages or haplotypes
+    # The adjusted stats arrive the same way: the fused epilogue over
+    # augmented planes returns r_adj directly, so it is the same column
+    # mapping as the phased case with a different name.
+    if "r_adj" in stats:
+        g["R_ADJ"] = r.astype(cp.float32)
+    if "r2_adj" in stats:
+        g["R2_ADJ"] = r2.astype(cp.float32)
     if "r_phased" in stats:
         g["R_PHASED"] = r.astype(cp.float32)
     if "r2_phased" in stats:
@@ -4005,6 +4167,10 @@ def ld_matrix(
         "min_r2": float(min_r2), "max_p": max_p, "correction": correction,
         "alpha": float(alpha),
         "top_k": None if top_k is None else int(top_k),
+        # rank of the ancestry basis, i.e. the number of PC columns actually
+        # residualised out. ldio.LDReader refuses p-values when this is set
+        # and non-zero; 0 means intercept-only, which is plain r.
+        "adjust": None,
         "n_obs": (2 * int(reader.n_samples) if want_phased
                   else int(reader.n_samples)),
         "m_tests": int(m_tests),
@@ -4020,13 +4186,14 @@ def ld_matrix(
     # D and D' need the 3x3 table; r-family statistics do not, and skipping it
     # avoids ~9x the memory traffic per tile.
     need_table = bool({"d", "dp"} & set(stats))
-    if want_corrected and use_gpu:
-        # The cost here is one n x n eigendecomposition plus a dense transform
-        # of the genotype matrix, neither of which the GPU scan is shaped for,
-        # and the paper's own scale is hundreds of individuals. Take the
-        # reference path and say so rather than pretending otherwise.
+    # r2_s / r2_v / r2_vs still take the reference path: each needs an n x n
+    # eigendecomposition plus a dense sample-axis transform, and the paper's
+    # own scale is hundreds of individuals. r_adj / r2_adj do NOT -- they are
+    # a rank-K downdate expressible as an augmented GEMM, so they run fused.
+    _gls_stats = [x for x in want_corrected if x not in _ANCESTRY_STATS]
+    if _gls_stats and use_gpu:
         if verbose:
-            print(f"cugen.ld: {want_corrected} take the reference path "
+            print(f"cugen.ld: {_gls_stats} take the reference path "
                   f"(dense sample-axis transform); backend={backend!r} ignored")
         use_gpu = False
 
@@ -4044,9 +4211,17 @@ def ld_matrix(
     # gammaln, so keeping the survivors on the device would buy nothing and
     # would leave a second implementation of the same test to keep in step.
     # Under exact='auto' the loop runs on a small subset by construction.
+    # Streaming to a NATIVE .cugenld needs no cuDF: that path goes from the
+    # device arrays straight into ldio.LDDatasetWriter (see _flush below), so
+    # requiring cuDF for it shut the fused scan out of exactly the case it was
+    # built for -- a genome-wide stream on a box without RAPIDS installed.
+    # Every other device route does build a cudf frame via _assemble_device.
+    _native_stream = (bool(stream) and output is not None
+                      and str(output).endswith(".cugenld"))
     on_device = (use_gpu and not need_table and "p_exact" not in stats
                  and not lambda_gc and annotation is None
-                 and (count_only or (HAS_CUDF and output is not None)))
+                 and (count_only or _native_stream
+                      or (HAS_CUDF and output is not None)))
     # The fused single-kernel scan handles the clean r-only case: no
     # missingness, no bp window, no D/D'. That is the hot path, and it is
     # where the device was sitting at 1-4% SM utilisation.
@@ -4060,6 +4235,8 @@ def ld_matrix(
     # starts/hi arrays; see the handoff note in benchmarks/results/STORAGE.md.
     _needs_row_bounds = (window_kb is not None or min_dist_kb is not None
                          or max_dist_kb is not None or scope != "all")
+    # The adjusted stats are fusable; the GLS ones are not, and _gls_stats
+    # has already dropped use_gpu for those, so nothing extra is needed here.
     fused = (on_device and not reader.has_missing and not _needs_row_bounds
              and min_obs <= reader.n_samples and fused_ok_phased)
 
@@ -4085,11 +4262,21 @@ def ld_matrix(
 
     if use_gpu and fused:
         cp.cuda.Device(device).use()
+        _basis_u = None
+        _want_adj = [x for x in stats if x in _ANCESTRY_STATS]
+        if _want_adj:
+            if structure is None:
+                raise ValueError(
+                    f"{_want_adj} need structure= (the ancestry covariates to "
+                    f"residualise on). Pass PCs, e.g. from "
+                    f"cugen.popstruct.pcs_from_grm on an LD-pruned GRM.")
+            _basis_u = _ancestry_basis(structure, int(reader.n_samples))
+            _ld_params["adjust"] = int(_basis_u.shape[1])
         if count_only:
             return _scan_gpu_fused(reader, rows, window, min_r2,
                                    tile_size=tile_size, verbose=verbose,
                                    tf32=use_tf32, phased=bool(want_phased),
-                                   count_only=True)
+                                   count_only=True, basis_u=_basis_u)
         if stream:
             n_obs_s = (2 * int(reader.n_samples) if want_phased
                        else int(reader.n_samples))
@@ -4147,7 +4334,7 @@ def ld_matrix(
                     reader, rows, window, min_r2, tile_size=tile_size,
                     verbose=verbose, tf32=use_tf32,
                     phased=bool(want_phased), on_flush=_flush,
-                    flush_rows=flush_rows)
+                    flush_rows=flush_rows, basis_u=_basis_u)
             finally:
                 if native:
                     dsw.mark_complete()
@@ -4160,7 +4347,8 @@ def ld_matrix(
             return int(total)
         ii, jj, rr = _scan_gpu_fused(reader, rows, window, min_r2,
                                      tile_size=tile_size, verbose=verbose,
-                                     tf32=use_tf32, phased=bool(want_phased))
+                                     tf32=use_tf32, phased=bool(want_phased),
+                                     basis_u=_basis_u)
         if ii.size == 0:
             return _empty_pairs(stats)
         pairs_local = cp.stack([ii, jj], axis=1)

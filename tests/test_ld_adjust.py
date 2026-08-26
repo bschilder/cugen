@@ -272,37 +272,118 @@ def test_r2_adj_requires_a_structure_matrix(structured):
 
 
 @pytest.mark.skipif(not L.HAS_CUPY, reason="needs a GPU")
-@pytest.mark.xfail(strict=True, reason="Track A2 (fused adjusted GPU scan) "
-                                       "not implemented; cugen/ld.py:4031 "
-                                       "forces use_gpu=False for corrected "
-                                       "stats. Remove this marker when it lands.")
-def test_gpu_agrees_with_the_reference_path(structured):
-    """The fused path is the point of all this. It must match the CPU oracle.
+def test_fused_gpu_agrees_with_the_reference_path(structured, tmp_path):
+    """Track A2: the augmented-GEMM path must equal the CPU oracle.
 
-    The first call is load-bearing. `backend="gpu"` is silently downgraded to
-    the reference path for corrected stats -- ld.py announces it only under
-    verbose=True -- so without a probe that the GPU path is actually reachable,
-    the comparison below is CPU against CPU and proves nothing. count_only is
-    the observable: it is available on the fused path and raises on any other.
+    Routed through stream= to a .cugenld because that is how the fused path is
+    reachable without cuDF -- `on_device` requires count_only or an output
+    file, and the streaming writer goes straight from device arrays to ldio.
+
+    r2 rather than r, so the comparison cannot be rescued or broken by the
+    sign convention; the sign is pinned separately by the Wahlund test below.
     """
+    from cugen import ldio                                    # noqa: PLC0415
     path, dos, pcs, _ = structured
+    cpu = L.ld_matrix(path, stats=("r2_adj",), structure=pcs, min_r2=0.0, **CPU)
+    out = tmp_path / "adj.cugenld"
     L.ld_matrix(path, stats=("r2_adj",), structure=pcs, min_r2=0.0,
-                count_only=True, backend="gpu", verbose=False)
-    cpu = L.ld_matrix(path, stats=("r2_adj",), structure=pcs, **CPU)
-    gpu = L.ld_matrix(path, stats=("r2_adj",), structure=pcs,
-                      backend="gpu", verbose=False)
-    key = {(a, b): v for a, b, v in
-           zip(cpu["gidx_a"], cpu["gidx_b"], cpu["R2_ADJ"])}
-    worst = max(abs(key[(a, b)] - v) for a, b, v in
-                zip(gpu["gidx_a"], gpu["gidx_b"], gpu["R2_ADJ"]))
-    assert worst < 1e-4, f"GPU vs CPU max |dr2_adj| = {worst:.3e}"
+                stream=True, output=str(out), backend="gpu", verbose=False)
+    rd = ldio.open_ld(str(out))
+    i, j, r = rd.above(None)
+    got = {(int(a), int(b)): float(v) ** 2 for a, b, v in zip(i, j, r)}
+    want = {(int(a), int(b)): float(v) for a, b, v in
+            zip(cpu["gidx_a"], cpu["gidx_b"], cpu["R2_ADJ"])}
+    assert got, "the fused path emitted nothing"
+    shared = set(got) & set(want)
+    assert len(shared) > 0.9 * len(want), (
+        f"fused emitted {len(got)} pairs, oracle {len(want)}, "
+        f"{len(shared)} shared")
+    worst = max(abs(got[k] - want[k]) for k in shared)
+    # default precision may be TF32, which truncates the float Y columns:
+    # measured max|dr| 4.42e-04 => max|dr2| ~ 8.8e-04 near r = 1. The strict
+    # bound lives in the fp32 test below, which is the exact one.
+    assert worst < 2e-3, f"fused vs CPU max |dr2_adj| = {worst:.3e}"
 
 
 @pytest.mark.skipif(not L.HAS_CUPY, reason="needs a GPU")
-@pytest.mark.xfail(strict=True, reason="Track A2 (fused adjusted GPU scan) "
-                                       "not implemented; count_only requires "
-                                       "the fused path. Remove this marker "
-                                       "when it lands.")
+def test_fused_fp32_is_exact_to_the_storage_quantum(structured, tmp_path):
+    """With TF32 off the augmented GEMM must be exact, not merely close.
+
+    Measured: max|dr| 1.55e-05 against the float64 oracle, which IS the int16
+    storage half-step (1/32767/2 = 1.53e-05). So the only error left is how
+    .cugenld stores r, and the arithmetic contributes nothing above it. This is
+    the test that would catch a genuine algebra error hiding under a TF32-sized
+    tolerance.
+    """
+    from cugen import ldio                                    # noqa: PLC0415
+    path, _, pcs, _ = structured
+    cpu = L.ld_matrix(path, stats=("r_adj",), structure=pcs, min_r2=0.0, **CPU)
+    out = tmp_path / "fp32.cugenld"
+    L.ld_matrix(path, stats=("r_adj",), structure=pcs, min_r2=0.0,
+                stream=True, output=str(out), backend="gpu",
+                precision="fp32", verbose=False)
+    i, j, r = ldio.open_ld(str(out)).above(None)
+    got = {(int(a), int(b)): float(v) for a, b, v in zip(i, j, r)}
+    want = {(int(a), int(b)): float(v) for a, b, v in
+            zip(cpu["gidx_a"], cpu["gidx_b"], cpu["R_ADJ"])}
+    shared = set(got) & set(want)
+    assert len(shared) > 0.9 * len(want)
+    worst = max(abs(got[k] - want[k]) for k in shared)
+    QUANTUM = 1.0 / 32767 / 2
+    assert worst < 3 * QUANTUM, (
+        f"fp32 fused vs float64 oracle max |dr| = {worst:.3e}, "
+        f"storage quantum is {QUANTUM:.3e}")
+
+
+@pytest.mark.skipif(not L.HAS_CUPY, reason="needs a GPU")
+def test_fused_adjusted_r_never_exceeds_one(structured, tmp_path):
+    """The bound that caught a sign/moment error once already.
+
+    r is a correlation. A wrong downdate -- adding Y Y' instead of
+    subtracting it, or pairing S_adj with the unadjusted q -- produces values
+    outside [-1, 1], which is the cheapest possible detector and costs nothing.
+    """
+    from cugen import ldio                                    # noqa: PLC0415
+    path, _, pcs, _ = structured
+    out = tmp_path / "b.cugenld"
+    L.ld_matrix(path, stats=("r_adj",), structure=pcs, min_r2=0.0,
+                stream=True, output=str(out), backend="gpu", verbose=False)
+    _i, _j, r = ldio.open_ld(str(out)).above(None)
+    assert r.size, "nothing emitted"
+    assert np.abs(r).max() <= 1.0 + 1e-6, (
+        f"max |r_adj| = {np.abs(r).max():.4f} -- impossible for a correlation")
+
+
+@pytest.mark.skipif(not L.HAS_CUPY, reason="needs a GPU")
+def test_fused_k0_reproduces_the_unadjusted_scan(structured, tmp_path):
+    """k = 0 is intercept-only, so r_adj must equal plain r exactly.
+
+    A free correctness check on the whole augmented-GEMM path: with K = 1 the
+    only basis column is the intercept, the downdate is exactly the centring
+    the ordinary epilogue already does, and the two answers must agree to
+    float32.
+    """
+    from cugen import ldio                                    # noqa: PLC0415
+    path, _, _, _ = structured
+    plain = tmp_path / "plain.cugenld"
+    adj = tmp_path / "k0.cugenld"
+    n_samp = int(L.read_cugen(path).n_samples)
+    L.ld_matrix(path, stats=("r",), min_r2=0.0, stream=True,
+                output=str(plain), backend="gpu", verbose=False)
+    L.ld_matrix(path, stats=("r_adj",), structure=np.zeros((n_samp, 0)),
+                min_r2=0.0, stream=True, output=str(adj), backend="gpu",
+                verbose=False)
+    ai, aj, ar = ldio.open_ld(str(plain)).above(None)
+    bi, bj, br = ldio.open_ld(str(adj)).above(None)
+    ka = {(int(x), int(y)): float(v) for x, y, v in zip(ai, aj, ar)}
+    kb = {(int(x), int(y)): float(v) for x, y, v in zip(bi, bj, br)}
+    shared = set(ka) & set(kb)
+    assert len(shared) > 0.99 * len(ka), f"{len(shared)} of {len(ka)} shared"
+    worst = max(abs(ka[k] - kb[k]) for k in shared)
+    assert worst < 1e-5, f"k=0 vs plain r: max |dr| = {worst:.3e}"
+
+
+@pytest.mark.skipif(not L.HAS_CUPY, reason="needs a GPU")
 def test_count_only_matches_the_streamed_row_count(structured, tmp_path):
     """Catches a q_adj omitted from the OVERFLOW-RETRY kernel launch.
 
