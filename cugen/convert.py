@@ -37,6 +37,91 @@ import numpy as np
 from .write import CugenWriter, ENCODING_2BIT
 
 
+#: 2-bit code for a no-call. Dosages are 0/1/2; 3 means missing.
+_MISSING_CODE = 3.0
+
+MISSING_POLICIES = ("keep", "ref", "mean", "drop")
+
+
+def _apply_missing_policy(dosages, policy):
+    """Resolve no-calls in one variant. Returns ``(dosages_or_None, n_missing)``.
+
+    ``None`` means drop the variant.
+
+    Why this exists
+    ---------------
+    cugen's association kernels are complete-case and skip code 3, which is why
+    ``keep`` is the historical behaviour and remains the default. The LD scan
+    cannot do that: its fused path -- the only one supporting ``stream=`` or
+    ``count_only=`` -- requires ``not reader.has_missing``, and
+    ``FLAG_HAS_MISSING`` is set for the WHOLE file if a single genotype anywhere
+    is a no-call. So for LD the missingness has to be resolved at conversion
+    time; there is no scan-time option.
+
+    Policies
+    --------
+    keep    Leave code 3 in place. Complete-case downstream. Sets the file flag.
+    ref     Fill with 0 (hom REF).
+    mean    Fill with the observed mean, ROUNDED to the nearest integer dosage.
+    drop    Return None for any variant carrying a no-call.
+
+    Statistics, stated plainly
+    --------------------------
+    Imputation here happens BEFORE ``CugenWriter.add_variant``, so
+    ``variant_stats`` runs over the imputed vector and mu_x/sxx/maf are
+    self-consistent with the stored dosages. That is the crucial difference from
+    the failure this module's docstring warns about, which was writing 0 for
+    missing while keeping sxx over only the non-missing calls -- data and stats
+    disagreeing.
+
+    Both fills still bias, and neither is free:
+
+    * ``mean`` puts imputed samples at (approximately) the variant mean, where
+      they contribute ~0 to the centred sum of squares. sxx is therefore
+      deflated by roughly ``1 - missingness`` against true complete data. r^2 is
+      a ratio, so the bias partly cancels, but not exactly.
+    * ``ref`` shifts mu_x and maf downward in proportion to the missingness
+      rate, and the shift lands hardest on common variants -- the ones a
+      MAF-filtered LD panel is made of.
+
+    ``mean`` rounds because 2-bit has no fractional code. Exact mean-imputation
+    needs a float encoding, which costs 4-16x the bytes per variant and
+    re-breaks the device-memory ceiling that motivates resolving missingness at
+    all. Rounding uses numpy's half-to-even, so an observed mean of exactly 0.5
+    fills 0 and exactly 1.5 fills 2.
+    """
+    if policy not in MISSING_POLICIES:
+        raise ValueError(
+            f"unknown missing= policy {policy!r}; expected one of "
+            f"{list(MISSING_POLICIES)}")
+    d = np.asarray(dosages, dtype=np.float64)
+    miss = ~(np.isfinite(d) & (d >= 0) & (d <= 2))
+    n_missing = int(miss.sum())
+    if n_missing == 0:
+        return d, 0
+    if policy == "keep":
+        # Never mutate the caller's buffer: pgen2cugen reuses one array across
+        # every variant, so an in-place fill would leak into the next record.
+        out = d.copy()
+        out[miss] = _MISSING_CODE
+        return out, n_missing
+    if policy == "drop":
+        return None, n_missing
+    if policy == "ref":
+        out = d.copy()
+        out[miss] = 0.0
+        return out, n_missing
+    # mean
+    obs = d[~miss]
+    if obs.size == 0:
+        # No observed call means no mean. Filling anything would be a
+        # fabrication, so the variant is dropped rather than invented.
+        return None, n_missing
+    out = d.copy()
+    out[miss] = float(np.rint(obs.mean()))
+    return out, n_missing
+
+
 def _write_samples(out_path, sample_ids):
     p = f"{out_path}.samples.txt"
     with open(p, "w") as f:
@@ -50,8 +135,28 @@ def _progress(i, n, every=50000):
 
 
 def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
-               variant_idx=None, gidx=None, verbose=True):
-    """PLINK2 .pgen -> .cugen. Requires pgenlib."""
+               variant_idx=None, gidx=None, missing="mean", verbose=True):
+    """PLINK2 .pgen -> .cugen. Requires pgenlib.
+
+    ``missing`` resolves no-calls; see :func:`_apply_missing_policy` for the
+    policies and their statistical consequences. The short version:
+
+    * ``"mean"`` (default) fills with the observed mean rounded to an integer
+      dosage, so the file carries no missing code and cugen's fused LD scan can
+      use it. That scan is the only path supporting ``stream=`` or
+      ``count_only=``, and it refuses any file with ``has_missing`` set -- a
+      file-wide flag that one no-call anywhere trips.
+    * ``"keep"`` is the historical behaviour: leave code 3 in place and let
+      cugen's complete-case association kernels skip it. Use this for
+      association scans, where complete-case is the correct treatment and
+      imputing would change the analysis.
+    * ``"ref"`` fills with 0. ``"drop"`` discards any variant carrying a
+      no-call, and costs a second pass over the .pgen to learn the surviving
+      count, since the header declares it up front.
+
+    A missingness summary is printed when ``verbose``, so the choice can be
+    checked against the data rather than assumed.
+    """
     try:
         import pgenlib
     except ImportError:
@@ -78,19 +183,77 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
     g = vidx if gidx is None else np.asarray(gidx)
     kept_ids = ids if si is None else [ids[i] for i in si]
 
+    if missing not in MISSING_POLICIES:
+        raise ValueError(
+            f"unknown missing= policy {missing!r}; expected one of "
+            f"{list(MISSING_POLICIES)}")
     if verbose:
-        print(f"pgen2cugen: {n_samples:,} samples x {len(vidx):,} variants -> {out}")
+        print(f"pgen2cugen: {n_samples:,} samples x {len(vidx):,} variants "
+              f"-> {out}  (missing={missing})")
     buf = np.empty(n_samples, dtype=np.int8)
-    with CugenWriter(out, n_samples, len(vidx), ENCODING_2BIT) as w:
+
+    def _read(v):
+        """One variant as float dosages, pgenlib's -9 folded to the 2-bit code."""
+        reader.read(int(v), buf)
+        d = buf.astype(np.float64)
+        d[d < 0] = _MISSING_CODE                # pgenlib marks missing as -9
+        return d
+
+    # `drop` changes the variant count, and CugenWriter._finalize refuses a
+    # short write ("declared N variants, wrote M"). So learn the surviving count
+    # first -- the same two-pass shape vcf2cugen already uses, and only paid
+    # when the policy actually needs it.
+    keep_mask = None
+    if missing == "drop":
+        keep_mask = np.ones(len(vidx), dtype=bool)
         for k, v in enumerate(vidx):
-            reader.read(int(v), buf)
-            d = buf.astype(np.float64)
-            d[d < 0] = 3.0                      # pgenlib marks missing as -9
+            keep_mask[k] = _apply_missing_policy(_read(v), "drop")[0] is not None
+            if verbose:
+                _progress(k, len(vidx))
+        if verbose:
+            print(f"  drop: {int((~keep_mask).sum()):,} of {len(vidx):,} "
+                  f"variants carry a no-call and will be discarded", flush=True)
+
+    n_out = len(vidx) if keep_mask is None else int(keep_mask.sum())
+    if n_out == 0:
+        raise ValueError(
+            f"missing={missing!r} leaves 0 of {len(vidx):,} variants. Every "
+            f"variant carries a no-call, which at this sample count is normal "
+            f"-- use missing='mean' or 'ref' instead of dropping.")
+
+    n_missing_total = 0
+    n_var_with_missing = 0
+    n_var_undefined = 0
+    with CugenWriter(out, n_samples, n_out, ENCODING_2BIT) as w:
+        for k, v in enumerate(vidx):
+            if keep_mask is not None and not keep_mask[k]:
+                continue
+            d, n_miss = _apply_missing_policy(_read(v), missing)
+            if n_miss:
+                n_missing_total += n_miss
+                n_var_with_missing += 1
+            if d is None:
+                # Only reachable for 'mean' on a fully-missing variant, which
+                # the counting pass above does not run for. Refuse rather than
+                # write a short file, which _finalize would reject anyway with
+                # a message that does not name the cause.
+                n_var_undefined += 1
+                raise ValueError(
+                    f"variant {int(g[k])} has no observed call, so "
+                    f"missing={missing!r} has no mean to fill with. Use "
+                    f"missing='drop' to discard such variants, or filter them "
+                    f"upstream (plink2 --geno 0.99).")
             w.add_variant(int(g[k]), d)
             if verbose:
                 _progress(k, len(vidx))
     reader.close()
     _write_samples(out, kept_ids)
+    if verbose:
+        cells = float(n_samples) * max(len(vidx), 1)
+        print(f"  missingness: {n_missing_total:,} no-calls "
+              f"({100.0 * n_missing_total / cells:.4f}% of genotypes) across "
+              f"{n_var_with_missing:,} of {len(vidx):,} variants; "
+              f"policy={missing}, {n_out:,} variants written", flush=True)
     return out
 
 

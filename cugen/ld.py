@@ -2199,6 +2199,26 @@ def _variant_moments(packed, p, ns, bpv):
     return s_v, q_v
 
 
+def _moments_blocked(src, p, ns, bpv, phased, block):
+    """Per-variant moments over a row source that may be a bounded cache.
+
+    The kernels launch one block per variant and touch only that variant's
+    packed row, so splitting the launch is bit-exact: same integer
+    accumulation, same order within each variant, no cross-variant reduction.
+    """
+    one = _hap_moments if phased else _variant_moments
+    if block is None or block >= p:
+        return one(src[0:p], p, ns, bpv)
+    s_v = cp.empty(p, dtype=cp.float32)
+    q_v = cp.empty(p, dtype=cp.float32)
+    for a in range(0, p, block):
+        e = min(a + block, p)
+        s_c, q_c = one(src[a:e], e - a, ns, bpv)
+        s_v[a:e] = s_c
+        q_v[a:e] = q_c
+    return s_v, q_v
+
+
 def _contiguous_runs(rows):
     """Split a strictly increasing row index array into contiguous runs.
 
@@ -2244,19 +2264,154 @@ def _load_packed_rows(reader, rows, bpv, verbose=False,
     # chromosome in one call raises MemoryError on the host while the card sits
     # empty. Each run is therefore fetched in bounded pieces and pushed to the
     # device as it goes, so peak host use is one chunk regardless of file size.
-    chunk_rows = max(1, min(p, chunk_bytes // max(bpv, 1)))
     out = cp.empty((p, bpv), dtype=cp.uint8)
+    _fill_packed_rows(reader, rows, bpv, out, chunk_bytes=chunk_bytes)
+    return out
+
+
+def _fill_packed_rows(reader, rows, bpv, out, chunk_bytes=(192 << 20), xp=None):
+    """Read ``rows`` into ``out[:len(rows)]``, host-chunked. See the note above.
+
+    Split out of _load_packed_rows so _PackedRowCache can refill a bounded
+    buffer with exactly the same read pattern, rather than reimplementing it.
+    """
+    xp = xp if xp is not None else cp
+    rows = np.asarray(rows, dtype=np.int64)
+    p = len(rows)
+    chunk_rows = max(1, min(max(p, 1), chunk_bytes // max(bpv, 1)))
     at = 0
-    for lo, hi in runs:
+    for lo, hi in _contiguous_runs(rows):
         for c0 in range(lo, hi, chunk_rows):
             c1 = min(c0 + chunk_rows, hi)
             buf = np.frombuffer(reader.read_packed_bytes(c0, c1),
                                 dtype=np.uint8)
             k = c1 - c0
-            out[at:at + k] = cp.asarray(buf).reshape(k, bpv)
+            out[at:at + k] = xp.asarray(buf).reshape(k, bpv)
             at += k
             del buf
     return out
+
+
+#: Test hook. A file small enough to run in CI always fits entirely, so the
+#: bounded-residency path would never be exercised without a way to force it.
+#: Set to a row count to cap the cache regardless of available memory.
+_ROW_CACHE_MAX_ROWS = None
+
+
+def _row_cache_cap(p, tile, window, bpv, free_bytes, share=0.25):
+    """Rows to hold resident, or None if residency cannot be bounded.
+
+    The scan's widest ask is ``[i0, i1 + window)``, so ``tile + window`` rows is
+    a hard floor -- below it _PackedRowCache raises rather than hand back a
+    short view. Above it, extra rows are pure win: refilling exactly the floor
+    re-reads the whole window band on every step, and forward context amortises
+    that away.
+
+    Returns None for ``window=None``. All-pairs runs the inner loop to p, so
+    every row from i0 onward is live and there is nothing to bound; the caller
+    falls back to a whole-file load, which for all-pairs is what it always was.
+    """
+    p = int(p)
+    if window is None:
+        return None
+    floor = int(tile) + int(window)
+    if floor >= p:
+        return p
+    need = floor * int(bpv)
+    budget = int(float(share) * float(free_bytes))
+    if need > budget:
+        # Say which knob moves it. The window is the only term the caller
+        # controls here, and at this point they have usually been told to
+        # narrow it for TIME reasons, which is a different axis.
+        raise ValueError(
+            f"a bounded row cache needs at least tile+window = {floor:,} rows "
+            f"x {bpv:,} B = {need / 1e9:,.2f} GB, but the budget is "
+            f"{budget / 1e9:,.2f} GB ({share:.0%} of {free_bytes / 1e9:,.2f} GB "
+            f"free). Reduce window=, or reduce the sample count -- bytes per "
+            f"variant is ceil(n/4), so halving n halves this.")
+    cap = int(min(p, budget // int(bpv)))
+    if _ROW_CACHE_MAX_ROWS is not None:
+        cap = int(min(cap, max(floor, int(_ROW_CACHE_MAX_ROWS))))
+    return cap
+
+
+class _PackedRowCache:
+    """Serves contiguous ranges of SELECTED packed rows from a bounded buffer.
+
+    Why this exists
+    ---------------
+    ``_load_packed_rows`` allocates ``(p, ceil(n/4))`` bytes for every selected
+    variant at once. At n=414,830 that is 103,708 bytes per variant, so a
+    chromosome of 8M variants wants ~830 GB against a T4's 14.5 GB, and the
+    fused scan dies at that single allocation before running a GEMM. The
+    ceiling TIGHTENS as n grows, which is the opposite direction from every
+    other cost in the scan, and narrowing ``window`` does not move it at all --
+    the window bounds compute, not residency.
+
+    But the scan never needs them all. ``_scan_gpu_fused`` touches packed rows
+    only as ``[i0:i1]`` and ``[j0:j1]`` with ``j0 >= i0`` and
+    ``j1 <= i1 + window``, and ``i0`` advances monotonically. At most
+    ``B + window`` rows are live at any moment.
+
+    Contract
+    --------
+    Indexing is by SELECTED row, matching ``_load_packed_rows``: ``cache[k]`` is
+    ``rows[k]``, not file row k. ``cache[lo:hi]`` returns a contiguous view, so
+    ``_build_g``'s zero-copy ``packed2d[lo:hi].ravel()`` keeps working
+    unchanged. A range wider than ``cap_rows`` RAISES rather than returning a
+    short view -- a truncated plane would silently corrupt a GEMM, which is far
+    worse than stopping.
+    """
+
+    def __init__(self, reader, rows, bpv, cap_rows, xp=None,
+                 chunk_bytes=(192 << 20)):
+        self._xp = xp if xp is not None else cp
+        self._reader = reader
+        self._rows = np.asarray(rows, dtype=np.int64)
+        self._bpv = int(bpv)
+        self._chunk_bytes = int(chunk_bytes)
+        self.cap = int(max(1, min(int(cap_rows), len(self._rows))))
+        self._buf = self._xp.empty((self.cap, self._bpv), dtype=np.uint8)
+        self._base = 0
+        self.resident = 0
+        self.refills = 0
+
+    @property
+    def nbytes(self) -> int:
+        return self.cap * self._bpv
+
+    def _ensure(self, lo, hi):
+        if self.resident and self._base <= lo and hi <= self._base + self.resident:
+            return
+        want = hi - lo
+        if want > self.cap:
+            raise ValueError(
+                f"row range [{lo:,}, {hi:,}) is {want:,} rows but the cache cap "
+                f"is {self.cap:,}. The cap must be at least B + window; a "
+                f"short view would corrupt the GEMM silently.")
+        # Refill from lo, taking as much forward context as the cap allows.
+        # Access is monotone in lo, so nothing behind lo is wanted again.
+        take = int(min(self.cap, len(self._rows) - lo))
+        _fill_packed_rows(self._reader, self._rows[lo:lo + take], self._bpv,
+                          self._buf, chunk_bytes=self._chunk_bytes, xp=self._xp)
+        self._base, self.resident = int(lo), take
+        self.refills += 1
+
+    def __getitem__(self, sl):
+        if not isinstance(sl, slice):
+            raise TypeError("_PackedRowCache supports slice access only")
+        lo = 0 if sl.start is None else int(sl.start)
+        hi = len(self._rows) if sl.stop is None else int(sl.stop)
+        if sl.step not in (None, 1):
+            raise ValueError("_PackedRowCache does not support strided access")
+        lo = max(0, lo)
+        hi = min(len(self._rows), hi)
+        self._ensure(lo, hi)
+        a = lo - self._base
+        return self._buf[a:a + (hi - lo)]
+
+    def __len__(self):
+        return len(self._rows)
 
 
 def _plan_cand_tiles(cand, pos, span, max_cands, row_budget):
@@ -3341,7 +3496,38 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
     # B=31,744 and then allocated a 31,744 x 100,000 plane buffer to hold
     # 4,000 rows -- ~8x over-allocation, invisible whenever p >> B.
     B = max(256, min(B, p))
-    packed = _load_packed_rows(reader, rows, bpv, verbose)
+    # Residency. The fused scan touches packed rows only as [i0:i1] and
+    # [j0:j1] with j0 >= i0 and j1 <= i1 + window, and i0 advances
+    # monotonically -- so a windowed scan needs at most B + window rows live,
+    # not all p. Holding all p is p * ceil(n/4) bytes: 830 GB for an 8M-variant
+    # chromosome at n=414,830, against a T4's 14.5 GB, and it fails at the
+    # single allocation before any GEMM runs.
+    _free = None
+    if HAS_CUPY:
+        try:
+            _free = int(cp.cuda.Device().mem_info[0])
+        except Exception:                                      # noqa: BLE001
+            _free = None
+    # COST OF BOUNDING IT: the packed data is now read more than once. The
+    # moments pre-pass sweeps the rows, the adjusted path's basis pre-pass
+    # sweeps them again, and the tile loop sweeps them a third time -- against
+    # one read into one huge buffer before. Each sweep is monotone, so the cache
+    # streams rather than thrashes, but a windowed scan at full residency-bound
+    # scale is I/O bound rather than compute bound, and the hours estimate from
+    # FLOPs alone will read low. Fusing the moments into the refill would cut it
+    # to one pass and is the obvious next optimisation.
+    _cap = None
+    if window is not None and (_free or _ROW_CACHE_MAX_ROWS is not None):
+        _cap = _row_cache_cap(p, B, int(window), bpv, _free or (1 << 62))
+    if _cap is not None and _cap < p:
+        packed = _PackedRowCache(reader, rows, bpv, _cap)
+        if verbose:
+            print(f"[ld] row cache: {_cap:,} of {p:,} rows resident "
+                  f"({packed.nbytes / 2**30:.2f} GiB; whole set would be "
+                  f"{p * bpv / 2**30:.2f} GiB)", flush=True)
+    else:
+        packed = _load_packed_rows(reader, rows, bpv, verbose)
+    _mblock = None if _cap is None or _cap >= p else max(256, _cap - int(window or 0))
 
     # Per-variant moments straight from the packed bytes. This previously
     # streamed chunks through _build_dosage, which materialises G, G2 and M --
@@ -3350,8 +3536,7 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
     # n=500,000 to compute 160 KB of output, and it dominated the run at large
     # n. The kernel reads the 2-bit data once, writes only the sums, and stays
     # bit-exact by accumulating in integers.
-    s_v, q_v = (_hap_moments(packed, p, ns, bpv) if phased
-                else _variant_moments(packed, p, ns, bpv))
+    s_v, q_v = _moments_blocked(packed, p, ns, bpv, phased, _mblock)
 
     # ---- ancestry adjustment via an AUGMENTED GEMM ------------------------
     # COST, measured (RTX 4090, n=2504, K=20, count_only, against the same
