@@ -483,6 +483,10 @@ _PARAM_KEYS = (
     "scope",
     # retention -- what was written, and so what the reader may be asked
     "min_r2", "max_p", "correction", "alpha", "top_k",
+    # ancestry adjustment: the rank of the basis r was residualised on. Set
+    # means every stored r is a correlation between PC-residualised genotypes,
+    # which invalidates chi2 = N * r^2 -- see LDReader._refuse_if_adjusted.
+    "adjust",
     # provenance needed to derive every other statistic from r
     "n_obs", "m_tests",
 )
@@ -869,9 +873,36 @@ class LDReader:
                 "there is nothing to derive it from.")
         return float(scalar)
 
+    def _refuse_if_adjusted(self, what: str) -> None:
+        """No p-value is defined for an ancestry-adjusted r.
+
+        `cugen.ld` already refuses p-values for the corrected statistics, and
+        the reasoning is in its module docstring: nothing in Bercovich et al.
+        gives a null sampling law for them, and chi2 = N * r^2 does not
+        transfer, because after rank-K residualisation the effective sample
+        size is not N. The refusal has to live here too. A file records
+        `adjust`, so a reader that quietly computed N * r^2 would produce
+        p-values under the wrong null from correct data -- the failure mode
+        that leaves no trace.
+        """
+        k = self.params.get("adjust")
+        if k is None or int(k) == 0:
+            return
+        raise ValueError(
+            f"{what} is not available: this file was written with "
+            f"adjust={k}, so every stored r is a correlation between "
+            f"genotypes residualised on a rank-{k} ancestry basis. chi2 = N * "
+            f"r^2 does not hold for it -- the effective sample size after "
+            f"residualisation is not n_obs={self.params.get('n_obs')}, and no "
+            f"null sampling law for the adjusted measure is established. Use "
+            f"min_r2 to threshold instead, or read the unadjusted file if you "
+            f"need p-values. (adjust=0 is the intercept-only case and "
+            f"reproduces plain r, so it is not refused.)")
+
     def neglog10p(self, r, n_stored=None):
         """-log10 p for a 1-df chi-square of N * r^2."""
         from cugen.ld import _neglog10_chi2_1df              # noqa: PLC0415
+        self._refuse_if_adjusted("neglog10p")
         n = self.n_obs_for(n_stored)
         return _neglog10_chi2_1df(np.asarray(n, dtype=np.float64)
                                   * np.asarray(r, dtype=np.float64) ** 2)
@@ -913,6 +944,7 @@ class LDReader:
         is converted to the equivalent r^2 using n_obs from the header.
         """
         if max_p is not None:
+            self._refuse_if_adjusted("max_p")
             n = self.params.get("n_obs")
             if not n:
                 raise ValueError(
@@ -922,6 +954,7 @@ class LDReader:
         t = self._check_threshold(min_r2)
         if with_p:
             # Fail before reading a single block if p is not derivable at all.
+            self._refuse_if_adjusted("with_p")
             self.n_obs_for(np.zeros(0) if self.has_per_pair_n else None)
         oi, oj, orr, on = [], [], [], []
         for b in self.blocks:

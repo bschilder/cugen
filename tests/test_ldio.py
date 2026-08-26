@@ -1031,3 +1031,69 @@ def test_streaming_to_cugenld_records_its_params_and_resumes(tmp_path,
     assert ds.params["n_obs"] == dos.shape[1] or ds.params["n_obs"] > 0
     w = ldio.LDDatasetWriter(d, params=ds.params, resume=True)
     assert len(w.completed_shards()) == ds.n_shards
+
+
+# ------------------------------------------------------- ancestry adjustment
+# An adjusted r is a correlation between PC-RESIDUALISED genotypes. chi2 = N*r^2
+# does not transfer to it: after rank-K residualisation the effective sample
+# size is not N, and cugen.ld already refuses p-values for the corrected stats
+# for exactly this reason (see the module docstring at cugen/ld.py:245). The
+# format has to carry that refusal too, or a stored adjusted r silently yields
+# p-values computed under the wrong null the moment anyone reads the file back.
+
+ADJ = dict(PARAMS, adjust=10)
+
+
+def test_adjust_round_trips_through_the_header(tmp_path):
+    """It has to be recorded, or a reader cannot know to refuse."""
+    i = np.array([0, 0, 1]); j = np.array([1, 2, 2])
+    r = np.array([0.9, 0.5, 0.3])
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r, params=ADJ))
+    assert rd.params["adjust"] == 10
+
+
+def test_neglog10p_refuses_on_an_adjusted_file(tmp_path):
+    i = np.array([0, 0, 1]); j = np.array([1, 2, 2])
+    r = np.array([0.9, 0.5, 0.3])
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r, params=ADJ))
+    with pytest.raises(ValueError, match="adjust"):
+        rd.neglog10p(r)
+
+
+def test_above_with_max_p_refuses_on_an_adjusted_file(tmp_path):
+    """The p-value path into `above` is the one a caller reaches by accident:
+    max_p is converted to an equivalent r^2 using n_obs, which is exactly the
+    conversion that does not hold after residualisation."""
+    i = np.array([0, 0, 1]); j = np.array([1, 2, 2])
+    r = np.array([0.9, 0.5, 0.3])
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r, params=ADJ))
+    with pytest.raises(ValueError, match="adjust"):
+        rd.above(max_p=1e-3)
+
+
+def test_above_with_p_columns_refuses_on_an_adjusted_file(tmp_path):
+    i = np.array([0, 0, 1]); j = np.array([1, 2, 2])
+    r = np.array([0.9, 0.5, 0.3])
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r, params=ADJ))
+    with pytest.raises(ValueError, match="adjust"):
+        rd.above(0.1, with_p=True)
+
+
+def test_an_unadjusted_file_still_yields_p_values(tmp_path):
+    """The guard must key on `adjust` being set, not on its presence."""
+    i = np.array([0, 0, 1]); j = np.array([1, 2, 2])
+    r = np.array([0.9, 0.5, 0.3])
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r, params=PARAMS))
+    p = rd.neglog10p(r)
+    assert np.all(np.isfinite(p)) and p[0] > p[2]
+    rd.above(max_p=1e-10)        # tighter than the stored min_r2; must not raise
+
+
+def test_adjust_zero_is_not_an_adjusted_file(tmp_path):
+    """k = 0 is the intercept-only case, which reproduces plain r exactly, so
+    p-values remain valid. Treating 0 as "adjusted" would refuse a file that is
+    not adjusted at all."""
+    i = np.array([0, 0, 1]); j = np.array([1, 2, 2])
+    r = np.array([0.9, 0.5, 0.3])
+    rd = ldio.read_ld(write_shard(tmp_path, i, j, r, params=dict(PARAMS, adjust=0)))
+    assert np.all(np.isfinite(rd.neglog10p(r)))
