@@ -46,15 +46,19 @@ SRC=":s3:smb-data-prod-scratch/cugen/1kg-30x-grch38/perchrom"
 SUF=""; [ "$ARM" = "ph" ] && SUF="_ph"
 
 say "pull per-chromosome .cugen for $POP"
-for c in $(seq 1 22); do
+PULL="${CHROMS:-$(seq 1 22)}"
+[ "$MODE" = "gw" ] && PULL="$(seq 1 22)"   # gw always needs the whole set to merge
+for c in $PULL; do
     rclone "${R2[@]}" copyto "$SRC/${PRE}chr${c}${SUF}.cugen" "$D/chr${c}.cugen" \
         --stats-one-line >/dev/null 2>&1 || fail "pull chr$c"
 done
 echo "  pulled $(ls $D/chr*.cugen | wc -l) files, $(du -sh $D | cut -f1)"
 
 if [ "$MODE" = "cis" ]; then
-    say "per-chromosome scans (within-chromosome pairs only)"
-    for c in $(seq 1 22); do
+    # CHROMS lets a failed subset be repaired without re-running all 22.
+    CHROMS="${CHROMS:-$(seq 1 22)}"
+    say "per-chromosome scans (within-chromosome pairs only): $CHROMS"
+    for c in $CHROMS; do
         [ -f "$D/chr${c}.cugen" ] || fail "missing chr$c"
         say "scan chr$c"
         CHROM="$c" ARM="$ARM" POP="$POP" MODE=cis \

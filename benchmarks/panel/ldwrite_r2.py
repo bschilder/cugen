@@ -113,7 +113,8 @@ def uploader():
         print("    [up] manifest uploaded", flush=True)
 
 
-threading.Thread(target=uploader, daemon=True).start()
+_up_thread = threading.Thread(target=uploader, daemon=True)
+_up_thread.start()
 
 
 def ticker():
@@ -154,6 +155,24 @@ dt = time.perf_counter() - t0
 print(f"\n  ROWS WRITTEN = {n:,} in {dt/3600:.2f} h", flush=True)
 done.set()
 q.put(1)
-time.sleep(20)
-print(f"  uploaded {stats['up']} shards / {stats['bytes']/1e9:.1f} GB", flush=True)
+# JOIN, do not sleep. An earlier version slept 20 s here; the uploader is a
+# daemon thread, so process exit killed it mid-push and the FINAL manifest
+# upload -- which happens after every shard -- never completed. That leaves a
+# directory of .ldz shards with no manifest.json, which LDDatasetReader refuses
+# outright: the dataset is unreadable even though every byte of data is present.
+# It only bit the large chromosomes, because small ones finished inside 20 s,
+# which is what made it look intermittent rather than systematic.
+_up_thread.join(timeout=3600)
+
+# And verify the manifest is actually THERE. The upload returning cleanly is not
+# the same as the object existing, and this is the one file whose absence makes
+# everything else worthless.
+_chk = subprocess.run(["rclone"] + R2 + ["lsf", f":s3:{BUCKET}/{DEST}/manifest.json"],
+                      capture_output=True, text=True)
+if "manifest.json" not in _chk.stdout:
+    raise SystemExit(
+        f"FATAL: manifest.json missing at {DEST} after {stats['up']} shards. "
+        f"The shards are useless without it -- re-run this scan.")
+print(f"  uploaded {stats['up']} shards / {stats['bytes']/1e9:.1f} GB, "
+      f"manifest verified present", flush=True)
 print("LDWRITE_DONE", flush=True)
