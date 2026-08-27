@@ -3,7 +3,7 @@
 # Downloads its own VCF, filters, converts, uploads artifacts to HF, deletes the
 # VCF. Nothing but the outputs ever leaves the pod.
 #
-# NO `set -x` anywhere: HF_TOKEN is in this environment.
+# NO `set -x` anywhere: R2 credentials are in this environment.
 #
 # ASCERTAINMENT (the reason this file was rewritten)
 # --------------------------------------------------
@@ -32,14 +32,18 @@ L=/root/job.log; exec > >(tee -a "$L") 2>&1
 say(){ echo "===== $(date -u +%H:%M:%S) chr$N $* ====="; }
 fail(){ echo "CHROMJOB_FAIL chr$N: $*"; exit 1; }
 
-if [[ -n "${HF_TOKEN:-}" ]]; then echo "  HF_TOKEN present? YES"; else fail "no HF_TOKEN"; fi
+# Guard on what this script ACTUALLY needs. An earlier revision still checked
+# HF_TOKEN after the upload had moved to R2, which failed 21 pods on boot.
+for v in r2_endpoint r2_access_key r2_secret; do
+    if [[ -n "${!v:-}" ]]; then echo "  $v present? YES"; else fail "no $v"; fi
+done
 
 say "deps"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq >/dev/null 2>&1
 apt-get install -y -qq bcftools tabix curl git unzip >/dev/null 2>&1 || fail "apt"
 pip install -q --no-input --break-system-packages --root-user-action=ignore \
-    numpy "pandas>=2.0" "scipy>=1.10" "pyarrow>=13" cyvcf2 huggingface_hub \
+    numpy "pandas>=2.0" "scipy>=1.10" "pyarrow>=13" cyvcf2 \
     >/dev/null 2>&1 || fail "pip"
 [ -d /root/cugen_ld ] || git clone -q --branch ld-rowblock --depth 3 \
     https://github.com/bschilder/cugen.git /root/cugen_ld || fail "clone"
@@ -206,7 +210,7 @@ say "upload artifacts to R2"
 # are never written to a config file on a shared-account pod, and there is no
 # `set -x` in this script.
 DEST_BUCKET=smb-data-prod-scratch
-DEST_PREFIX=cugen-ld/1kg-30x-grch38-v2/perchrom
+DEST_PREFIX=cugen/1kg-30x-grch38/perchrom
 command -v rclone >/dev/null || curl -sSL https://rclone.org/install.sh | bash >/dev/null 2>&1
 [[ -n "${r2_access_key:-}" ]] || fail "r2_access_key not set"
 
