@@ -34,11 +34,13 @@ import sys
 
 import numpy as np
 
-from .write import CugenWriter, ENCODING_2BIT
+from .write import CugenWriter, ENCODING_2BIT, pack_2bit
 
 
 #: 2-bit code for a no-call. Dosages are 0/1/2; 3 means missing.
 _MISSING_CODE = 3.0
+#: The same code as a 2-bit integer, for the int8 fast path.
+_MISSING_U8 = 3
 
 MISSING_POLICIES = ("keep", "ref", "mean", "drop")
 
@@ -131,6 +133,93 @@ def _apply_missing_policy(dosages, policy):
     return out, n_missing
 
 
+def _convert_codes(codes, policy):
+    """One variant of pgenlib hardcalls -> what CugenWriter would have written.
+
+    Returns ``(packed_bytes, mu, sxx, maf, has_missing, n_missing)``, or a
+    leading ``None`` when the policy drops the variant.
+
+    This replaces a float64 round-trip. The old path promoted each variant to
+    float64 -- 4.09 MiB at n=535,662, well past L2 -- and then built roughly a
+    dozen more arrays that size across the missing policy, ``variant_stats`` and
+    the 2-bit packing. That measured 2.89 ms per variant, i.e. 2.04 h for chr1's
+    2,537,153 SNVs before any I/O. Dosages are 0/1/2 plus a no-call, so none of
+    it needed 64-bit floats.
+
+    Three things make it fast, all measured rather than assumed:
+
+    * ``int8 -> uint8`` is a free view, and every negative sentinel lands at
+      >= 128 unsigned, so ONE ``minimum`` collapses all no-calls to code 3 with
+      no comparison pass and no ``where``.
+    * ``np.count_nonzero`` is 4x faster than ``(u == k).sum()`` here, and
+      ``np.bincount`` on uint8 is 17x SLOWER -- it upcasts to intp.
+    * mu and sxx follow from the counts. For dosages in {0,1,2},
+      ``sum(x) = n1 + 2*n2`` and ``sum(x**2) = n1 + 4*n2``, both exact integers
+      far inside 2**53, so no pass over the vector is needed at all.
+
+    The statistics are computed over the IMPUTED counts, preserving the ordering
+    the old path had (policy applied before ``variant_stats``), which is what
+    keeps mu/sxx/maf self-consistent with the stored dosages.
+
+    The written file is BIT-IDENTICAL to what the old path produced. ``sxx`` is
+    the only value that differs in float64 -- the closed form ``s2 - s1**2/cnt``
+    carries two roundings where ``sum((x - mu)**2)`` carries about n, making the
+    closed form the more accurate of the two -- and the difference is ~4e-16
+    relative, which the float32 the writer stores erases completely.
+    tests/test_convert_fastpath.py asserts both halves.
+    """
+    c = np.ascontiguousarray(codes, dtype=np.int8)
+    n = int(c.size)
+    u = np.minimum(c.view(np.uint8), np.uint8(_MISSING_U8))
+    # Plain ints, not numpy scalars: variant_stats returned bool() and int(),
+    # and CugenWriter stores them; a np.bool_ leaking out here would be a
+    # silent type change in the header fields.
+    n0 = int(np.count_nonzero(u == 0))
+    n1 = int(np.count_nonzero(u == 1))
+    n2 = int(np.count_nonzero(u == 2))
+    cnt = n0 + n1 + n2
+    n_missing = n - cnt
+
+    if n_missing:
+        if policy == "drop":
+            return None, 0.0, 0.0, 0.0, True, n_missing
+        if policy == "mean":
+            if cnt == 0:
+                # No observed call means no mean to fill with; pgen2cugen turns
+                # this into an error naming the variant.
+                return None, 0.0, 0.0, 0.0, True, n_missing
+            # np.rint, not round(): banker's rounding, matching the old path.
+            fill = int(np.rint(float(n1 + 2 * n2) / cnt))
+        elif policy == "ref":
+            fill = 0
+        elif policy == "keep":
+            fill = _MISSING_U8
+        else:
+            raise ValueError(
+                f"unknown missing= policy {policy!r}; expected one of "
+                f"{list(MISSING_POLICIES)}")
+        if fill != _MISSING_U8:
+            u[u == _MISSING_U8] = fill
+            if fill == 0:
+                n0 += n_missing
+            elif fill == 1:
+                n1 += n_missing
+            else:
+                n2 += n_missing
+            cnt += n_missing
+
+    if cnt:
+        s1 = float(n1 + 2 * n2)
+        s2 = float(n1 + 4 * n2)
+        mu = s1 / cnt
+        sxx = s2 - s1 * s1 / cnt
+        af = mu / 2.0
+        maf = min(af, 1.0 - af)
+    else:
+        mu = sxx = maf = 0.0
+    return pack_2bit(u).tobytes(), mu, sxx, maf, bool(cnt < n), n_missing
+
+
 def _write_samples(out_path, sample_ids):
     p = f"{out_path}.samples.txt"
     with open(p, "w") as f:
@@ -202,11 +291,15 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
     buf = np.empty(n_samples, dtype=np.int8)
 
     def _read(v):
-        """One variant as float dosages, pgenlib's -9 folded to the 2-bit code."""
+        """One variant of raw int8 hardcalls, straight from pgenlib.
+
+        Deliberately NOT promoted to float64 here. That promotion, plus the
+        temporaries it forced through the missing policy, variant_stats and the
+        packing, was 2.89 ms per variant at n=535,662 -- 2.04 h for chr1 before
+        any I/O. :func:`_convert_codes` consumes the int8 directly.
+        """
         reader.read(int(v), buf)
-        d = buf.astype(np.float64)
-        d[d < 0] = _MISSING_CODE                # pgenlib marks missing as -9
-        return d
+        return buf
 
     # `drop` changes the variant count, and CugenWriter._finalize refuses a
     # short write ("declared N variants, wrote M"). So learn the surviving count
@@ -216,7 +309,7 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
     if missing == "drop":
         keep_mask = np.ones(len(vidx), dtype=bool)
         for k, v in enumerate(vidx):
-            keep_mask[k] = _apply_missing_policy(_read(v), "drop")[0] is not None
+            keep_mask[k] = _convert_codes(_read(v), "drop")[0] is not None
             if verbose:
                 _progress(k, len(vidx))
         if verbose:
@@ -237,11 +330,12 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
         for k, v in enumerate(vidx):
             if keep_mask is not None and not keep_mask[k]:
                 continue
-            d, n_miss = _apply_missing_policy(_read(v), missing)
+            packed, mu, sxx, maf, has_missing, n_miss = _convert_codes(
+                _read(v), missing)
             if n_miss:
                 n_missing_total += n_miss
                 n_var_with_missing += 1
-            if d is None:
+            if packed is None:
                 # Only reachable for 'mean' on a fully-missing variant, which
                 # the counting pass above does not run for. Refuse rather than
                 # write a short file, which _finalize would reject anyway with
@@ -252,7 +346,7 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
                     f"missing={missing!r} has no mean to fill with. Use "
                     f"missing='drop' to discard such variants, or filter them "
                     f"upstream (plink2 --geno 0.99).")
-            w.add_variant(int(g[k]), d)
+            w.add_variant_packed(int(g[k]), packed, mu, sxx, maf, has_missing)
             if verbose:
                 _progress(k, len(vidx))
     reader.close()
