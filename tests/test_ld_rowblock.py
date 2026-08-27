@@ -165,36 +165,50 @@ def _small_cugen(tmp_path):
     return out
 
 
+def _scan(path, out, cap, monkeypatch):
+    """Run the scan through the STREAMING path and return (i, j, r).
+
+    It has to be the streaming path. `on_device` requires count_only, a native
+    .cugenld stream, or cuDF plus an output -- a plain DataFrame-returning call
+    has none of them, so it never reaches _scan_gpu_fused and never touches the
+    row cache. An earlier version of these tests did exactly that and compared
+    two identical whole-file runs, which is why the companion spy test below
+    exists. This is also the path AoU.genome.ld.run_scan uses.
+    """
+    from cugen import ld as LD
+    from cugen.ldio import open_ld
+    monkeypatch.setattr(LD, "_ROW_CACHE_MAX_ROWS", cap)
+    n = LD.ld_matrix(path, stats=("r2",), window=32, min_r2=0.0,
+                     backend="gpu", maf_min=0.01, tile_size=32,
+                     stream=True, output=str(out))
+    i, j, r = open_ld(str(out)).rows()
+    order = np.lexsort((j, i))
+    return int(n), i[order], j[order], r[order]
+
+
 @pytest.mark.parametrize("cap_rows", [64, 96, 130])
 def test_a_bounded_cache_gives_bit_identical_results(_small_cugen, cap_rows,
-                                                     monkeypatch):
+                                                     tmp_path, monkeypatch):
     """The whole point: bounding residency must not change a single value.
 
     Same tiles, same kernels, same integer accumulation -- only where the bytes
-    live changes. Any difference here means the cache is serving wrong rows.
+    live changes. Any difference means the cache served the wrong rows.
     """
     pytest.importorskip("cupy", reason="fused scan is GPU-only")
-    from cugen import ld as LD
-
-    kw = dict(stats=("r2",), window=32, min_r2=0.0, backend="gpu",
-              maf_min=0.01, tile_size=32)
-    monkeypatch.setattr(LD, "_ROW_CACHE_MAX_ROWS", None)
-    whole = LD.ld_matrix(_small_cugen, **kw)
-    monkeypatch.setattr(LD, "_ROW_CACHE_MAX_ROWS", cap_rows)
-    blocked = LD.ld_matrix(_small_cugen, **kw)
-
-    assert len(whole) == len(blocked), "row counts differ"
-    for col in whole.columns:
-        a, bb = np.asarray(whole[col]), np.asarray(blocked[col])
-        if a.dtype.kind == "f":
-            np.testing.assert_array_equal(a, bb)      # bit-identical, not close
-        else:
-            np.testing.assert_array_equal(a, bb)
+    n_w, i_w, j_w, r_w = _scan(_small_cugen, tmp_path / "whole.cugenld",
+                               None, monkeypatch)
+    n_b, i_b, j_b, r_b = _scan(_small_cugen, tmp_path / f"blk{cap_rows}.cugenld",
+                               cap_rows, monkeypatch)
+    assert n_w == n_b, f"row counts differ: {n_w:,} vs {n_b:,}"
+    np.testing.assert_array_equal(i_w, i_b)
+    np.testing.assert_array_equal(j_w, j_b)
+    np.testing.assert_array_equal(r_w, r_b)          # bit-identical, not close
 
 
-def test_the_cache_path_is_actually_taken_when_forced(_small_cugen, monkeypatch):
-    """Guards against the equality test above passing vacuously because the cap
-    was ignored and the whole file loaded both times."""
+def test_the_cache_path_is_actually_taken_when_forced(_small_cugen, tmp_path,
+                                                      monkeypatch):
+    """Guards against the equality test passing vacuously because the cap was
+    ignored and the whole file loaded on both sides. It caught exactly that."""
     pytest.importorskip("cupy", reason="fused scan is GPU-only")
     from cugen import ld as LD
 
@@ -207,8 +221,26 @@ def test_the_cache_path_is_actually_taken_when_forced(_small_cugen, monkeypatch)
             made.append(self)
 
     monkeypatch.setattr(LD, "_PackedRowCache", _Spy)
-    monkeypatch.setattr(LD, "_ROW_CACHE_MAX_ROWS", 64)
-    LD.ld_matrix(_small_cugen, stats=("r2",), window=32, min_r2=0.0,
-                 backend="gpu", maf_min=0.01, tile_size=32)
+    _scan(_small_cugen, tmp_path / "spy.cugenld", 64, monkeypatch)
     assert made, "the bounded cache was never constructed"
     assert made[0].refills >= 2, "a 64-row cap over 400 rows must refill"
+
+
+def test_the_whole_file_path_is_taken_when_not_forced(_small_cugen, tmp_path,
+                                                      monkeypatch):
+    """The other half of the guard: the baseline arm must NOT be using the
+    cache, or 'blocked vs whole' compares two blocked runs."""
+    pytest.importorskip("cupy", reason="fused scan is GPU-only")
+    from cugen import ld as LD
+
+    made = []
+    real = LD._PackedRowCache
+
+    class _Spy(real):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            made.append(self)
+
+    monkeypatch.setattr(LD, "_PackedRowCache", _Spy)
+    _scan(_small_cugen, tmp_path / "base.cugenld", None, monkeypatch)
+    assert not made, "the baseline arm must load the whole file"
