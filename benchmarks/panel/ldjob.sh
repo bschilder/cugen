@@ -8,6 +8,16 @@
 set -uo pipefail
 POP="${POP:?POP not set}"          # ALL | AFR | AMR | EAS | EUR | SAS
 ARM="${ARM:?ARM not set}"          # un | ph
+MODE="${MODE:-gw}"                 # gw = genome-wide (cis+trans) | cis = per-chromosome
+#
+# Both are needed and they are not redundant. The genome-wide scan concatenates
+# all 22 chromosomes and emits every pair, so it CONTAINS the within-chromosome
+# pairs -- but recovering them means filtering across ~2,500 shards, since shards
+# are row-budgeted and each spans a narrow slab of both variant axes rather than
+# aligning to chromosome boundaries. A per-chromosome scan writes one
+# independently-queryable dataset per chromosome, which is what a viz layer wants
+# to load. Cis is also cheap: cross-chromosome pairs were 93.7% of the old row
+# count, so the cis arm is ~6% of the genome-wide output.
 D=/root/data; mkdir -p $D /root/ld_out
 exec > >(tee -a /root/ldjob.log) 2>&1
 say(){ echo "===== $(date -u +%H:%M:%S) $POP/$ARM $* ====="; }
@@ -41,6 +51,19 @@ for c in $(seq 1 22); do
         --stats-one-line >/dev/null 2>&1 || fail "pull chr$c"
 done
 echo "  pulled $(ls $D/chr*.cugen | wc -l) files, $(du -sh $D | cut -f1)"
+
+if [ "$MODE" = "cis" ]; then
+    say "per-chromosome scans (within-chromosome pairs only)"
+    for c in $(seq 1 22); do
+        [ -f "$D/chr${c}.cugen" ] || fail "missing chr$c"
+        say "scan chr$c"
+        CHROM="$c" ARM="$ARM" POP="$POP" MODE=cis \
+            python3 /root/ldwrite_r2.py || fail "scan chr$c"
+        rm -f "$D/chr${c}.cugen"
+    done
+    say "LDJOB_OK"
+    exit 0
+fi
 
 say "concatenate -> genome-wide panel"
 python3 - <<'PYX' || fail "merge"

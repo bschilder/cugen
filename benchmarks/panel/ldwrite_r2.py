@@ -35,11 +35,24 @@ from cugen.ld import ld_matrix            # noqa: E402
 
 ARM = os.environ["ARM"]                              # "ph" | "un"
 POP = os.environ.get("POP", "ALL")
+MODE = os.environ.get("MODE", "gw")                  # "gw" | "cis"
+CHROM = os.environ.get("CHROM")                      # required when MODE=cis
 SUF = "_ph" if ARM == "ph" else ""
-PANEL = f"/root/data/chrALL{SUF}.cugen"
-OUTD = f"/root/ld_out/{POP}_{ARM}.cugenld"
 BUCKET = "smb-data-prod-scratch"
-DEST = f"cugen/1kg-30x-grch38/ld/{POP}/ld_{ARM}"
+
+if MODE == "cis":
+    # One chromosome at a time, so every emitted pair is within-chromosome by
+    # construction rather than by filtering afterwards. The per-chromosome
+    # .cugen pulled from R2 is already the right scope; no merge, no window.
+    if not CHROM:
+        raise SystemExit("MODE=cis needs CHROM")
+    PANEL = f"/root/data/chr{CHROM}.cugen"
+    OUTD = f"/root/ld_out/{POP}_{ARM}_cis_chr{CHROM}.cugenld"
+    DEST = f"cugen/1kg-30x-grch38/ld/{POP}/ld_{ARM}_cis/chr{CHROM}.cugenld"
+else:
+    PANEL = f"/root/data/chrALL{SUF}.cugen"
+    OUTD = f"/root/ld_out/{POP}_{ARM}.cugenld"
+    DEST = f"cugen/1kg-30x-grch38/ld/{POP}/ld_{ARM}"
 os.makedirs(os.path.dirname(OUTD), exist_ok=True)
 
 R2 = ["--s3-provider", "Cloudflare",
@@ -115,7 +128,8 @@ r = CugenReader(PANEL)
 P, N = r.n_variants, r.n_samples
 r.close()
 sel = ("r_phased", "r2_phased") if ARM == "ph" else ("r", "r2")
-print(f"  panel {PANEL}  n={N:,}  p={P:,}  arm={ARM}  pop={POP}", flush=True)
+print(f"  panel {PANEL}  n={N:,}  p={P:,}  arm={ARM}  pop={POP}  mode={MODE}",
+      flush=True)
 print(f"  -> r2:{BUCKET}/{DEST}", flush=True)
 
 t0 = time.perf_counter()
