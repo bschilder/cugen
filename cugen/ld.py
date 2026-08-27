@@ -4351,6 +4351,8 @@ def ld_matrix(
         "scope": scope,
         "min_r2": float(min_r2), "max_p": max_p, "correction": correction,
         "alpha": float(alpha),
+        # Recorded so a reader never has to guess. See ldio._PARAM_KEYS.
+        "sign_reference": sign_reference,
         "top_k": None if top_k is None else int(top_k),
         # rank of the ancestry basis, i.e. the number of PC columns actually
         # residualised out. ldio.LDReader refuses p-values when this is set

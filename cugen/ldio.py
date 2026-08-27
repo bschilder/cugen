@@ -487,6 +487,20 @@ _PARAM_KEYS = (
     # means every stored r is a correlation between PC-residualised genotypes,
     # which invalidates chi2 = N * r^2 -- see LDReader._refuse_if_adjusted.
     "adjust",
+    # WHICH ALLELE r IS SIGNED ON. "alt" (ld_matrix's default) or "major"
+    # (signed on the MINOR allele). .cugen dosages count ALT, so reconstructing
+    # a raw cross-product from a stored r needs r * (-1)^(major_i XOR major_j)
+    # for a "major" file and NO flip for an "alt" one -- and applying the
+    # correction that is not needed is as wrong as omitting one that is.
+    #
+    # This ambiguity has already produced a wrong answer here: without it,
+    # |r_adj| reached 7.7 -- impossible for a correlation -- after a complete
+    # table claiming 36% of trans LD survived, wrong by four orders of
+    # magnitude. A file that does not record its own convention leaves that
+    # mistake available to every future reader. None means UNRECORDED, which is
+    # not the same as "alt": datasets written before this key existed cannot be
+    # assumed either way.
+    "sign_reference",
     # provenance needed to derive every other statistic from r
     "n_obs", "m_tests",
 )

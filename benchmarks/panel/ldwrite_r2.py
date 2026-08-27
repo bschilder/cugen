@@ -132,10 +132,24 @@ print(f"  panel {PANEL}  n={N:,}  p={P:,}  arm={ARM}  pop={POP}  mode={MODE}",
       flush=True)
 print(f"  -> r2:{BUCKET}/{DEST}", flush=True)
 
+# flush_rows sized from ACTUAL free device memory, not a constant. The original
+# scan used 200,000,000, which needs ~10.4 GB: 4.0 GB of i/j/r output buffers,
+# plus cp.stack([g_j, g_i]) at 3.2 GB and a comparable lexsort workspace inside
+# _flush. That fits an 80 GB A100 and OOMs a 24 GB RTX 4090 -- which is exactly
+# how the pooled arms died at 24.7 GB allocated of 24.8 GB available.
+#
+# 52 bytes/row covers all three allocations. Take 15% of free memory for them;
+# the row cache, the two plane buffers and the packed residency need the rest.
+import cupy as cp                                            # noqa: E402
+_free = int(cp.cuda.Device().mem_info[0])
+FLUSH_ROWS = max(5_000_000, min(200_000_000, int(0.15 * _free / 52)))
+print(f"  free {_free/1e9:.1f} GB -> flush_rows={FLUSH_ROWS:,} "
+      f"(~{FLUSH_ROWS*52/1e9:.2f} GB of flush buffers)", flush=True)
+
 t0 = time.perf_counter()
 n = ld_matrix(PANEL, variant_range=(0, P), min_r2=0.1, stats=sel,
               sign_reference="major", stream=True, output=OUTD,
-              flush_rows=200_000_000, max_pairs=10**18, verbose=False)
+              flush_rows=FLUSH_ROWS, max_pairs=10**18, verbose=False)
 dt = time.perf_counter() - t0
 print(f"\n  ROWS WRITTEN = {n:,} in {dt/3600:.2f} h", flush=True)
 done.set()
