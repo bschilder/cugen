@@ -668,6 +668,13 @@ def read_cugen_header(path: str) -> dict:
         'encoding': encoding_name(struct.unpack_from('<I', header, 12)[0]),
         'flags': struct.unpack_from('<I', header, 64)[0],
         'phased': bool(struct.unpack_from('<I', header, 64)[0] & FLAG_PHASED),
+        # The fused LD scan refuses any file with this set, and this is the
+        # cheap header-only path -- so a caller preflighting a multi-hour scan
+        # reads it here rather than opening the file. Omitting it meant
+        # `info.get('has_missing')` silently returned None, i.e. "no missing",
+        # which is the wrong answer in the direction that costs hours.
+        'has_missing': bool(struct.unpack_from('<I', header, 64)[0]
+                            & FLAG_HAS_MISSING),
         'n_samples': struct.unpack_from('<Q', header, 16)[0],
         'n_variants': struct.unpack_from('<Q', header, 24)[0],
         'bytes_per_variant': struct.unpack_from('<Q', header, 32)[0],

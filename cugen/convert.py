@@ -74,21 +74,30 @@ def _apply_missing_policy(dosages, policy):
     missing while keeping sxx over only the non-missing calls -- data and stats
     disagreeing.
 
-    Both fills still bias, and neither is free:
+    Both fills bias, and rounding makes ``mean`` bias differently than you would
+    expect. Measured, not assumed -- see tests/test_convert_missing.py:
 
-    * ``mean`` puts imputed samples at (approximately) the variant mean, where
-      they contribute ~0 to the centred sum of squares. sxx is therefore
-      deflated by roughly ``1 - missingness`` against true complete data. r^2 is
-      a ratio, so the bias partly cancels, but not exactly.
+    * EXACT mean-imputation would leave sxx UNCHANGED: filled samples sit on the
+      mean, contribute nothing to the centred sum of squares, and do not move
+      the mean. Only the variance estimate ``sxx/n`` shrinks, by
+      ``1 - missingness``.
+    * ``mean`` here ROUNDS, because 2-bit has no fractional code, so the fill
+      can sit up to 0.49 away from the mean. That shifts the mean AND adds
+      spread, so sxx goes UP -- the same direction as the failure this module's
+      docstring warns about. It is self-consistent, because the stats are
+      recomputed over the imputed vector rather than left over the observed
+      calls, but it is not the benign case exact imputation would be.
+    * ``round(mean)`` is 0 for any variant whose mean dosage is <= 0.5, i.e.
+      AF <= 0.25. Most of a MAF>1% panel sits below that, so for those variants
+      ``mean`` and ``ref`` produce BYTE-IDENTICAL files. The choice only bites
+      above AF 0.25.
     * ``ref`` shifts mu_x and maf downward in proportion to the missingness
-      rate, and the shift lands hardest on common variants -- the ones a
-      MAF-filtered LD panel is made of.
+      rate, hardest on common variants.
 
-    ``mean`` rounds because 2-bit has no fractional code. Exact mean-imputation
-    needs a float encoding, which costs 4-16x the bytes per variant and
-    re-breaks the device-memory ceiling that motivates resolving missingness at
-    all. Rounding uses numpy's half-to-even, so an observed mean of exactly 0.5
-    fills 0 and exactly 1.5 fills 2.
+    Exact mean-imputation needs a float encoding, at 4-16x the bytes per
+    variant -- which re-breaks the device-residency ceiling that motivates
+    resolving missingness at all. Rounding is numpy's half-to-even, so an
+    observed mean of exactly 0.5 fills 0 and exactly 1.5 fills 2.
     """
     if policy not in MISSING_POLICIES:
         raise ValueError(
