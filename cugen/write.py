@@ -295,6 +295,37 @@ class CugenWriter:
             self.f.write(np.asarray(d, dtype=np.float32).tobytes())
         self.i += 1
 
+    def add_variant_packed(self, gidx, packed, mu, sxx, maf, has_missing):
+        """Append a variant whose bytes and statistics are already computed.
+
+        The 2-bit converter path packs and derives mu/sxx/maf from genotype
+        COUNTS, which costs one pass over an int8 vector instead of a dozen over
+        float64 copies of it. Handing the result straight to the writer avoids
+        re-deriving what the caller already knows; ``add_variant`` remains the
+        door for anyone holding dosages.
+
+        The caller owns correctness of the statistics here -- nothing is
+        recomputed -- so this is deliberately not part of the public surface.
+        """
+        if self.encoding != ENCODING_2BIT:
+            raise ValueError(
+                f"add_variant_packed is 2-bit only; this writer has encoding "
+                f"{self.encoding}")
+        if self.i >= self.n_variants:
+            raise IndexError(f"more than the declared {self.n_variants} variants")
+        if len(packed) != self.bytes_per_variant:
+            raise ValueError(
+                f"variant {self.i}: {len(packed)} packed bytes != "
+                f"bytes_per_variant {self.bytes_per_variant}")
+        self.mu_x[self.i] = mu
+        self.sxx[self.i] = sxx
+        self.maf[self.i] = maf
+        self.gidx[self.i] = int(gidx)
+        if has_missing:
+            self.flags |= FLAG_HAS_MISSING
+        self.f.write(packed)
+        self.i += 1
+
     def add_variant_phased(self, gidx, alleles):
         """Add one phased variant. `alleles` is (2*n_samples,) or (n_samples, 2).
 
