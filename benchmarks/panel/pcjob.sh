@@ -66,11 +66,29 @@ for c in range(1, 23):
         bad |= (pos >= r.start) & (pos <= r.end)
     cand = np.nonzero(~bad)[0]
     t0 = time.time()
+    # max_pairs must be lifted explicitly. ld_prune forwards it to ld_matrix,
+    # which defaults to 100,000,000 and REFUSES a larger plan -- and a 1.6M
+    # variant chromosome at window=1000 plans ~978M pairs. The cap exists to
+    # catch runaway all-pairs requests, not a bounded sliding window, and it is
+    # the third place in this project it has had to be raised deliberately.
     kept, _ = ld_prune(f"/root/data/chr{c}.cugen", window=1000, r2=0.1,
-                       variants=cand, maf_min=0.01, backend="gpu", verbose=False)
-    keep_all.append(np.asarray(kept) + off)
+                       variants=cand, maf_min=0.01, backend="gpu",
+                       max_pairs=10**18, verbose=False)
+    # ld_prune returns (keep, drop) as DataFrames with gidx/ID columns, NOT
+    # index arrays. np.asarray(kept) yields a 2-column object array, and adding
+    # the chromosome offset to it fails on the ID column with
+    # "can only concatenate str (not int) to str". Assert the shape so a future
+    # change surfaces here rather than as an arithmetic error.
+    assert hasattr(kept, "columns") and "gidx" in kept.columns, (
+        f"ld_prune returned {type(kept)}; expected a frame with a gidx column")
+    # For a per-chromosome .cugen the stored gidx IS the row position (0..p-1),
+    # and merge_cugen renumbers continuously in path order, so adding the
+    # running offset gives the gidx in the merged panel -- which is what
+    # grm(variants=) matches on (stored gidx, not row position).
+    keep_all.append(kept.gidx.to_numpy().astype(np.int64) + off)
     print(f"  chr{c}: {p:,} variants, {bad.sum():,} in LRLD regions, "
           f"{len(kept):,} pruned-in  ({time.time()-t0:.0f}s)", flush=True)
+    assert keep_all[-1].max() < off + p, "pruned gidx exceeds this chromosome"
     off += p
 sel = np.concatenate(keep_all)
 np.save("/root/data/pruned_no_lrld.npy", sel)

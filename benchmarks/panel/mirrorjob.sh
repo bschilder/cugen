@@ -62,7 +62,7 @@ else
 fi
 echo "  pulled $(du -sh "$LOCAL" | cut -f1) in $(find "$LOCAL" -type f | wc -l) files"
 
-say "upload to HF standardmodelbio/cugen"
+say "upload to HF standardmodelbio/cugen (retrying until verified)"
 python3 - <<PYX || fail "hf upload"
 import os
 from huggingface_hub import HfApi
@@ -70,11 +70,35 @@ api = HfApi(token=os.environ["HF_TOKEN"])
 REPO = "standardmodelbio/cugen"
 # upload_large_folder is resumable and parallel; upload_folder would retry the
 # whole set on a single failure at this file count.
-# folder_path is the TREE ROOT, so the cohort folder becomes the top level.
-api.upload_large_folder(repo_id=REPO, repo_type="dataset",
-                        folder_path="$ROOT", num_workers=8,
-                        print_report=True)
-print("  upload complete")
+import subprocess, time
+
+def local_files():
+    out = subprocess.run(["bash", "-c",
+                          "cd $ROOT && find . -type f | sed 's|^\./||' | sort"],
+                         capture_output=True, text=True)
+    return set(out.stdout.split())
+
+want = local_files()
+print(f"  {len(want):,} files to publish")
+
+# upload_large_folder is resumable: re-running skips what already matches, so a
+# retry is cheap and the loop converges rather than restarting. Verify by FILE
+# SET each round -- "the call returned" is not "the files are there", which is
+# exactly how 484 files previously landed in the wrong place with a green check.
+for attempt in range(1, 6):
+    api.upload_large_folder(repo_id=REPO, repo_type="dataset",
+                            folder_path="$ROOT", num_workers=8,
+                            print_report=True)
+    have = {f for f in api.list_repo_files(REPO, repo_type="dataset")}
+    missing = want - have
+    if not missing:
+        print(f"  attempt {attempt}: all {len(want):,} files present on HF")
+        break
+    print(f"  attempt {attempt}: {len(missing):,} still missing, e.g. "
+          f"{sorted(missing)[:3]} -- retrying", flush=True)
+    time.sleep(30)
+else:
+    raise SystemExit(f"FATAL: {len(missing):,} files never uploaded")
 PYX
 
 say "verify: HF file count matches what was pulled"
