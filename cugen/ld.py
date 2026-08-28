@@ -703,7 +703,8 @@ def _pair_bounds(n_rows: int, positions: Optional[np.ndarray],
                  window: Optional[int], window_kb: Optional[float],
                  min_dist_kb: Optional[float] = None,
                  max_dist_kb: Optional[float] = None,
-                 scope: str = "all", chrom_codes=None):
+                 scope: str = "all", chrom_codes=None,
+                 emit_rows: Optional[Tuple[int, int]] = None):
     """Per-row half-open column range ``[starts, hi)`` for the upper triangle.
 
     Every test-space predicate collapses to this one contiguous range, which is
@@ -711,6 +712,7 @@ def _pair_bounds(n_rows: int, positions: Optional[np.ndarray],
     list would be ~6e11 entries, and m is needed before any data is read.
     Predicates AND together, matching PLINK:
 
+        emit_rows     hi <- starts for every i outside [lo, hi)
         window        hi <- i + window + 1
         max_dist_kb   hi <- last j with pos[j] - pos[i] <= span   (== window_kb)
         scope="cis"   hi <- end of i's chromosome block
@@ -792,6 +794,23 @@ def _pair_bounds(n_rows: int, positions: Optional[np.ndarray],
                     hi[b0:b1] = np.minimum(hi[b0:b1], edge)
                 else:
                     starts[b0:b1] = np.maximum(starts[b0:b1], edge)
+    # emit_rows drops whole ROWS rather than narrowing a column range, which is
+    # what makes block-chunked scanning exact. With window = W every pair has
+    # |i - j| <= W, so a block holding variants [s, e+W) and emitting only rows
+    # in [s, e) covers each pair exactly once: no pair straddling a boundary is
+    # lost, and none is emitted by two blocks. variant_range cannot express that
+    # because it restricts both axes.
+    #
+    # An emptied row is still one contiguous (empty) range, so the closed-form
+    # pair count and every consumer of these bounds keep working unchanged.
+    if emit_rows is not None:
+        r0, r1 = int(emit_rows[0]), int(emit_rows[1])
+        if r0 > r1:
+            raise ValueError(
+                f"emit_rows={emit_rows!r} is empty backwards (lo > hi); pass "
+                f"(lo, hi) with lo <= hi.")
+        outside = (lo < r0) | (lo >= r1)
+        hi = np.where(outside, starts, hi)
     # With no bp predicate nothing bands by position, so position order is
     # irrelevant and the old global monotonicity check would only reject files
     # it never actually mis-banded.
@@ -3988,11 +4007,14 @@ def ld_matrix(
     variant_range: Optional[Tuple[int, int]] = None,
     variants=None,
     region: Optional[str] = None,
+    exclude_regions=None,
+    exclude_pad: int = 0,
     maf_min: float = 0.0,
     maf_max: Optional[float] = None,
     min_dist_kb: Optional[float] = None,
     max_dist_kb: Optional[float] = None,
     scope: str = "all",
+    emit_rows: Optional[Tuple[int, int]] = None,
     top_k: Optional[int] = None,
     window: Optional[int] = None,
     window_kb: Optional[float] = None,
@@ -4211,6 +4233,11 @@ def ld_matrix(
                else pd.read_feather(str(annotation)))
     if (region is not None or window_kb is not None) and ann is None:
         raise ValueError("region= and window_kb= need coordinates; pass annotation=")
+    if exclude_regions is not None and ann is None:
+        raise ValueError(
+            "exclude_regions= needs coordinates to test against; pass "
+            "annotation= with CHR and POS. Skipping the exclusion silently "
+            "would report an unmasked scan as a filtered one.")
     if region is not None and variant_range is not None:
         raise ValueError("pass at most one of region= and variant_range=")
 
@@ -4278,6 +4305,34 @@ def ld_matrix(
         if start is not None:
             sub = sub[(sub["POS"] >= start) & (sub["POS"] <= end)]
         rows = rows[np.isin(gidx_all[rows], np.asarray(sub["gidx"], dtype=np.int64))]
+    if exclude_regions is not None:
+        # Drop excluded variants BEFORE scanning, not after: pairs grow
+        # quadratically, so removing 11% of variants removes ~21% of pairs and
+        # the scan gets cheaper as well as cleaner.
+        from .regions import mask_variants, resolve_regions
+
+        beds = resolve_regions(exclude_regions)
+        if beds:
+            if "gidx" in ann.columns:
+                sub = ann.set_index("gidx").reindex(gidx_all[rows])
+            elif len(ann) == p_all:
+                sub = ann.iloc[rows]
+            else:
+                raise ValueError(
+                    f"annotation has {len(ann):,} rows, the panel has "
+                    f"{p_all:,}, and there is no gidx column to align on")
+            if sub["POS"].isna().any():
+                raise ValueError(
+                    f"{int(sub['POS'].isna().sum()):,} selected variants have "
+                    f"no coordinate in the annotation, so they cannot be "
+                    f"tested against the exclusion regions")
+            bad = mask_variants(sub["CHR"].to_numpy(), sub["POS"].to_numpy(),
+                                beds, pad=int(exclude_pad))
+            n_bad = int(bad.sum())
+            if verbose and n_bad:
+                print(f"  exclude_regions: dropped {n_bad:,} of {rows.size:,} "
+                      f"variants ({100.0 * n_bad / max(rows.size, 1):.2f}%)")
+            rows = rows[~np.asarray(bad)]
     if maf_min > 0:
         rows = rows[maf_all[rows] >= maf_min]
     if maf_max is not None:
@@ -4307,7 +4362,7 @@ def ld_matrix(
         chrom_codes = np.unique(labels, return_inverse=True)[1].astype(np.int64)
 
     _space = dict(min_dist_kb=min_dist_kb, max_dist_kb=max_dist_kb,
-                  scope=scope, chrom_codes=chrom_codes)
+                  scope=scope, chrom_codes=chrom_codes, emit_rows=emit_rows)
     n_pairs = _count_pairs(len(rows), positions, window, window_kb, **_space)
     if n_pairs > max_pairs and not count_only:
         raise ValueError(
