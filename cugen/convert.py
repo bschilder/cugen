@@ -233,7 +233,8 @@ def _progress(i, n, every=50000):
 
 
 def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
-               variant_idx=None, gidx=None, missing="mean", verbose=True):
+               variant_idx=None, gidx=None, missing="mean", verbose=True,
+               read_batch=64):
     """PLINK2 .pgen -> .cugen. Requires pgenlib.
 
     ``missing`` resolves no-calls; see :func:`_apply_missing_policy` for the
@@ -254,6 +255,14 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
 
     A missingness summary is printed when ``verbose``, so the choice can be
     checked against the data rather than assumed.
+
+    ``read_batch`` is how many variants are pulled from pgenlib per call. pgen
+    stores runs of variants as diffs against a reference variant, so reading one
+    variant per call defeats that compression; a batch lets pgenlib decode the
+    run once. Costs ``read_batch * n_samples`` bytes of host buffer -- 34 MB at
+    the default 64 and n = 535,662. Output is byte-identical at every value,
+    which ``tests/test_convert_batched_read.py`` asserts across sparse
+    ``variant_idx``, ``sample_idx`` subsets and all four missing policies.
     """
     try:
         import pgenlib
@@ -288,18 +297,44 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
     if verbose:
         print(f"pgen2cugen: {n_samples:,} samples x {len(vidx):,} variants "
               f"-> {out}  (missing={missing})")
-    buf = np.empty(n_samples, dtype=np.int8)
+    _B = max(1, min(int(read_batch), len(vidx)))
+    _cache = np.empty((_B, n_samples), dtype=np.int8)
+    _lo = _hi = -1
 
-    def _read(v):
-        """One variant of raw int8 hardcalls, straight from pgenlib.
+    def _read(k):
+        """Raw int8 hardcalls for ``vidx[k]``, from a batched cache.
 
         Deliberately NOT promoted to float64 here. That promotion, plus the
         temporaries it forced through the missing policy, variant_stats and the
         packing, was 2.89 ms per variant at n=535,662 -- 2.04 h for chr1 before
         any I/O. :func:`_convert_codes` consumes the int8 directly.
+
+        Indexed by POSITION in ``vidx``, not by variant index, because the cache
+        window is a slice of ``vidx``. Both call sites walk k forward, so a
+        single forward window suffices and a second sweep (the ``drop``
+        counting pass) refills from k=0 naturally.
+
+        ``read_range`` is used only when the batch is genuinely contiguous.
+        ``variant_idx`` is sparse whenever a caller converts a subset -- AoU
+        passes the biallelic-SNV rows of an ACAF callset, which interleave with
+        indels -- and a range read over a sparse index would silently convert
+        the rows sitting between the wanted ones. ``read_list`` handles that.
+
+        Returns a VIEW into the cache. Safe because :func:`_convert_codes` never
+        writes through its argument: it builds ``u`` with ``np.minimum``, which
+        allocates.
         """
-        reader.read(int(v), buf)
-        return buf
+        nonlocal _lo, _hi
+        if not (_lo <= k < _hi):
+            _lo, _hi = k, min(k + _B, len(vidx))
+            want = vidx[_lo:_hi]
+            view = _cache[:_hi - _lo]
+            if len(want) > 1 and int(want[-1]) - int(want[0]) == len(want) - 1:
+                reader.read_range(int(want[0]), int(want[-1]) + 1, view)
+            else:
+                reader.read_list(
+                    np.ascontiguousarray(want, dtype=np.uint32), view)
+        return _cache[k - _lo]
 
     # `drop` changes the variant count, and CugenWriter._finalize refuses a
     # short write ("declared N variants, wrote M"). So learn the surviving count
@@ -309,7 +344,7 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
     if missing == "drop":
         keep_mask = np.ones(len(vidx), dtype=bool)
         for k, v in enumerate(vidx):
-            keep_mask[k] = _convert_codes(_read(v), "drop")[0] is not None
+            keep_mask[k] = _convert_codes(_read(k), "drop")[0] is not None
             if verbose:
                 _progress(k, len(vidx))
         if verbose:
@@ -331,7 +366,7 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
             if keep_mask is not None and not keep_mask[k]:
                 continue
             packed, mu, sxx, maf, has_missing, n_miss = _convert_codes(
-                _read(v), missing)
+                _read(k), missing)
             if n_miss:
                 n_missing_total += n_miss
                 n_var_with_missing += 1
