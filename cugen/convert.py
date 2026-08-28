@@ -33,6 +33,7 @@ import os
 import sys
 
 import numpy as np
+from time import perf_counter as _perf
 
 from .write import CugenWriter, ENCODING_2BIT, pack_2bit
 
@@ -234,7 +235,7 @@ def _progress(i, n, every=50000):
 
 def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
                variant_idx=None, gidx=None, missing="mean", verbose=True,
-               read_batch=64):
+               read_batch=64, profile=None):
     """PLINK2 .pgen -> .cugen. Requires pgenlib.
 
     ``missing`` resolves no-calls; see :func:`_apply_missing_policy` for the
@@ -263,6 +264,15 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
     the default 64 and n = 535,662. Output is byte-identical at every value,
     which ``tests/test_convert_batched_read.py`` asserts across sparse
     ``variant_idx``, ``sample_idx`` subsets and all four missing policies.
+
+    Pass a dict as ``profile`` to have it filled with ``read_s``,
+    ``transform_s``, ``write_s`` and ``n_variants``. Which of the three
+    dominates decides whether moving :func:`_convert_codes` to the GPU is worth
+    building: on a laptop the transform is 0.317 ms/variant at n = 535,662, or
+    0.42 h for chr1, but pgenlib decode and the 642 GB write were never measured
+    on the machine that runs the job. The clock is read three times per variant
+    unconditionally -- about 0.6 s across chr1, or 0.01% of it -- so the numbers
+    are always available rather than behind a flag that has to be remembered.
     """
     try:
         import pgenlib
@@ -361,12 +371,19 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
     n_missing_total = 0
     n_var_with_missing = 0
     n_var_undefined = 0
+    _read_s = _xform_s = _write_s = 0.0
     with CugenWriter(out, n_samples, n_out, ENCODING_2BIT) as w:
         for k, v in enumerate(vidx):
             if keep_mask is not None and not keep_mask[k]:
                 continue
+            _t0 = _perf()
+            _codes = _read(k)
+            _t1 = _perf()
             packed, mu, sxx, maf, has_missing, n_miss = _convert_codes(
-                _read(k), missing)
+                _codes, missing)
+            _t2 = _perf()
+            _read_s += _t1 - _t0
+            _xform_s += _t2 - _t1
             if n_miss:
                 n_missing_total += n_miss
                 n_var_with_missing += 1
@@ -382,9 +399,20 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
                     f"missing='drop' to discard such variants, or filter them "
                     f"upstream (plink2 --geno 0.99).")
             w.add_variant_packed(int(g[k]), packed, mu, sxx, maf, has_missing)
+            _write_s += _perf() - _t2
             if verbose:
                 _progress(k, len(vidx))
     reader.close()
+    if profile is not None:
+        profile.update(read_s=_read_s, transform_s=_xform_s,
+                       write_s=_write_s, n_variants=n_out)
+    if verbose:
+        _tot = _read_s + _xform_s + _write_s
+        if _tot > 0:
+            print(f"  convert split: pgenlib read {_read_s:,.1f}s "
+                  f"({100 * _read_s / _tot:.0f}%)  transform {_xform_s:,.1f}s "
+                  f"({100 * _xform_s / _tot:.0f}%)  write {_write_s:,.1f}s "
+                  f"({100 * _write_s / _tot:.0f}%)", flush=True)
     _write_samples(out, kept_ids)
     if verbose:
         cells = float(n_samples) * max(len(vidx), 1)

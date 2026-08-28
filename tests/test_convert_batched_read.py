@@ -95,3 +95,36 @@ def test_read_batch_defaults_to_batching_not_one(tmp_path):
     sig = inspect.signature(pgen2cugen)
     assert "read_batch" in sig.parameters
     assert sig.parameters["read_batch"].default > 1
+
+
+# ------------------------------------------------------------------ profiling
+#
+# Whether a GPU port of _convert_codes is worth building depends on how convert
+# splits between pgenlib decode, the numpy transform, and the write. Measured on
+# a laptop the transform is 0.317 ms/variant at n=535,662 -- 0.42 h for chr1 --
+# but the other two terms were never measured on the VM that runs the job.
+
+
+def test_profile_dict_reports_the_three_phases(tmp_path):
+    import time
+    prefix = _write_pgen(tmp_path, _panel(n_var=200, n_samp=400))
+    prof: dict = {}
+    t0 = time.perf_counter()
+    pgen2cugen(f"{prefix}.pgen", str(tmp_path / "p.cugen"), verbose=False,
+               profile=prof)
+    wall = time.perf_counter() - t0
+    assert {"read_s", "transform_s", "write_s", "n_variants"} <= set(prof)
+    assert prof["n_variants"] == 200
+    total = prof["read_s"] + prof["transform_s"] + prof["write_s"]
+    assert 0 < total <= wall, "phases cannot exceed the wall time"
+    assert total > 0.25 * wall, "the three phases should dominate the loop"
+
+
+def test_profile_is_optional_and_default_changes_nothing(tmp_path):
+    prefix = _write_pgen(tmp_path, _panel(n_var=40, n_samp=25))
+    a = _convert(prefix, tmp_path, "np_a")
+    prof: dict = {}
+    out = tmp_path / "np_b.cugen"
+    pgen2cugen(f"{prefix}.pgen", str(out), verbose=False, profile=prof)
+    assert out.read_bytes() == a
+    assert prof["read_s"] >= 0.0
