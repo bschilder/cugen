@@ -128,3 +128,60 @@ def test_profile_is_optional_and_default_changes_nothing(tmp_path):
     pgen2cugen(f"{prefix}.pgen", str(out), verbose=False, profile=prof)
     assert out.read_bytes() == a
     assert prof["read_s"] >= 0.0
+
+
+# ------------------------------------------------------- parallel conversion
+#
+# Conversion is CPU-bound per variant and independent across variants, so it
+# fans out across processes. Workers write their own bytes into disjoint slots
+# of ONE preallocated file, which avoids a merge -- concatenating 0.34 TB of
+# shards would cost 0.68 TB of sequential I/O and eat the entire gain.
+#
+# Workers must read the STAGED LOCAL pgen. Fanning out over the AoU mount would
+# put N concurrent readers on the CDR bucket, which raises egress alerts; that
+# guard is AoU.genome.ld.resolve_convert_source, enforced before calling here.
+
+
+@pytest.mark.parametrize("workers", [2, 3, 5])
+def test_parallel_conversion_is_byte_identical(tmp_path, workers):
+    prefix = _write_pgen(tmp_path, _panel(n_var=61, n_samp=37))
+    one = _convert(prefix, tmp_path, "w1")
+    many = _convert(prefix, tmp_path, f"w{workers}", workers=workers)
+    assert one == many
+
+
+def test_parallel_conversion_byte_identical_on_a_sparse_variant_idx(tmp_path):
+    prefix = _write_pgen(tmp_path, _panel(n_var=61, n_samp=37))
+    keep = [0, 1, 5, 6, 7, 20, 33, 34, 35, 36, 60]
+    one = _convert(prefix, tmp_path, "sp1", variant_idx=keep)
+    many = _convert(prefix, tmp_path, "sp4", variant_idx=keep, workers=4)
+    assert one == many
+
+
+def test_parallel_conversion_handles_more_workers_than_variants(tmp_path):
+    prefix = _write_pgen(tmp_path, _panel(n_var=3, n_samp=12))
+    one = _convert(prefix, tmp_path, "tiny1")
+    many = _convert(prefix, tmp_path, "tiny9", workers=9)
+    assert one == many
+
+
+def test_parallel_conversion_refuses_the_drop_policy(tmp_path):
+    """'drop' changes the variant count, so slots cannot be assigned up front."""
+    G = _panel(seed=5)
+    G[3, 1] = -9
+    prefix = _write_pgen(tmp_path, G)
+    with pytest.raises(ValueError, match="drop"):
+        pgen2cugen(f"{prefix}.pgen", str(tmp_path / "d.cugen"),
+                   missing="drop", workers=4, verbose=False)
+
+
+def test_parallel_conversion_preserves_missingness_stats(tmp_path):
+    G = _panel(seed=9)
+    G[4, 2] = -9
+    G[40, 11] = -9
+    prefix = _write_pgen(tmp_path, G)
+    for policy in ("keep", "ref", "mean"):
+        one = _convert(prefix, tmp_path, f"p1_{policy}", missing=policy)
+        many = _convert(prefix, tmp_path, f"p4_{policy}", missing=policy,
+                        workers=4)
+        assert one == many, policy

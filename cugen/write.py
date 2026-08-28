@@ -230,9 +230,16 @@ class CugenWriter:
     manager exits.
     """
 
-    def __init__(self, path, n_samples, n_variants, encoding=ENCODING_2BIT):
+    def __init__(self, path, n_samples, n_variants, encoding=ENCODING_2BIT,
+                 parallel=None):
         if encoding not in _ENC_BYTES:
             raise ValueError(f"unknown encoding {encoding}")
+        if parallel not in (None, "create", "attach"):
+            raise ValueError(
+                f"parallel={parallel!r}; expected None (sequential append), "
+                f"'create' (preallocate the whole file and own the header), or "
+                f"'attach' (write slots into a file 'create' already made)")
+        self.parallel = parallel
         self.path = str(path)
         self.n_samples = int(n_samples)
         self.n_variants = int(n_variants)
@@ -254,11 +261,119 @@ class CugenWriter:
             self.flags |= FLAG_PHASED
         self.i = 0
         self.f = None
+        # Which slots have been written. In parallel mode this replaces the
+        # sequential `i` count as the completeness check, and it is strictly
+        # stronger: a count cannot distinguish a short write from a GAP, and a
+        # gap would leave a zeroed variant inside an otherwise valid file.
+        self.filled = (np.zeros(self.n_variants, dtype=bool)
+                       if parallel is not None else None)
 
     def __enter__(self):
+        if self.parallel == "attach":
+            # r+b: the coordinator already sized the file. "wb" here would
+            # truncate every slot another worker has written.
+            self.f = open(self.path, "r+b")
+            return self
+        if self.parallel == "create":
+            self.f = open(self.path, "wb")
+            # Preallocate the DATA region too, so workers can seek into it.
+            # truncate() rather than writing 0.34 TB of zeros: the file system
+            # gives a sparse file and the bytes are all overwritten anyway.
+            self.f.truncate(self.data_offset
+                            + self.n_variants * self.bytes_per_variant)
+            return self
         self.f = open(self.path, "wb")
         self.f.write(b"\x00" * (HEADER_SIZE + self.stats_size + self.gidx_size))
         return self
+
+    def add_variant_packed_at(self, index, gidx, packed, mu, sxx, maf,
+                              has_missing):
+        """Write one already-packed variant at SLOT ``index``.
+
+        Position, not arrival order, decides layout, so callers may write slots
+        in any order and from any process. Requires ``parallel=`` -- in
+        sequential mode the file has no preallocated data region to seek into.
+        """
+        if self.parallel is None:
+            raise ValueError(
+                "add_variant_packed_at needs parallel='create' or 'attach'; a "
+                "sequential writer has no preallocated data region to seek "
+                "into, so a positional write would land past end-of-file.")
+        if self.encoding != ENCODING_2BIT:
+            raise ValueError(
+                f"add_variant_packed_at is 2-bit only; this writer has "
+                f"encoding {self.encoding}")
+        i = int(index)
+        if not (0 <= i < self.n_variants):
+            raise IndexError(
+                f"slot {i} outside the declared {self.n_variants} variants")
+        if len(packed) != self.bytes_per_variant:
+            raise ValueError(
+                f"slot {i}: {len(packed)} packed bytes != bytes_per_variant "
+                f"{self.bytes_per_variant}")
+        if self.filled[i]:
+            raise ValueError(
+                f"slot {i} written twice; two workers claim the same variant")
+        self.mu_x[i] = mu
+        self.sxx[i] = sxx
+        self.maf[i] = maf
+        self.gidx[i] = int(gidx)
+        if has_missing:
+            self.flags |= FLAG_HAS_MISSING
+        self.f.seek(self.data_offset + i * self.bytes_per_variant)
+        self.f.write(packed)
+        self.filled[i] = True
+
+    def absorb_slice(self, index0, mu, sxx, maf, gidx, has_missing):
+        """Take one worker's contiguous slot range, as plain arrays.
+
+        The process-parallel path cannot hand back a writer -- it holds a file
+        handle and does not pickle -- and returning full-length arrays from every
+        worker would move n_variants * 20 bytes per worker over IPC for nothing.
+        A worker returns only its own slice.
+        """
+        if self.parallel != "create":
+            raise ValueError("absorb_slice() is for the 'create' coordinator")
+        i0 = int(index0)
+        m = np.asarray(mu)
+        i1 = i0 + m.size
+        if i1 > self.n_variants:
+            raise IndexError(
+                f"slice [{i0}, {i1}) overruns the declared {self.n_variants}")
+        if self.filled[i0:i1].any():
+            raise ValueError(
+                f"slots in [{i0}, {i1}) already claimed by another worker")
+        self.mu_x[i0:i1] = m
+        self.sxx[i0:i1] = np.asarray(sxx)
+        self.maf[i0:i1] = np.asarray(maf)
+        self.gidx[i0:i1] = np.asarray(gidx)
+        if has_missing:
+            self.flags |= FLAG_HAS_MISSING
+        self.filled[i0:i1] = True
+
+    def absorb(self, other):
+        """Take a worker's slot stats into this (coordinator) writer.
+
+        A worker writes its own bytes straight into the shared file, so only the
+        small per-variant arrays have to come back. Stats are merged by slot, not
+        appended, and HAS_MISSING is a file-wide flag so it ORs in.
+        """
+        if self.parallel != "create":
+            raise ValueError("absorb() is for the 'create' coordinator")
+        m = other.filled
+        if m is None:
+            raise ValueError("absorb() needs a parallel writer")
+        clash = m & self.filled
+        if clash.any():
+            raise ValueError(
+                f"{int(clash.sum())} slots claimed by two workers, first at "
+                f"{int(np.flatnonzero(clash)[0])}")
+        self.mu_x[m] = other.mu_x[m]
+        self.sxx[m] = other.sxx[m]
+        self.maf[m] = other.maf[m]
+        self.gidx[m] = other.gidx[m]
+        self.flags |= (other.flags & FLAG_HAS_MISSING)
+        self.filled |= m
 
     def add_variant(self, gidx, dosages):
         if self.encoding == ENCODING_HAP2BIT:
@@ -422,7 +537,16 @@ class CugenWriter:
         self.i += n
 
     def _finalize(self):
-        if self.i != self.n_variants:
+        if self.parallel == "attach":
+            return          # workers own no header; the coordinator finalises
+        if self.parallel == "create":
+            if not self.filled.all():
+                miss = np.flatnonzero(~self.filled)
+                raise ValueError(
+                    f"{miss.size:,} of {self.n_variants:,} slots unfilled, "
+                    f"first at {int(miss[0])}. Finalising would leave zeroed "
+                    f"variants in a file that otherwise looks valid.")
+        elif self.i != self.n_variants:
             raise ValueError(f"declared {self.n_variants} variants, wrote {self.i}")
         self.f.seek(self.stats_offset)
         self.f.write(self.mu_x.tobytes())

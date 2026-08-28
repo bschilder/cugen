@@ -235,7 +235,7 @@ def _progress(i, n, every=50000):
 
 def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
                variant_idx=None, gidx=None, missing="mean", verbose=True,
-               read_batch=64, profile=None):
+               read_batch=64, profile=None, workers=1):
     """PLINK2 .pgen -> .cugen. Requires pgenlib.
 
     ``missing`` resolves no-calls; see :func:`_apply_missing_policy` for the
@@ -264,6 +264,20 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
     the default 64 and n = 535,662. Output is byte-identical at every value,
     which ``tests/test_convert_batched_read.py`` asserts across sparse
     ``variant_idx``, ``sample_idx`` subsets and all four missing policies.
+
+    ``workers`` > 1 fans the conversion out across processes. Each worker takes
+    a contiguous slice of ``variant_idx``, opens its own ``PgenReader``, and
+    writes its bytes straight into disjoint slots of one preallocated output --
+    so there is no merge, which matters because concatenating 0.34 TB of shards
+    would cost 0.68 TB of sequential I/O and consume the whole gain. Output is
+    byte-identical to ``workers=1``.
+
+    Two constraints. ``missing="drop"`` is refused, because it changes the
+    surviving variant count and slots have to be assigned before any data is
+    read. And the input must be on LOCAL disk: fanning out over a network mount
+    puts N concurrent readers on it, which on the All of Us Workbench is the
+    access pattern that raises egress alerts. Callers there should go through
+    ``AoU.genome.ld.resolve_convert_source``, which refuses that combination.
 
     Pass a dict as ``profile`` to have it filled with ``read_s``,
     ``transform_s``, ``write_s`` and ``n_variants``. Which of the three
@@ -307,6 +321,18 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
     if verbose:
         print(f"pgen2cugen: {n_samples:,} samples x {len(vidx):,} variants "
               f"-> {out}  (missing={missing})")
+    if int(workers) > 1 and len(vidx) > 1:
+        if missing == "drop":
+            raise ValueError(
+                "workers>1 cannot be combined with missing='drop': dropping "
+                "changes the surviving variant count, and the parallel writer "
+                "must assign slots before any data is read. Use 'mean' or "
+                "'ref', or convert with workers=1.")
+        reader.close()
+        return _pgen2cugen_parallel(
+            pgen, out, kept_ids, vidx, g, si, raw_n, n_samples, missing,
+            verbose, read_batch, int(workers), profile)
+
     _B = max(1, min(int(read_batch), len(vidx)))
     _cache = np.empty((_B, n_samples), dtype=np.int8)
     _lo = _hi = -1
@@ -419,6 +445,101 @@ def pgen2cugen(pgen, out, psam=None, pvar=None, sample_idx=None,
         print(f"  missingness: {n_missing_total:,} no-calls "
               f"({100.0 * n_missing_total / cells:.4f}% of genotypes) across "
               f"{n_var_with_missing:,} of {len(vidx):,} variants; "
+              f"policy={missing}, {n_out:,} variants written", flush=True)
+    return out
+
+
+def _convert_slice(a):
+    """One worker: convert vidx[lo:hi] into the shared output's slots.
+
+    Top-level so it pickles. Returns only this slice's stats -- the bytes are
+    already in the file, and shipping n_variants-length arrays back from every
+    worker would move tens of MB over IPC for nothing.
+    """
+    (pgen, out, lo, hi, vidx, g, si, raw_n, n_samples, missing, read_batch,
+     n_out) = a
+    import pgenlib
+    from cugen.write import CugenWriter, ENCODING_2BIT
+
+    sub = np.asarray(vidx[lo:hi])
+    gsub = np.asarray(g[lo:hi])
+    sarr = None if si is None else np.asarray(si, dtype=np.uint32)
+    reader = pgenlib.PgenReader(str(pgen).encode(), raw_sample_ct=raw_n,
+                                sample_subset=sarr)
+    B = max(1, min(int(read_batch), sub.size))
+    cache = np.empty((B, n_samples), dtype=np.int8)
+    mu = np.zeros(sub.size, np.float32)
+    sxx = np.zeros(sub.size, np.float32)
+    maf = np.zeros(sub.size, np.float32)
+    any_missing = False
+    n_miss_tot = 0
+    clo = chi = -1
+    w = CugenWriter(str(out), n_samples, n_out, ENCODING_2BIT,
+                    parallel="attach")
+    with w:
+        for k in range(sub.size):
+            if not (clo <= k < chi):
+                clo, chi = k, min(k + B, sub.size)
+                want = sub[clo:chi]
+                view = cache[:chi - clo]
+                if len(want) > 1 and int(want[-1]) - int(want[0]) == len(want) - 1:
+                    reader.read_range(int(want[0]), int(want[-1]) + 1, view)
+                else:
+                    reader.read_list(
+                        np.ascontiguousarray(want, dtype=np.uint32), view)
+            packed, m_, s_, f_, hm, nm = _convert_codes(cache[k - clo], missing)
+            if packed is None:
+                raise ValueError(
+                    f"variant {int(gsub[k])} has no observed call, so "
+                    f"missing={missing!r} has no mean to fill with.")
+            mu[k], sxx[k], maf[k] = m_, s_, f_
+            any_missing |= bool(hm)
+            n_miss_tot += int(nm)
+            w.add_variant_packed_at(lo + k, int(gsub[k]), packed, m_, s_, f_, hm)
+    reader.close()
+    return lo, mu, sxx, maf, gsub.astype(np.int64), any_missing, n_miss_tot
+
+
+def _pgen2cugen_parallel(pgen, out, kept_ids, vidx, g, si, raw_n, n_samples,
+                         missing, verbose, read_batch, workers, profile):
+    """Coordinator: preallocate, fan out, absorb slot stats, finalise."""
+    import multiprocessing as mp
+    from cugen.write import CugenWriter, ENCODING_2BIT
+
+    n_out = len(vidx)
+    nw = max(1, min(int(workers), n_out))
+    edges = np.linspace(0, n_out, nw + 1).astype(np.int64)
+    jobs = [(str(pgen), str(out), int(a), int(b), np.asarray(vidx),
+             np.asarray(g), si, raw_n, n_samples, missing, read_batch, n_out)
+            for a, b in zip(edges[:-1], edges[1:]) if b > a]
+    if verbose:
+        print(f"pgen2cugen: {n_samples:,} samples x {n_out:,} variants -> {out}"
+              f"  (missing={missing}, {len(jobs)} workers)", flush=True)
+
+    coord = CugenWriter(str(out), n_samples, n_out, ENCODING_2BIT,
+                        parallel="create")
+    coord.__enter__()
+    n_miss_tot = 0
+    try:
+        ctx = mp.get_context("fork") if hasattr(mp, "get_context") else mp
+        with ctx.Pool(len(jobs)) as pool:
+            for lo, mu, sxx, maf, gsub, anym, nm in pool.imap_unordered(
+                    _convert_slice, jobs):
+                coord.absorb_slice(lo, mu, sxx, maf, gsub, anym)
+                n_miss_tot += nm
+        coord.__exit__(None, None, None)
+    except BaseException:
+        coord.__exit__(*__import__("sys").exc_info())
+        raise
+    _write_samples(out, kept_ids)
+    if profile is not None:
+        profile.update(read_s=0.0, transform_s=0.0, write_s=0.0,
+                       n_variants=n_out, workers=len(jobs),
+                       note="phase split is not measured under workers>1")
+    if verbose:
+        cells = float(n_samples) * max(n_out, 1)
+        print(f"  missingness: {n_miss_tot:,} no-calls "
+              f"({100.0 * n_miss_tot / cells:.4f}% of genotypes); "
               f"policy={missing}, {n_out:,} variants written", flush=True)
     return out
 
