@@ -5,6 +5,15 @@ hand-edited; the plots and the issue text are generated from these files by
 `../make_plots.py` and `../gen_subissue.py`, so any number in the write-up can
 be traced back to a file in this directory.
 
+## Feature write-ups
+
+| file | what it is |
+|---|---|
+| `PHASED.md` | phased LD statistics — correctness vs plink2 `--r2-phased`, and speed |
+| `SAMPLE_AXIS.md` | sample axis to n = 1,000,000 |
+| `GENOMEWIDE.md` | genome-wide validation on chr21 + chr22 |
+| `SIGNIFICANCE.md` | LD significance testing — chi2/p, the exact conditional test, multiple testing, inflation control. **CPU reference path only; no plink2 comparison exists because plink2 emits no LD p-values.** |
+
 ## GPU portability matrix
 
 | file | what it is |
