@@ -349,9 +349,16 @@ _STAT_COL = {"r": "R", "r2": "R2", "r2_signed": "R2_SIGNED", "d": "D", "dp": "DP
 # -log10(p), not p -- see _neglog10_chi2_1df for why p itself is unusable.
 _SIG_STATS = frozenset(("chi2", "p", "p_exact", "chi2_adj", "p_adj"))
 # Statistics that need the full 3x3 genotype table rather than the scalar
-# cross-product the fused epilogue produces. GA joins d/dp here: the fused
-# kernel contracts to one number per pair, and nine cell counts is a different
-# contraction, so these force the reference path exactly as d/dp already do.
+# cross-product the fused epilogue produces. GA joins d/dp here because it is a
+# function of that same table.
+#
+# This selects the TILED GPU scan, not the CPU: `_scan_gpu(need_table=True)`
+# builds the nine cell counts on device in `_counts_block` and returns them, and
+# only the per-pair epilogue arithmetic runs host-side in `ld_from_counts`. What
+# these statistics give up is the FUSED kernel, which contracts to one number
+# per pair and so cannot carry nine counts, and the cuDF device-write path that
+# depends on it. That is a narrower cost than falling back to CPU, and it is
+# exactly the cost d/dp already pay.
 _TABLE_STATS = frozenset(("d", "dp", "ga", "ga_df", "p_ga"))
 # median of chi-square with 1 df; the denominator of the genomic-control ratio
 _CHI2_1DF_MEDIAN = 0.4549364
@@ -537,7 +544,9 @@ def _genotype_association(counts):
     """Pearson chi-square for independence of the 3x3 genotype table, and its df.
 
     The GA statistic of Rohlfs, Swanson & Weir (2010), and the complement to
-    composite LD rather than a variant of it. CLD is a ONE-degree-of-freedom
+    composite LD rather than a variant of it. Runs on GPU or CPU: the counts it
+    consumes are built by whichever backend produced them, and this arithmetic
+    is identical either way because the cells are exact integers. CLD is a ONE-degree-of-freedom
     additive summary of this same table, so it is blind by construction to any
     association whose dosage covariance cancels: a pair where heterozygotes at A
     accompany homozygotes at B has r exactly 0 and GA large.

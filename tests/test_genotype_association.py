@@ -15,6 +15,8 @@ import pytest
 from scipy.stats import chi2 as _chi2
 from scipy.stats import chi2_contingency
 
+from conftest import requires_gpu
+
 from cugen import ld as L
 
 
@@ -113,3 +115,65 @@ def test_ga_is_requestable_through_ld_matrix(tmp_path):
     assert float(row["GA"]) == pytest.approx(400.0, rel=1e-5)
     assert int(row["GA_DF"]) == 4
     assert float(row["NEG_LOG10_P_GA"]) > 80.0
+
+
+def _two_locus_file(tmp_path, name="ga.cugen"):
+    from cugen.write import write_cugen
+    a = np.repeat([0, 1, 1, 2], 100).astype(np.uint8)
+    b = np.repeat([1, 0, 2, 1], 100).astype(np.uint8)
+    p = tmp_path / name
+    write_cugen(str(p), np.column_stack([a, b]))
+    return str(p)
+
+
+def test_ga_is_gpu_eligible_like_d_not_cpu_only_like_r2_s():
+    """GA runs on the GPU counts path; it is not a reference-path statistic.
+
+    Two decisions in `ld_matrix` fix which backend a statistic gets, and this
+    pins both without needing a device:
+
+      * `_TABLE_STATS` selects the tiled GPU scan with `need_table=True`, which
+        builds the 3x3 counts on device via `_counts_block`. GA belongs here,
+        with d/dp, because it is a function of that same table.
+      * The GLS-corrected statistics (r2_s / r2_v / r2_vs) are the ones that
+        genuinely force CPU -- each needs an n x n eigendecomposition and a
+        dense sample-axis transform. GA must NOT be among them.
+
+    An end-to-end `backend="gpu"` check cannot discriminate here, because the
+    CuPy-missing guard (ld.py:4102) fires before the GLS downgrade (ld.py:4266),
+    so on a CPU-only box every statistic raises alike.
+    """
+    assert {"ga", "ga_df", "p_ga"} <= L._TABLE_STATS
+    assert {"d", "dp"} <= L._TABLE_STATS, "GA must ride the same path as d/dp"
+
+    forces_cpu = set(L._CORRECTED_STATS) - set(L._ANCESTRY_STATS)
+    assert {"r2_s", "r2_v", "r2_vs"} <= forces_cpu
+    assert not ({"ga", "ga_df", "p_ga"} & forces_cpu)
+
+
+@requires_gpu
+def test_ga_gpu_matches_reference_bit_for_bit(tmp_path):
+    """The GPU counts path and the NumPy counts path must agree exactly.
+
+    Both feed the same `ld_from_counts`, and the 3x3 cells are exact integers on
+    either side, so this is an equality test rather than a tolerance test.
+    """
+    rng = np.random.default_rng(11)
+    from cugen.write import write_cugen
+    dos = rng.integers(0, 3, size=(500, 40)).astype(np.uint8)
+    path = str(tmp_path / "gpu_parity.cugen")
+    write_cugen(path, dos)
+
+    cols = ["GA", "GA_DF", "NEG_LOG10_P_GA", "D", "DP"]
+    kw = dict(stats=["ga", "ga_df", "p_ga", "d", "dp"], verbose=False)
+    cpu = L.ld_matrix(path, backend="numpy", **kw).sort_values(
+        ["gidx_a", "gidx_b"]).reset_index(drop=True)
+    gpu = L.ld_matrix(path, backend="gpu", **kw).sort_values(
+        ["gidx_a", "gidx_b"]).reset_index(drop=True)
+
+    assert len(cpu) == len(gpu) and len(cpu) > 0
+    np.testing.assert_array_equal(cpu["gidx_a"], gpu["gidx_a"])
+    np.testing.assert_array_equal(cpu["GA_DF"], gpu["GA_DF"])
+    for c in cols:
+        np.testing.assert_allclose(cpu[c], gpu[c], rtol=1e-6, equal_nan=True,
+                                   err_msg=f"{c} differs between backends")
