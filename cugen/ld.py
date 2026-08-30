@@ -331,6 +331,7 @@ EPS = 1e-12
 _STATS = ("r", "r2", "r2_signed", "d", "dp", "r_phased", "r2_phased",
           "d_phased", "dp_phased", "r2_phased_em",
           "chi2", "p", "p_exact", "chi2_adj", "p_adj",
+          "ga", "ga_df", "p_ga",
           "r2_s", "r2_v", "r2_vs", "r_adj", "r2_adj")
 _DEFAULT_STATS = ("r", "r2", "r2_signed", "d", "dp")
 _STAT_COL = {"r": "R", "r2": "R2", "r2_signed": "R2_SIGNED", "d": "D", "dp": "DP",
@@ -340,12 +341,18 @@ _STAT_COL = {"r": "R", "r2": "R2", "r2_signed": "R2_SIGNED", "d": "D", "dp": "DP
              "chi2": "CHI2", "p": "NEG_LOG10_P",
              "p_exact": "NEG_LOG10_P_EXACT",
              "chi2_adj": "CHI2_ADJ", "p_adj": "NEG_LOG10_P_ADJ",
+             "ga": "GA", "ga_df": "GA_DF", "p_ga": "NEG_LOG10_P_GA",
              "r2_s": "R2_S", "r2_v": "R2_V", "r2_vs": "R2_VS",
              "r_adj": "R_ADJ", "r2_adj": "R2_ADJ"}
 # The significance pair. Derived from whichever correlation the path computed
 # and from N_OBS, so they cost no extra passes over the data. "p" emits
 # -log10(p), not p -- see _neglog10_chi2_1df for why p itself is unusable.
 _SIG_STATS = frozenset(("chi2", "p", "p_exact", "chi2_adj", "p_adj"))
+# Statistics that need the full 3x3 genotype table rather than the scalar
+# cross-product the fused epilogue produces. GA joins d/dp here: the fused
+# kernel contracts to one number per pair, and nine cell counts is a different
+# contraction, so these force the reference path exactly as d/dp already do.
+_TABLE_STATS = frozenset(("d", "dp", "ga", "ga_df", "p_ga"))
 # median of chi-square with 1 df; the denominator of the genomic-control ratio
 _CHI2_1DF_MEDIAN = 0.4549364
 # p_exact conditions on the 2x2 HAPLOTYPE table, which dosage data does not
@@ -526,6 +533,65 @@ def _loglik(x, tab, pA, pB):
     return np.where(bad, -np.inf, ll)
 
 
+def _genotype_association(counts):
+    """Pearson chi-square for independence of the 3x3 genotype table, and its df.
+
+    The GA statistic of Rohlfs, Swanson & Weir (2010), and the complement to
+    composite LD rather than a variant of it. CLD is a ONE-degree-of-freedom
+    additive summary of this same table, so it is blind by construction to any
+    association whose dosage covariance cancels: a pair where heterozygotes at A
+    accompany homozygotes at B has r exactly 0 and GA large.
+
+    Rohlfs et al. drop pairs in which a one-locus genotype is unobserved, because
+    the table collapses and the statistic no longer carries four df. Returning the
+    REALISED df instead lets a caller filter, or test against the right null,
+    rather than silently comparing a 2 df statistic to a 4 df threshold. A 3x3
+    table can only realise df in {0, 1, 2, 4}.
+    """
+    tab = np.asarray(counts, dtype=np.float64)
+    n = tab.sum(axis=(-2, -1))
+    rows, cols = tab.sum(axis=-1), tab.sum(axis=-2)
+    # clamp BEFORE multiplying: an all-zero table would otherwise give
+    # (-1) * (-1) = 1 and report a one-df test on no data.
+    nr = np.maximum(np.count_nonzero(rows, axis=-1) - 1, 0)
+    nc = np.maximum(np.count_nonzero(cols, axis=-1) - 1, 0)
+    df = nr * nc
+    with np.errstate(divide="ignore", invalid="ignore"):
+        exp = rows[..., :, None] * cols[..., None, :] / n[..., None, None]
+        ok = exp > 0
+        # cells with zero expectation are structurally empty, not evidence
+        ga = np.where(ok, (tab - exp) ** 2 / np.where(ok, exp, 1.0),
+                      0.0).sum(axis=(-2, -1))
+    return np.where(df > 0, ga, np.nan), df
+
+
+def _neglog10_chi2_ga(chi2, df):
+    """``-log10(P(X > chi2))`` for GA, exactly, at the realised df.
+
+    The even-df cases have closed forms that never underflow, because -log10 of
+    them is a difference of logs rather than the log of a difference:
+
+        df = 2:  sf(x) = exp(-x/2)
+        df = 4:  sf(x) = exp(-x/2) * (1 + x/2)
+
+    df = 1 defers to :func:`_neglog10_chi2_1df`. df = 0 is not a test and is NaN.
+    Kept scipy-free for the same reason ``_neglog10_chi2_1df`` is: this module
+    computes its own tails so the hot path carries no SciPy call.
+    """
+    x = np.asarray(chi2, dtype=np.float64)
+    df = np.asarray(df)
+    finite = np.isfinite(x)
+    half = np.where(finite, np.maximum(x, 0.0), 0.0) / 2.0
+    ln10 = math.log(10.0)
+    out = np.full(np.broadcast(x, df).shape, np.nan, dtype=np.float64)
+    one = df == 1
+    if np.any(one):
+        out = np.where(one, _neglog10_chi2_1df(np.where(one, half * 2.0, 0.0)), out)
+    out = np.where(df == 2, half / ln10, out)
+    out = np.where(df == 4, (half - np.log1p(half)) / ln10, out)
+    return np.where(finite, out, np.nan)
+
+
 def ld_from_counts(counts, dprime_method: str = "phased"):
     """All five statistics from an (..., 3, 3) stack of genotype tables.
 
@@ -607,10 +673,12 @@ def ld_from_counts(counts, dprime_method: str = "phased"):
                          np.clip(D * D / np.where(den > EPS, den, 1.0), 0.0, 1.0),
                          np.nan)
 
+    ga, ga_df = _genotype_association(tab)
     return {"n": n, "pA": pA, "pB": pB, "r": r,
             "r2": np.clip(r * r, 0.0, 1.0),
             "r2_signed": np.clip(r * np.abs(r), -1.0, 1.0),
-            "d": D, "dp": DP, "r2_phased_em": r2_em}
+            "d": D, "dp": DP, "r2_phased_em": r2_em,
+            "ga": ga, "ga_df": ga_df, "p_ga": _neglog10_chi2_ga(ga, ga_df)}
 
 
 def contingency_tables(dosages, pairs):
@@ -4185,7 +4253,7 @@ def ld_matrix(
     # ---- counts ----------------------------------------------------------
     # D and D' need the 3x3 table; r-family statistics do not, and skipping it
     # avoids ~9x the memory traffic per tile.
-    need_table = bool({"d", "dp"} & set(stats))
+    need_table = bool(_TABLE_STATS & set(stats))
     # r2_s / r2_v / r2_vs still take the reference path: each needs an n x n
     # eigendecomposition plus a dense sample-axis transform, and the paper's
     # own scale is hundreds of individuals. r_adj / r2_adj do NOT -- they are
