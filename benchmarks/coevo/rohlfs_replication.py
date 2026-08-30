@@ -24,13 +24,15 @@ since:
    ENCODE blacklist, segmental duplications, satellite or centromeric regions
    are dropped.
 
-3. **ZP3R no longer exists.** Their primary candidate pair was ZP3 x ZP3R. As of
-   this writing ZP3R returns zero hits in both HGNC and NCBI Gene for human; the
-   locus is now annotated as the pseudogenes C4BPAP1 / C4BPAP2. A unitary
-   pseudogene cannot make a protein, so the protein-protein coevolution premise
-   does not survive re-annotation. We run the locus anyway, labelled as a
-   pseudogene proxy, and we run their secondary pair GHR x GH2 -- both of which
-   are still valid genes -- as the interpretable replication.
+3. **ZP3R has been reclassified as a pseudogene.** Their primary candidate pair
+   was ZP3 x ZP3R. The symbol ZP3R is retired; the locus is now HGNC:1326
+   **ZP3RP**, "zona pellucida 3 receptor, pseudogene", locus_type `pseudogene`,
+   at 1q32.2 -- and C4BPAP1 is one of its PREVIOUS SYMBOLS, so the coordinates
+   used here are the same locus they studied, not a substitute for it. A
+   pseudogene makes no protein, so the protein-protein coevolution premise does
+   not survive re-annotation. We run it anyway, labelled, and run their
+   secondary pair GHR x GH2 -- both still protein-coding -- as the
+   interpretable replication.
 """
 from __future__ import annotations
 

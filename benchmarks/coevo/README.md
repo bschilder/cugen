@@ -41,12 +41,16 @@ makes their test conservative by an unknown amount rather than anti-conservative
 
 ## A note on the candidate genes
 
-Their primary pair was **ZP3 x ZP3R**. `ZP3R` now returns zero hits in both HGNC
-and NCBI Gene for human; the locus is annotated as the pseudogenes `C4BPAP1` and
-`C4BPAP2`. A unitary pseudogene makes no protein, so the protein-protein
-coevolution premise does not survive re-annotation. The script runs that locus
-labelled as a pseudogene proxy, and runs their secondary pair **GHR x GH2**,
-both of which are still valid genes, as the interpretable comparison.
+Their primary pair was **ZP3 x ZP3R**. The symbol `ZP3R` is retired: the locus is
+now **HGNC:1326 `ZP3RP`**, *"zona pellucida 3 receptor, pseudogene"*,
+`locus_type: pseudogene`, at 1q32.2. `C4BPAP1` — the symbol this script uses for
+its coordinates — is one of `ZP3RP`'s **previous symbols**, so this is the same
+locus they studied rather than a substitute for it.
+
+A pseudogene makes no protein, so the protein-protein coevolution premise does not
+survive re-annotation. The script runs it anyway, labelled, and runs their
+secondary pair **GHR x GH2** — both still protein-coding — as the interpretable
+comparison.
 
 ## Running it
 
@@ -94,3 +98,10 @@ GHR x GH2 in EAS, is p = 0.010 uncorrected and 0.10 after Bonferroni; EUR is
 **The ZP3 locus does not replicate in any population** (empirical p 0.267-0.733).
 Given that ZP3R is now a pseudogene, that is the expected outcome rather than a
 surprising one.
+
+**For scale, their own empirical rank did not clear 0.05 either.** Rohlfs et al.
+report (p. 681) that "8.2% and 7.6% of random gene pair p value distributions
+were significantly lower than the ZP3-ZP3R distributions" for CLD and GA
+respectively — an empirical rank p of about 0.08 against their own 0.05
+threshold. So the headline claim was already marginal by the paper's own
+calibration, which is the same calibration this benchmark applies.
