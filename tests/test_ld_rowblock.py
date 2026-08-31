@@ -128,6 +128,24 @@ def test_cap_takes_forward_context_when_memory_allows():
     assert roomy > tight >= B + window
 
 
+def test_cap_allows_a_wide_window_above_the_read_ahead_target():
+    """The read-ahead target is not a hard ceiling on the live window.
+
+    AoU chr22 on a T4 needs 51,280 packed rows for a 50,000-variant
+    window.  That is about 44% of free VRAM: above the normal 25% read-ahead
+    target, but still below the 50% hard cache ceiling that leaves 15% after
+    the fused path's 35% compute-buffer budget.
+    """
+    n_samples = 535_662
+    bpv = (n_samples + 3) // 4
+    tile, window, free = 1_280, 50_000, 15.7e9
+
+    cap = L._row_cache_cap(426_463, tile, window, bpv=bpv, free_bytes=free)
+
+    assert cap >= tile + window
+    assert cap * bpv <= 0.50 * free
+
+
 def test_cap_fits_the_memory_budget_it_is_given():
     bpv, free = 103_708, 14.5e9
     cap = L._row_cache_cap(8_000_000, 1_280, 5_000, bpv=bpv, free_bytes=free)

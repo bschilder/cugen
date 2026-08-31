@@ -2317,14 +2317,18 @@ def _fill_packed_rows(reader, rows, bpv, out, chunk_bytes=(192 << 20), xp=None):
 _ROW_CACHE_MAX_ROWS = None
 
 
-def _row_cache_cap(p, tile, window, bpv, free_bytes, share=0.25):
+def _row_cache_cap(p, tile, window, bpv, free_bytes, share=0.25,
+                   max_share=0.50):
     """Rows to hold resident, or None if residency cannot be bounded.
 
     The scan's widest ask is ``[i0, i1 + window)``, so ``tile + window`` rows is
     a hard floor -- below it _PackedRowCache raises rather than hand back a
     short view. Above it, extra rows are pure win: refilling exactly the floor
     re-reads the whole window band on every step, and forward context amortises
-    that away.
+    that away. ``share`` is therefore the read-ahead target, not the legality
+    ceiling. The mandatory floor may exceed it up to ``max_share``; the fused
+    tile planner reserves at most 35% for compute buffers, so the default hard
+    ceiling leaves at least 15% for output buffers and allocator headroom.
 
     Returns None for ``window=None``. All-pairs runs the inner loop to p, so
     every row from i0 onward is live and there is nothing to bound; the caller
@@ -2337,17 +2341,20 @@ def _row_cache_cap(p, tile, window, bpv, free_bytes, share=0.25):
     if floor >= p:
         return p
     need = floor * int(bpv)
-    budget = int(float(share) * float(free_bytes))
-    if need > budget:
+    target_budget = int(float(share) * float(free_bytes))
+    hard_budget = int(float(max_share) * float(free_bytes))
+    if need > hard_budget:
         # Say which knob moves it. The window is the only term the caller
         # controls here, and at this point they have usually been told to
         # narrow it for TIME reasons, which is a different axis.
         raise ValueError(
             f"a bounded row cache needs at least tile+window = {floor:,} rows "
             f"x {bpv:,} B = {need / 1e9:,.2f} GB, but the budget is "
-            f"{budget / 1e9:,.2f} GB ({share:.0%} of {free_bytes / 1e9:,.2f} GB "
+            f"{hard_budget / 1e9:,.2f} GB ({max_share:.0%} of "
+            f"{free_bytes / 1e9:,.2f} GB "
             f"free). Reduce window=, or reduce the sample count -- bytes per "
             f"variant is ceil(n/4), so halving n halves this.")
+    budget = max(need, target_budget)
     cap = int(min(p, budget // int(bpv)))
     if _ROW_CACHE_MAX_ROWS is not None:
         cap = int(min(cap, max(floor, int(_ROW_CACHE_MAX_ROWS))))
@@ -4571,15 +4578,18 @@ def ld_matrix(
                         n_planned=n_pairs)
                     writer.write(g)
 
+            scan_succeeded = False
             try:
                 total = _scan_gpu_fused(
                     reader, rows, window, min_r2, tile_size=tile_size,
                     verbose=verbose, tf32=use_tf32,
                     phased=bool(want_phased), on_flush=_flush,
                     flush_rows=flush_rows, basis_u=_basis_u)
+                scan_succeeded = True
             finally:
                 if native:
-                    dsw.mark_complete()
+                    if scan_succeeded:
+                        dsw.mark_complete()
                     dsw.close()
                 else:
                     writer.close()

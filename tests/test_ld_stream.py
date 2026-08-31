@@ -138,3 +138,59 @@ def test_stream_requires_an_output_path(tmp_path, write_cugen_file):
         L.ld_matrix(path, min_r2=0.2, stats=("r", "r2"),
                     sign_reference="major", output=None, stream=True,
                     max_pairs=10 ** 12, verbose=False)
+
+
+def test_failed_native_stream_keeps_partial_dataset_incomplete(
+        tmp_path, monkeypatch):
+    """A flushed shard is durable progress, not proof the scan finished."""
+    import json
+    import types
+
+    class Reader:
+        encoding = L.ENCODING_2BIT
+        n_samples = 4
+        n_variants = 3
+        has_missing = False
+        gidx = np.arange(n_variants, dtype=np.int64)
+        maf = np.full(n_variants, 0.2, dtype=np.float32)
+
+    class Device:
+        def use(self):
+            pass
+
+    fake_cp = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(Device=lambda *_args, **_kwargs: Device()),
+        asarray=np.asarray,
+        asnumpy=np.asarray,
+        lexsort=np.lexsort,
+        stack=np.stack,
+    )
+    monkeypatch.setattr(L, "HAS_CUPY", True)
+    monkeypatch.setattr(L, "cp", fake_cp)
+    monkeypatch.setattr(L, "read_cugen", lambda *_args, **_kwargs: Reader())
+
+    def fail_after_one_shard(*_args, on_flush, **_kwargs):
+        on_flush(np.array([0]), np.array([1]),
+                 np.array([0.5], dtype=np.float32))
+        raise RuntimeError("synthetic scan failure")
+
+    monkeypatch.setattr(L, "_scan_gpu_fused", fail_after_one_shard)
+    output = tmp_path / "partial.cugenld"
+
+    with pytest.raises(RuntimeError, match="synthetic scan failure"):
+        L.ld_matrix(
+            tmp_path / "input.cugen",
+            stats=("r2",),
+            window=2,
+            min_r2=0.1,
+            backend="gpu",
+            precision="fp32",
+            stream=True,
+            output=output,
+            max_pairs=100,
+            verbose=False,
+        )
+
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert len(manifest["shards"]) == 1
+    assert manifest["complete"] is False
