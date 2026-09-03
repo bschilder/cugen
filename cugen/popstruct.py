@@ -21,7 +21,7 @@ import numpy as np
 from ._stubs import _stub
 from .io import ENCODING_2BIT, read_cugen
 
-__all__ = ["grm", "pcs_from_grm", "king", "pca", "pc_project"]
+__all__ = ["grm", "pcs_from_grm", "king", "king_pairs", "pca", "pc_project"]
 
 # 2-bit codes are big-endian within the byte: sample 0 is the HIGH pair. Same
 # convention as the LD kernels (see cugen/ld.py) and cugen/write.pack_2bit.
@@ -386,9 +386,11 @@ def king(cugen: Union[str, Path], *, variant_range=None, variants=None,
     has_missing = bool(reader.has_missing)
     need_obs = has_missing or maf_min > 0
 
-    HH = xp.zeros((n, n), dtype=xp.float64)
-    RA = xp.zeros((n, n), dtype=xp.float64)
-    HM = xp.zeros((n, n), dtype=xp.float64) if has_missing else None
+    UU = xp.zeros((n, n), dtype=xp.float64)
+    MM = xp.zeros((n, n), dtype=xp.float64) if has_missing else None
+    WM = xp.zeros((n, n), dtype=xp.float64) if has_missing else None
+    HH = xp.zeros((n, n), dtype=xp.float64) if estimator == "within-family" \
+        else None
     het_tot = xp.zeros(n, dtype=xp.float64)
     m_used = 0
 
@@ -418,24 +420,35 @@ def king(cugen: Union[str, Path], *, variant_range=None, variants=None,
                 continue
             codes, obs = codes[keep], obs[keep]
 
-        # float32 is exact here: the planes are 0/1, so each product term needs
-        # one mantissa bit, and a tile accumulates at most `tile` of them --
-        # far inside fp32's exact-integer range of 2**24. The running totals are
-        # float64, so the sum over tiles stays exact for any number of markers.
+        # ONE product, not two. Substituting the identity
+        #     IBS0 = (m - h_i - h_j + HetHet - u'u) / 2,      u = dosage - 1
+        # into the between-family estimator cancels HetHet outright:
+        #     phi = (2*u'u - 2m + h_i + h_j + 2*min(h_i,h_j)) / (4*min(...))
+        # so the whole statistic rides on the Gram matrix of u, whose entries
+        # are +1 for a shared homozygote class, -1 for opposite homozygotes,
+        # and 0 wherever either sample is heterozygous. u'u is also SYMMETRIC,
+        # so BLAS takes the SYRK path -- worth another factor of two over the
+        # general product this replaced.
         #
-        # H'H is written as `Hf.T @ Hf` deliberately: BLAS recognises the
-        # symmetric form and dispatches SYRK, which is measurably half the cost
-        # of the general product (43.7 ms vs 82.3 ms per 8192-marker tile at
-        # n=2504). R'A cannot take that path -- the operands differ -- and the
-        # symmetric rewrites of IBS0 all cost more, e.g. O'O - R'R - A'A is
-        # three SYRKs where this is one GEMM.
-        Hf = (codes == 1).astype(xp.float32)
-        HH += Hf.T @ Hf
-        RA += (codes == 0).astype(xp.float32).T @ (codes == 2).astype(xp.float32)
-        if has_missing:
-            HM += Hf.T @ obs.astype(xp.float32)
+        # float32 is exact: u is in {-1,0,+1}, so each term needs one mantissa
+        # bit, and a tile accumulates at most `tile` of them, far inside fp32's
+        # exact-integer range of 2**24. Totals are float64, so the sum over
+        # tiles stays exact for any marker count.
+        if obs is None:
+            uf = codes.astype(xp.float32) - xp.float32(1.0)
         else:
-            het_tot += Hf.sum(axis=0, dtype=xp.float64)
+            uf = xp.where(obs, codes.astype(xp.float32) - xp.float32(1.0),
+                          xp.float32(0.0))
+        UU += uf.T @ uf
+        wf = (codes == 1).astype(xp.float32)
+        if has_missing:
+            mf = obs.astype(xp.float32)
+            MM += mf.T @ mf              # pairwise co-observed marker count
+            WM += wf.T @ mf              # h_i over the pair's shared markers
+        else:
+            het_tot += wf.sum(axis=0, dtype=xp.float64)
+        if HH is not None:
+            HH += wf.T @ wf              # within-family form still needs HetHet
         m_used += int(codes.shape[0])
 
     if m_used == 0:
@@ -443,24 +456,26 @@ def king(cugen: Union[str, Path], *, variant_range=None, variants=None,
             f"no variant in {path} passed the filter (maf_min={maf_min}); "
             f"KING is undefined with zero markers.")
 
-    ibs0 = RA + RA.T
     if has_missing:
-        # h_i restricted to the pair's co-observed markers, and its transpose
-        h_i, h_j = HM, HM.T
+        h_i, h_j, m_pair = WM, WM.T, MM
     else:
         h_i = xp.broadcast_to(het_tot[:, None], (n, n))
         h_j = xp.broadcast_to(het_tot[None, :], (n, n))
+        m_pair = float(m_used)
 
     with np.errstate(invalid="ignore", divide="ignore"):
+        mn = xp.minimum(h_i, h_j)
         if estimator == "between-family":
-            mn = xp.minimum(h_i, h_j)
-            num = 2.0 * HH - 4.0 * ibs0 - h_i - h_j + 2.0 * mn
+            num = 2.0 * UU - 2.0 * m_pair + h_i + h_j + 2.0 * mn
             den = 4.0 * mn
         else:
+            # within-family: (HetHet - 2*IBS0) / (h_i + h_j), with IBS0 taken
+            # from the same identity so it still costs no extra product.
+            ibs0 = 0.5 * (m_pair - h_i - h_j + HH - UU)
             num = HH - 2.0 * ibs0
             den = h_i + h_j
         K = xp.where(den > 0, num / xp.where(den > 0, den, 1.0), xp.nan)
-    K = 0.5 * (K + K.T)          # kill fp asymmetry from the two products
+    K = 0.5 * (K + K.T)          # kill fp asymmetry in the accumulated products
 
     if verbose:
         print(f"cugen.popstruct: KING {n} x {n} from {m_used:,} of "
@@ -472,3 +487,210 @@ def king(cugen: Union[str, Path], *, variant_range=None, variants=None,
 
 def pc_project(*a, **kw):
     return _stub("popstruct.pc_project")
+
+
+def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
+               sample_block: int = 4096, variant_range=None, variants=None,
+               maf_min: float = 0.0, tile_size: Optional[int] = None,
+               backend: str = "auto", device: int = 0, verbose: bool = True):
+    """Related pairs only, for cohorts where the (n, n) matrix does not exist.
+
+    :func:`king` materialises three (n_samples, n_samples) accumulators. That is
+    the right shape for a cohort and the wrong shape for a biobank: at n =
+    500,000 they are 6 TB and the output matrix alone is 2 TB; at n = 1,000,000
+    they are 24 TB. No amount of tuning fixes an allocation that large.
+
+    What does fix it is the observation that a kinship matrix at that scale is
+    almost entirely zeros -- relatives are rare -- so the useful object is the
+    sparse set of pairs above a threshold, not the dense matrix. This walks
+    BLOCKS of the sample-pair space, evaluates each block, keeps only the pairs
+    that clear ``min_kinship`` and discards the rest before the next block. Peak
+    memory is the packed panel plus one (sample_block, sample_block) accumulator,
+    neither of which grows with n^2.
+
+    The default threshold, 0.0442, is the conventional lower bound of the
+    4th-degree band (2^-9/2), i.e. the usual "unrelated" cut. Note that pairs
+    from DIFFERENT ancestries score NEGATIVE rather than zero -- see
+    :func:`king` -- so a threshold selects relatives from one direction only and
+    never returns the population-difference tail.
+
+    Parameters
+    ----------
+    min_kinship
+        Emit pairs with ``phi >= min_kinship``. Pass ``-inf`` to emit every
+        pair, which reintroduces the n^2 output this function exists to avoid.
+    sample_block
+        Samples per block, rounded down to a multiple of 4 so a block is a clean
+        byte slice of the 2-bit packing. Peak accumulator is
+        ``sample_block**2 * 8`` bytes; the number of block pairs, and therefore
+        the number of passes over the resident panel, is ``(n/B)(n/B+1)/2``.
+
+    Returns
+    -------
+    DataFrame with columns ``i``, ``j`` (sample indices, ``i < j``) and
+    ``kinship``, sorted by kinship descending.
+    """
+    import pandas as pd  # noqa: PLC0415  (lazy: keeps popstruct import light)
+
+    path = str(cugen)
+    if backend not in ("auto", "gpu", "numpy"):
+        raise ValueError(
+            f"backend must be 'auto', 'gpu' or 'numpy', got {backend!r}")
+    B = max(4, (int(sample_block) // 4) * 4)
+
+    reader = read_cugen(path, device=device)
+    if int(reader.encoding) != ENCODING_2BIT:
+        raise ValueError(
+            f"{path} is not 2bit dosage data (encoding={int(reader.encoding)}).")
+
+    xp = np
+    if backend != "numpy":
+        try:
+            import cupy as _cp  # noqa: PLC0415
+            _cp.cuda.Device(device).use()
+            xp = _cp
+        except Exception:  # noqa: BLE001
+            if backend == "gpu":
+                raise
+            xp = np
+
+    n = int(reader.n_samples)
+    p_all = int(reader.n_variants)
+    lo, hi = (0, p_all) if variant_range is None else (
+        max(0, int(variant_range[0])), min(p_all, int(variant_range[1])))
+    bpv = int(reader.bytes_per_variant)
+    tile = int(tile_size) if tile_size else 8192
+    has_missing = bool(reader.has_missing)
+
+    keep_rows = None
+    if variants is not None:
+        from .ld import _resolve_gidx  # noqa: PLC0415
+        want = _resolve_gidx(variants)
+        gidx_all = np.asarray(reader.gidx, dtype=np.int64)
+        keep_rows = np.isin(gidx_all, want)
+        if not keep_rows[lo:hi].any():
+            raise ValueError(f"none of the requested gidx are in {path}")
+
+    # ---- pass 1: per-sample het counts, marker count, and the MAF mask ----
+    # O(n) memory. Also decides which markers survive, so pass 2 never has to
+    # recompute a frequency it already knows.
+    het = xp.zeros(n, dtype=xp.float64)
+    marker_keep, m_used = [], 0
+    for s0 in range(lo, hi, tile):
+        s1 = min(s0 + tile, hi)
+        raw = np.frombuffer(reader.read_packed_bytes(s0, s1), dtype=np.uint8)
+        codes = _unpack_tile(raw.reshape(s1 - s0, bpv), n)
+        if keep_rows is not None:
+            codes = codes[keep_rows[s0:s1]]
+        codes = xp.asarray(codes)
+        obs = codes != 3
+        n_obs = obs.sum(axis=1)
+        keep = n_obs > 0
+        if maf_min > 0:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                freq = (xp.where(obs, codes, 0).sum(axis=1)
+                        / (2.0 * xp.maximum(n_obs, 1)))
+            keep &= xp.minimum(freq, 1.0 - freq) >= maf_min
+        codes = codes[keep]
+        het += (codes == 1).sum(axis=0, dtype=xp.float64)
+        m_used += int(codes.shape[0])
+        marker_keep.append(np.asarray(
+            keep.get() if xp is not np else keep, dtype=bool))
+    if m_used == 0:
+        raise ValueError(
+            f"no variant in {path} passed the filter (maf_min={maf_min}); "
+            f"KING is undefined with zero markers.")
+    if has_missing:
+        raise NotImplementedError(
+            f"{path} has missing calls, and the pairwise-complete het counts "
+            f"that requires are themselves (n, n) -- the very allocation this "
+            f"function avoids. Impute or hard-call first, or use king() if the "
+            f"cohort is small enough for the dense form.")
+
+    # ---- resident packed panel: read once, sliced per block pair ----
+    # Block pairs re-walk the markers, so the panel must not be re-read from
+    # disk (n/B)^2 times. Packed 2-bit is n/4 bytes per marker, which is 12.5 GB
+    # at n=500,000 and p=100,000 -- three orders of magnitude under the dense
+    # accumulators, which is the whole point.
+    rows = []
+    for k, s0 in enumerate(range(lo, hi, tile)):
+        s1 = min(s0 + tile, hi)
+        raw = np.frombuffer(reader.read_packed_bytes(s0, s1),
+                            dtype=np.uint8).reshape(s1 - s0, bpv)
+        if keep_rows is not None:
+            raw = raw[keep_rows[s0:s1]]
+        rows.append(raw[marker_keep[k]])
+    packed = np.concatenate(rows, axis=0) if len(rows) > 1 else rows[0]
+    del rows
+
+    nb = (n + B - 1) // B
+    n_block_pairs = nb * (nb + 1) // 2
+    if verbose:
+        print(f"cugen.popstruct: king_pairs n={n:,} markers={m_used:,} "
+              f"block={B} -> {nb} blocks, {n_block_pairs:,} block pairs, "
+              f"panel {packed.nbytes / 1e9:.2f} GB, "
+              f"backend={'gpu' if xp is not np else 'numpy'}", flush=True)
+
+    out_i, out_j, out_k = [], [], []
+    n_eval = 0
+    for a in range(nb):
+        a0, a1 = a * B, min((a + 1) * B, n)
+        # Unpack the a-block ONCE, not once per (a, b). It is reused by every
+        # b >= a, so unpacking it inside the b loop repeats the same work
+        # nb - a times; hoisting it roughly halves total unpack cost, which is
+        # the term that competes with the GEMM at biobank n. Resident size is
+        # markers x B float32 -- 82 MB at p=5,000 / B=4,096, 1.6 GB at p=100,000.
+        UA = xp.asarray(_unpack_tile(
+            packed[:, a0 // 4:(a1 + 3) // 4], a1 - a0)
+        ).astype(xp.float32) - xp.float32(1.0)
+
+        for b in range(a, nb):
+            b0, b1 = b * B, min((b + 1) * B, n)
+            acc = xp.zeros((a1 - a0, b1 - b0), dtype=xp.float64)
+            for t0 in range(0, packed.shape[0], tile):
+                t1 = min(t0 + tile, packed.shape[0])
+                fa = UA[t0:t1]
+                if b == a:
+                    acc += fa.T @ fa            # SYRK on the diagonal block
+                else:
+                    cb = xp.asarray(_unpack_tile(
+                        packed[t0:t1, b0 // 4:(b1 + 3) // 4], b1 - b0))
+                    acc += fa.T @ (cb.astype(xp.float32) - xp.float32(1.0))
+            hi_ = het[a0:a1][:, None]
+            hj_ = het[b0:b1][None, :]
+            mn = xp.minimum(hi_, hj_)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                phi = ((2.0 * acc - 2.0 * m_used + hi_ + hj_ + 2.0 * mn)
+                       / xp.where(mn > 0, 4.0 * mn, xp.nan))
+            take = phi >= min_kinship
+            if b == a:
+                # i < j only. Masking with -inf instead would leak the whole
+                # lower triangle at min_kinship=-inf, since -inf >= -inf.
+                take &= xp.triu(xp.ones(phi.shape, dtype=bool), 1)
+                n_eval += (a1 - a0) * (a1 - a0 - 1) // 2
+            else:
+                n_eval += (a1 - a0) * (b1 - b0)
+            sel = xp.nonzero(take)
+            if int(sel[0].size):
+                si = (sel[0] + a0).astype(xp.int64)
+                sj = (sel[1] + b0).astype(xp.int64)
+                out_i.append(np.asarray(si.get() if xp is not np else si))
+                out_j.append(np.asarray(sj.get() if xp is not np else sj))
+                v = phi[sel]
+                out_k.append(np.asarray(v.get() if xp is not np else v))
+            del acc, phi, take
+
+
+    if out_i:
+        df = pd.DataFrame({"i": np.concatenate(out_i),
+                           "j": np.concatenate(out_j),
+                           "kinship": np.concatenate(out_k)})
+        df = df.sort_values("kinship", ascending=False).reset_index(drop=True)
+    else:
+        df = pd.DataFrame({"i": np.zeros(0, np.int64),
+                           "j": np.zeros(0, np.int64),
+                           "kinship": np.zeros(0, np.float64)})
+    if verbose:
+        print(f"cugen.popstruct: {n_eval:,} pairs evaluated, {len(df):,} at "
+              f"kinship >= {min_kinship}", flush=True)
+    return df

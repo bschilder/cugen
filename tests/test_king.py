@@ -300,3 +300,85 @@ def test_missingness_confined_to_later_tiles(tmp_path):
     # tile_size=1000 puts markers 0-1999 in fully-called tiles
     got = king(path, tile_size=1000, verbose=False)
     np.testing.assert_allclose(got[off], want[off], atol=2e-6)
+
+
+# --------------------------------------------------------------------------
+# king_pairs: the blocked, thresholded form for cohorts where (n,n) is too big
+# --------------------------------------------------------------------------
+from cugen.popstruct import king_pairs  # noqa: E402
+
+
+def _dense_from_pairs(df, n):
+    M = np.full((n, n), np.nan)
+    M[df.i.to_numpy(), df.j.to_numpy()] = df.kinship.to_numpy()
+    return M
+
+
+@pytest.mark.parametrize("block", [16, 32, 128])
+def test_king_pairs_is_bit_exact_against_dense_king(tmp_path, block):
+    """Blocking must not perturb a single value, at any block size.
+
+    128 exceeds n here on purpose, so the single-block path is covered too.
+    """
+    G, _ = synth(n_unrel=60, p=4000, seed=31)
+    n = G.shape[0]
+    path = write_cg(tmp_path, G)
+    dense = king(path, verbose=False)
+    df = king_pairs(path, min_kinship=-np.inf, sample_block=block, verbose=False)
+    iu = np.triu_indices(n, 1)
+    np.testing.assert_array_equal(_dense_from_pairs(df, n)[iu], dense[iu])
+
+
+def test_king_pairs_emits_each_unordered_pair_once(tmp_path):
+    """At -inf every pair must appear exactly once, with i < j.
+
+    Guards the diagonal-block mask. Masking it with -inf instead of a boolean
+    leaks the whole lower triangle here, because -inf >= -inf.
+    """
+    G, _ = synth(n_unrel=30, p=1500, seed=32)
+    n = G.shape[0]
+    df = king_pairs(write_cg(tmp_path, G), min_kinship=-np.inf,
+                    sample_block=16, verbose=False)
+    assert len(df) == n * (n - 1) // 2
+    assert bool((df.i < df.j).all())
+    assert not df.duplicated(subset=["i", "j"]).any()
+
+
+def test_king_pairs_threshold_recovers_the_planted_relatives(tmp_path):
+    G, lab = synth(n_unrel=60, p=6000, seed=33)
+    df = king_pairs(write_cg(tmp_path, G), min_kinship=0.0442,
+                    sample_block=32, verbose=False)
+    got = {(int(a), int(b)) for a, b in zip(df.i, df.j)}
+    dup, child = lab.index("dup0"), lab.index("child12")
+    assert (0, dup) in got
+    assert (1, child) in got and (2, child) in got
+    top = df.iloc[0]
+    assert int(top.i) == 0 and int(top.j) == dup
+    assert float(top.kinship) == pytest.approx(0.5, abs=1e-12)
+
+
+def test_king_pairs_refuses_missingness_rather_than_guessing(tmp_path):
+    """Pairwise-complete het counts are themselves (n,n) -- the thing this
+    function exists to avoid -- so it must say so instead of quietly using
+    per-sample totals and returning slightly wrong kinships."""
+    G, _ = synth(n_unrel=20, p=1000, seed=34)
+    rng = np.random.default_rng(1)
+    G = G.copy()
+    G[rng.random(G.shape) < 0.05] = 3
+    with pytest.raises(NotImplementedError, match="missing"):
+        king_pairs(write_cg(tmp_path, G, "miss.cugen"), verbose=False)
+
+
+@requires_gpu
+def test_king_pairs_gpu_matches_numpy(tmp_path):
+    G, _ = synth(n_unrel=50, p=3000, seed=35)
+    path = write_cg(tmp_path, G)
+    a = king_pairs(path, min_kinship=-np.inf, sample_block=32,
+                   backend="numpy", verbose=False)
+    b = king_pairs(path, min_kinship=-np.inf, sample_block=32,
+                   backend="gpu", verbose=False)
+    a = a.sort_values(["i", "j"]).reset_index(drop=True)
+    b = b.sort_values(["i", "j"]).reset_index(drop=True)
+    np.testing.assert_array_equal(a.i, b.i)
+    np.testing.assert_array_equal(a.j, b.j)
+    np.testing.assert_allclose(a.kinship, b.kinship, rtol=1e-12, atol=1e-12)
