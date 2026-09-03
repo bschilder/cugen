@@ -514,6 +514,25 @@ def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
     :func:`king` -- so a threshold selects relatives from one direction only and
     never returns the population-difference tail.
 
+    USE ENOUGH MARKERS. This is the one thing that changes at biobank scale, and
+    it is not obvious. A threshold is applied to n(n-1)/2 draws from the null --
+    1.25e11 at n=500,000 -- so the per-pair false-positive rate has to sit below
+    roughly 1/n^2 before the emitted list means anything. The standard error of
+    phi falls as 1/sqrt(markers), so the threshold's distance from the null in
+    standard errors grows as sqrt(markers), and the tail collapses fast.
+    Measured at n=500,000 with 50 planted duplicates:
+
+        markers   emitted at phi >= 0.0442   false positives
+          5,000                  7,574,975         7,574,925
+         20,000                         50                 0
+
+    Four times the markers took the output from millions of spurious pairs to
+    exactly the 50 real ones. A marker count that is ample for a cohort of
+    thousands is not ample here; 20,000 is a floor rather than a target, and
+    published biobank relatedness scans use 50,000-100,000 pruned markers.
+    Cost scales sub-linearly in markers -- 4x the markers cost 3.2x the time in
+    that pair of runs -- so this is cheap insurance.
+
     Parameters
     ----------
     min_kinship
