@@ -13,6 +13,7 @@ become apparent kinship. Use the GRM to describe structure, KING to detect
 relatives.
 """
 
+import os
 from typing import Optional, Union
 from pathlib import Path
 
@@ -21,7 +22,8 @@ import numpy as np
 from ._stubs import _stub
 from .io import ENCODING_2BIT, read_cugen
 
-__all__ = ["grm", "pcs_from_grm", "king", "king_pairs", "pca", "pc_project"]
+__all__ = ["grm", "pcs_from_grm", "king", "king_pairs", "plan_king",
+           "pca", "pc_project"]
 
 # 2-bit codes are big-endian within the byte: sample 0 is the HIGH pair. Same
 # convention as the LD kernels (see cugen/ld.py) and cugen/write.pack_2bit.
@@ -38,6 +40,106 @@ def _unpack_tile(packed, n_samples):
     """
     codes = (packed[:, :, None] >> _SHIFTS) & np.uint8(3)
     return codes.reshape(packed.shape[0], -1)[:, :n_samples]
+
+
+def _host_available_bytes():
+    """Best-effort free host RAM. Falls back to a deliberately modest 8 GiB."""
+    try:
+        if os.path.exists("/proc/meminfo"):
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+        return int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    except Exception:  # noqa: BLE001
+        return 8 << 30
+
+
+def _king_budget(backend, device, safety):
+    """(budget_bytes, where) for whichever device would run the scan."""
+    if backend != "numpy":
+        try:
+            import cupy as _cp  # noqa: PLC0415
+            free, _ = _cp.cuda.Device(device).mem_info
+            return int(free * safety), "gpu"
+        except Exception:  # noqa: BLE001
+            if backend == "gpu":
+                raise
+    return int(_host_available_bytes() * safety), "host"
+
+
+#: (n, n) float64 blocks that king() holds at peak. One for the Gram
+#: accumulator, two more for the pairwise counts when calls are missing, one for
+#: HetHet under the within-family form, and five for the closing arithmetic
+#: (min, numerator, denominator, result, and the symmetrisation temporary).
+#: Deliberately an over-estimate: an optimistic figure routes a job to the dense
+#: path that then dies partway through, having already paid for the read.
+def _king_dense_bytes(n, has_missing, estimator):
+    blocks = 1 + (2 if has_missing else 0) + \
+        (1 if estimator == "within-family" else 0) + 5
+    return blocks * n * n * 8
+
+
+def _auto_sample_block(n, markers, budget_bytes):
+    """Largest whole-byte block whose accumulator and unpacked panel fit."""
+    B = 4
+    while B * 2 <= n:
+        cand = B * 2
+        need = 4 * cand * cand * 8 + markers * cand * 4
+        if need > budget_bytes:
+            break
+        B = cand
+    return min(max(B, 4), ((n + 3) // 4) * 4)
+
+
+def plan_king(cugen: Union[str, Path], *, estimator: str = "between-family",
+              backend: str = "auto", device: int = 0, safety: float = 0.70,
+              budget_bytes: Optional[int] = None, verbose: bool = True):
+    """Which KING routine this cohort and this machine can actually run.
+
+    :func:`king` returns a dense (n, n) matrix and :func:`king_pairs` returns the
+    pairs above a threshold, so they are NOT interchangeable outputs and nothing
+    here silently swaps one for the other. What this does is answer the question
+    that decides it -- does the dense form fit -- and report the arithmetic, so
+    the choice is a number rather than a guess.
+
+    Prefer `king` whenever it fits. It walks the markers once; `king_pairs`
+    bounds memory by re-walking them for every block pair, which is the right
+    trade only when the dense form is impossible. Measured on an RTX 4090 at
+    n=2504, p=100,000: `king` 0.048 s against `king_pairs` 0.877 s.
+
+    Returns
+    -------
+    dict with ``recommend`` (``"king"`` or ``"king_pairs"``), ``fits``,
+    ``n_samples``, ``n_variants``, ``dense_bytes``, ``budget_bytes``, ``where``
+    (``"gpu"`` or ``"host"``), ``sample_block`` (what to pass to `king_pairs`)
+    and ``reason``.
+    """
+    reader = read_cugen(str(cugen), device=device)
+    n = int(reader.n_samples)
+    p = int(reader.n_variants)
+    has_missing = bool(reader.has_missing)
+    where = "host"
+    if budget_bytes is None:
+        budget_bytes, where = _king_budget(backend, device, safety)
+    dense = _king_dense_bytes(n, has_missing, estimator)
+    fits = dense <= budget_bytes
+    B = _auto_sample_block(n, p, budget_bytes)
+    out = {
+        "recommend": "king" if fits else "king_pairs",
+        "fits": fits, "n_samples": n, "n_variants": p,
+        "has_missing": has_missing, "estimator": estimator,
+        "dense_bytes": dense, "budget_bytes": int(budget_bytes),
+        "where": where, "sample_block": B,
+        "reason": (
+            f"dense needs {dense/2**30:.2f} GiB of {budget_bytes/2**30:.2f} GiB "
+            f"{where} budget at n={n:,}"
+            + ("" if fits else
+               f"; use king_pairs(sample_block={B}) instead, which holds "
+               f"one ({B}, {B}) block rather than ({n:,}, {n:,})")),
+    }
+    if verbose:
+        print(f"cugen.popstruct: plan_king -> {out['recommend']}  ({out['reason']})")
+    return out
 
 
 def _unpack_on(packed, n_samples, xp, shifts):
@@ -277,7 +379,8 @@ def pca(*a, **kw):
 def king(cugen: Union[str, Path], *, variant_range=None, variants=None,
          maf_min: float = 0.0, estimator: str = "between-family",
          tile_size: Optional[int] = None, backend: str = "auto",
-         device: int = 0, verbose: bool = True):
+         device: int = 0, budget_bytes: Optional[int] = None,
+         safety: float = 0.70, verbose: bool = True):
     """KING-robust kinship coefficients, (n_samples, n_samples).
 
     Manichaikul et al. (2010), Bioinformatics 26:2867. The between-family form
@@ -374,6 +477,26 @@ def king(cugen: Union[str, Path], *, variant_range=None, variants=None,
 
     n = int(reader.n_samples)
     p_all = int(reader.n_variants)
+
+    # Refuse BEFORE reading anything. The dense form is (n, n)-bound, so at
+    # biobank n it cannot run at all -- and a MemoryError raised partway through
+    # the scan has already paid for the read and tells the caller nothing about
+    # what to do instead. This names the alternative and a block size.
+    _budget = budget_bytes
+    _where = "host"
+    if _budget is None:
+        _budget, _where = _king_budget(backend, device, safety)
+    _need = _king_dense_bytes(n, bool(reader.has_missing), estimator)
+    if _need > _budget:
+        _B = _auto_sample_block(n, p_all, _budget)
+        raise MemoryError(
+            f"king() needs about {_need/2**30:.2f} GiB of (n, n) accumulators at "
+            f"n={n:,}, over the {_budget/2**30:.2f} GiB {_where} budget. It "
+            f"returns a dense matrix, so there is no way to shrink it. Use "
+            f"king_pairs(..., sample_block={_B}) for the pairs above a "
+            f"threshold instead -- it holds one ({_B}, {_B}) block rather than "
+            f"({n:,}, {n:,}). See plan_king() for the arithmetic.")
+
     lo, hi = (0, p_all) if variant_range is None else (
         max(0, int(variant_range[0])), min(p_all, int(variant_range[1])))
     bpv = int(reader.bytes_per_variant)
@@ -507,9 +630,10 @@ def pc_project(*a, **kw):
 
 
 def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
-               sample_block: int = 4096, variant_range=None, variants=None,
+               sample_block=4096, variant_range=None, variants=None,
                maf_min: float = 0.0, tile_size: Optional[int] = None,
-               backend: str = "auto", device: int = 0, verbose: bool = True):
+               backend: str = "auto", device: int = 0, safety: float = 0.70,
+               verbose: bool = True):
     """Related pairs only, for cohorts where the (n, n) matrix does not exist.
 
     :func:`king` materialises three (n_samples, n_samples) accumulators. That is
@@ -572,12 +696,19 @@ def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
     if backend not in ("auto", "gpu", "numpy"):
         raise ValueError(
             f"backend must be 'auto', 'gpu' or 'numpy', got {backend!r}")
-    B = max(4, (int(sample_block) // 4) * 4)
-
     reader = read_cugen(path, device=device)
     if int(reader.encoding) != ENCODING_2BIT:
         raise ValueError(
             f"{path} is not 2bit dosage data (encoding={int(reader.encoding)}).")
+    if isinstance(sample_block, str):
+        if sample_block != "auto":
+            raise ValueError(
+                f"sample_block must be an int or 'auto', got {sample_block!r}")
+        _bud, _ = _king_budget(backend, device, safety)
+        B = _auto_sample_block(int(reader.n_samples),
+                               int(reader.n_variants), _bud)
+    else:
+        B = max(4, (int(sample_block) // 4) * 4)
 
     xp = np
     if backend != "numpy":

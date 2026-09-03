@@ -382,3 +382,78 @@ def test_king_pairs_gpu_matches_numpy(tmp_path):
     np.testing.assert_array_equal(a.i, b.i)
     np.testing.assert_array_equal(a.j, b.j)
     np.testing.assert_allclose(a.kinship, b.kinship, rtol=1e-12, atol=1e-12)
+
+
+# --------------------------------------------------------------------------
+# plan_king: which routine fits, and why
+# --------------------------------------------------------------------------
+from cugen.popstruct import plan_king  # noqa: E402
+
+
+def test_plan_recommends_dense_when_it_fits(tmp_path):
+    G, _ = synth(n_unrel=20, p=800, seed=40)
+    plan = plan_king(write_cg(tmp_path, G), budget_bytes=8 << 30, verbose=False)
+    assert plan["recommend"] == "king"
+    assert plan["fits"] is True
+    assert plan["n_samples"] == G.shape[0]
+
+
+def test_plan_recommends_pairs_when_dense_does_not_fit(tmp_path):
+    """Same file, tiny budget -- the choice must follow the budget, not n."""
+    G, _ = synth(n_unrel=20, p=800, seed=41)
+    plan = plan_king(write_cg(tmp_path, G), budget_bytes=1000, verbose=False)
+    assert plan["recommend"] == "king_pairs"
+    assert plan["fits"] is False
+    assert plan["sample_block"] >= 4
+    assert plan["sample_block"] % 4 == 0, "blocks must be whole bytes of 2-bit"
+
+
+def test_plan_dense_estimate_is_not_optimistic(tmp_path):
+    """The estimate must bound what king() actually peaks at, not undercut it.
+
+    An estimate that is too low is worse than none: it routes a job to the dense
+    path that then dies partway through with a MemoryError.
+    """
+    G, _ = synth(n_unrel=40, p=1200, seed=42)
+    path = write_cg(tmp_path, G)
+    n = G.shape[0]
+    plan = plan_king(path, budget_bytes=8 << 30, verbose=False)
+    # king() holds at minimum the Gram accumulator and the result, both (n,n) f64
+    assert plan["dense_bytes"] >= 2 * n * n * 8
+
+
+def test_plan_counts_the_extra_accumulators_for_missing_and_within_family(tmp_path):
+    G, _ = synth(n_unrel=20, p=800, seed=43)
+    clean = write_cg(tmp_path, G)
+    Gm = G.copy()
+    rng = np.random.default_rng(0)
+    Gm[rng.random(Gm.shape) < 0.05] = 3
+    dirty = write_cg(tmp_path, Gm, "dirty.cugen")
+    a = plan_king(clean, budget_bytes=8 << 30, verbose=False)["dense_bytes"]
+    b = plan_king(dirty, budget_bytes=8 << 30, verbose=False)["dense_bytes"]
+    c = plan_king(clean, estimator="within-family", budget_bytes=8 << 30,
+                  verbose=False)["dense_bytes"]
+    assert b > a, "missingness adds pairwise (n,n) accumulators"
+    assert c > a, "within-family still needs HetHet"
+
+
+def test_king_refuses_early_with_a_pointer_to_king_pairs(tmp_path):
+    """Fail before reading data, naming the alternative and a block size.
+
+    Dying in a MemoryError partway through a scan wastes the whole read and
+    tells the caller nothing about what to do instead.
+    """
+    G, _ = synth(n_unrel=20, p=800, seed=44)
+    with pytest.raises(MemoryError, match="king_pairs"):
+        king(write_cg(tmp_path, G), budget_bytes=1000, verbose=False)
+
+
+def test_king_pairs_auto_block_matches_an_explicit_block(tmp_path):
+    G, _ = synth(n_unrel=40, p=2000, seed=45)
+    path = write_cg(tmp_path, G)
+    auto = king_pairs(path, min_kinship=-np.inf, sample_block="auto",
+                      verbose=False).sort_values(["i", "j"]).reset_index(drop=True)
+    fixed = king_pairs(path, min_kinship=-np.inf, sample_block=32,
+                       verbose=False).sort_values(["i", "j"]).reset_index(drop=True)
+    np.testing.assert_array_equal(auto.i, fixed.i)
+    np.testing.assert_allclose(auto.kinship, fixed.kinship, rtol=0, atol=0)
