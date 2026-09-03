@@ -132,6 +132,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, Union
@@ -538,6 +539,62 @@ def _empty_pairs(stats: Sequence[str]) -> pd.DataFrame:
     cols["gidx_a"] = np.int64
     cols["gidx_b"] = np.int64
     return pd.DataFrame({c: pd.Series(dtype=t) for c, t in cols.items()})
+
+
+class _ChunkWriter:
+    """Appends successive frames to one output file.
+
+    Streaming exists because the result does not fit in device memory; it
+    must not then be accumulated in host memory either, so each chunk is
+    written and dropped. Parquet gets one row group per flush via
+    ParquetWriter, which keeps the file open and the schema fixed.
+    """
+
+    def __init__(self, path: str):
+        self.path = str(path)
+        self.rows = 0
+        self._pq = None
+
+    def write(self, df) -> None:
+        if len(df) == 0:
+            return
+        if self.path.endswith(".parquet"):
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+            tbl = (df.to_arrow() if hasattr(df, "to_arrow")
+                   else pa.Table.from_pandas(df, preserve_index=False))
+            if self._pq is None:
+                self._pq = pq.ParquetWriter(self.path, tbl.schema)
+            self._pq.write_table(tbl)
+        else:
+            sep = "\t" if self.path.endswith((".tsv", ".tsv.gz")) else ","
+            gz = self.path.endswith(".gz")
+            if hasattr(df, "to_pandas") and not gz:
+                # Keep libcudf's writer in the loop. Going through
+                # to_pandas().to_csv() per chunk cost 62.9 s to serialise
+                # 10,517,635 rows against 2.4 s for the whole buffered run --
+                # 26x, which would have made every streamed timing a
+                # measurement of pandas rather than of cugen. libcudf cannot
+                # append, so it writes a part file and the bytes are
+                # concatenated.
+                part = f"{self.path}.part"
+                df.to_csv(part, index=False, sep=sep, header=(self.rows == 0))
+                with open(part, "rb") as src, \
+                        open(self.path, "wb" if self.rows == 0 else "ab") as dst:
+                    shutil.copyfileobj(src, dst, 1 << 22)
+                os.remove(part)
+            else:
+                pdf = df.to_pandas() if hasattr(df, "to_pandas") else df
+                pdf.to_csv(self.path, sep=sep, index=False,
+                           header=(self.rows == 0),
+                           mode="w" if self.rows == 0 else "a",
+                           compression="gzip" if gz else None)
+        self.rows += len(df)
+
+    def close(self) -> None:
+        if self._pq is not None:
+            self._pq.close()
+            self._pq = None
 
 
 def _write_df(df: pd.DataFrame, path: str) -> None:
@@ -1399,9 +1456,13 @@ def _clump_edges_rect_gpu(reader, rows, positions, cand_mask, kb, r2_thresh,
     _t_read = _time.perf_counter() - _t0_read
 
     # Per-variant moments once, streamed -- identical to the banded scan.
+    # Genotype-only on purpose: ns, _build_g and the kb-window logic below all
+    # assume dosages, so there is no phased variant of this scan to select.
+    # d5de783 copied a `if phased` branch in here from the fused scan, where
+    # `phased` is a parameter; here it is not bound, so every GPU rectangular
+    # clump raised NameError.
     _t0 = _time.perf_counter()
-    s_v, q_v = (_hap_moments(packed, p, ns, bpv) if phased
-                else _variant_moments(packed, p, ns, bpv))
+    s_v, q_v = _variant_moments(packed, p, ns, bpv)
     cp.cuda.Stream.null.synchronize()
     _t_mom = _time.perf_counter() - _t0
 
@@ -2386,6 +2447,7 @@ def _r_only_result(r_arr, n_arr, reader, rows, pairs_local):
 
 
 def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
+                    count_only=False, on_flush=None, flush_rows=None,
                     verbose=False, tf32=False, phased=False):
     """Fused scan: one kernel per tile, one output buffer, no per-tile sync.
 
@@ -2418,7 +2480,10 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
     s_v, q_v = (_hap_moments(packed, p, ns, bpv) if phased
                 else _variant_moments(packed, p, ns, bpv))
 
-    def run(capacity):
+    def run(capacity, on_flush=None, tile_max=0):
+        """Scan every tile. With on_flush, drain the buffer at tile
+        boundaries so it can never overflow; without it, fill one buffer."""
+        flushed = 0
         # Set the cuBLAS math mode ONCE for the whole scan. Doing it per GEMM
         # cost two cuBLAS calls per tile, which showed up as TF32 being
         # *slower* than fp32 at large n where tiles are many.
@@ -2445,15 +2510,90 @@ def _scan_gpu_fused(reader, rows, window, min_r2, tile_size=None,
                     S = Ga @ Gb.T
                     bi, bj = i1 - i0, j1 - j0
                     nthread = bi * bj
+                    # Reserving B*B up front is unaffordable: B reaches the
+                    # planner's 32,768 ceiling at small n, so 2*B*B is 2.1e9
+                    # rows (~43 GB) -- worse than the buffer it replaced.
+                    # Instead keep the buffer at most half full going in, and
+                    # handle the rare tile that still overflows below.
+                    held = 0
+                    if on_flush is not None:
+                        held = int(counter[0])
+                        if held > capacity // 2:
+                            on_flush(out_i[:held], out_j[:held], out_r[:held])
+                            flushed += held
+                            counter.fill(0)
+                            held = 0
                     kern(((nthread + 255) // 256,), (256,),
                          (S, s_v[i0:i1], s_v[j0:j1], q_v[i0:i1], q_v[j0:j1],
                           np.float32(ns), np.int64(i0), np.int64(j0),
                           np.int64(bi), np.int64(bj),
                           np.int64(window if window else 0), np.float32(min_r2),
                           out_i, out_j, out_r, counter, np.int64(capacity)))
+                    if on_flush is not None:
+                        after = int(counter[0])
+                        if after > capacity:
+                            # This tile alone overflowed a half-empty buffer.
+                            # atomicAdd is unconditional, so `after` is exact
+                            # even though writes past capacity were dropped --
+                            # and S is still live, so only the epilogue is
+                            # re-run, never the GEMM. That is the difference
+                            # between retrying one tile and retrying O(p^2).
+                            need = after - held
+                            if held:
+                                on_flush(out_i[:held], out_j[:held],
+                                         out_r[:held])
+                                flushed += held
+                            counter.fill(0)
+                            t_i = cp.empty(need, dtype=cp.int64)
+                            t_j = cp.empty(need, dtype=cp.int64)
+                            t_r = cp.empty(need, dtype=cp.float32)
+                            kern(((nthread + 255) // 256,), (256,),
+                                 (S, s_v[i0:i1], s_v[j0:j1], q_v[i0:i1],
+                                  q_v[j0:j1], np.float32(ns), np.int64(i0),
+                                  np.int64(j0), np.int64(bi), np.int64(bj),
+                                  np.int64(window if window else 0),
+                                  np.float32(min_r2), t_i, t_j, t_r, counter,
+                                  np.int64(need)))
+                            got = int(counter[0])
+                            on_flush(t_i[:got], t_j[:got], t_r[:got])
+                            flushed += got
+                            del t_i, t_j, t_r
+                            counter.fill(0)
                     del S
         del bufA, bufB
+        if on_flush is not None:
+            held = int(counter[0])
+            if held:
+                on_flush(out_i[:held], out_j[:held], out_r[:held])
+                flushed += held
+            return None, None, None, flushed
         return out_i, out_j, out_r, int(counter[0])
+
+    if on_flush is not None:
+        # A tile emits at most B*B rows, so a buffer of at least 2*B*B drained
+        # whenever the count comes within B*B of capacity can never overflow.
+        # Overflow becomes structurally impossible rather than merely
+        # unlikely, which is what retires the re-run-everything retry.
+        # Sized from a memory budget, NOT from B: 8.4e6 rows is ~168 MB at
+        # 20 B/row and is independent of both p and the tile size. An
+        # oversized tile is handled by the exact epilogue retry above.
+        cap = max(1 << 16, int(flush_rows) if flush_rows else (1 << 23))
+        _a, _b, _c, total = run(cap, on_flush=on_flush, tile_max=0)
+        del packed
+        cp.get_default_memory_pool().free_all_blocks()
+        return int(total)
+
+    # count_only: the kernel's atomicAdd is unconditional and it only writes
+    # when slot < capacity, so a zero-capacity run does every GEMM, writes
+    # nothing, and still counts exactly. That is the only way to measure
+    # genome-scale compute today -- chr22's full variant set alone emits
+    # 187,252,868 rows, and genome-wide extrapolates to ~630 GB of output
+    # arrays, far past both this buffer and the card.
+    if count_only:
+        _i, _j, _r, found = run(0)
+        del _i, _j, _r, packed
+        cp.get_default_memory_pool().free_all_blocks()
+        return int(found)
 
     # optimistic capacity, then one exact retry if it overflowed
     cap = min(int(200e6), max(1 << 20, p * (int(window) if window else 4096)))
@@ -2709,6 +2849,9 @@ def ld_matrix(
     precision: str = "auto",
     max_pairs: int = 100_000_000,
     device: int = 0,
+    count_only: bool = False,
+    stream: bool = False,
+    flush_rows: Optional[int] = None,
     verbose: bool = True,
 ):
     """Pairwise LD (r, r^2, signed r^2, D, D') from a .cugen file.
@@ -2858,7 +3001,7 @@ def ld_matrix(
                              dtype=np.int64)
 
     n_pairs = _count_pairs(len(rows), positions, window, window_kb)
-    if n_pairs > max_pairs:
+    if n_pairs > max_pairs and not count_only:
         raise ValueError(
             f"plan would emit {n_pairs:,} pairs, above max_pairs={max_pairs:,}. "
             f"Narrow it with window= or window_kb=, raise min_r2, or raise "
@@ -2876,8 +3019,10 @@ def ld_matrix(
     # cuDF fast path: r-family stats only, and only when we are writing a file.
     # The survivors are already in device memory, so keeping them there and
     # letting cudf wrap them avoids a host round trip we would immediately undo.
-    on_device = (use_gpu and HAS_CUDF and not need_table
-                 and output is not None and annotation is None)
+    # The cuDF/output preconditions exist to avoid a host round trip when
+    # SERIALISING. count_only serialises nothing, so they do not apply.
+    on_device = (use_gpu and not need_table and annotation is None
+                 and (count_only or (HAS_CUDF and output is not None)))
     # The fused single-kernel scan handles the clean r-only case: no
     # missingness, no bp window, no D/D'. That is the hot path, and it is
     # where the device was sitting at 1-4% SM utilisation.
@@ -2888,8 +3033,58 @@ def ld_matrix(
     fused = (on_device and not reader.has_missing and window_kb is None
              and min_obs <= reader.n_samples and fused_ok_phased)
 
+    if stream and output is None:
+        raise ValueError(
+            "stream=True writes the result incrementally and returns a row "
+            "count, so it needs output=. Streaming to nowhere is a no-op.")
+    if stream and not (use_gpu and fused):
+        raise ValueError(
+            "stream=True needs the fused GPU scan; it is the only path whose "
+            "output is produced tile by tile.")
+    if count_only and not (use_gpu and fused):
+        raise ValueError(
+            "count_only needs the fused GPU scan, which is the only path with "
+            "a survivor counter. It is unavailable here because "
+            f"{'D/D-prime were requested' if need_table else ''}"
+            f"{'the file has missing calls' if reader.has_missing else ''}"
+            f"{'window_kb was set' if window_kb is not None else ''}"
+            f"{'no GPU is available' if not use_gpu else ''}"
+            f"{'an annotation was passed' if annotation is not None else ''}"
+            ". Returning a DataFrame instead of a count would be worse: the "
+            "caller would treat a frame as a number.")
+
     if use_gpu and fused:
         cp.cuda.Device(device).use()
+        if count_only:
+            return _scan_gpu_fused(reader, rows, window, min_r2,
+                                   tile_size=tile_size, verbose=verbose,
+                                   tf32=use_tf32, phased=bool(want_phased),
+                                   count_only=True)
+        if stream:
+            n_obs_s = (2 * int(reader.n_samples) if want_phased
+                       else int(reader.n_samples))
+            writer = _ChunkWriter(str(output))
+
+            def _flush(ii_d, jj_d, rr_d):
+                g = _assemble_device(
+                    cp.stack([ii_d, jj_d], axis=1),
+                    (rr_d, cp.full(ii_d.size, float(n_obs_s),
+                                   dtype=cp.float32)),
+                    reader, rows, stats, sign_reference, path, False,
+                    n_planned=n_pairs)
+                writer.write(g)
+
+            try:
+                total = _scan_gpu_fused(
+                    reader, rows, window, min_r2, tile_size=tile_size,
+                    verbose=verbose, tf32=use_tf32,
+                    phased=bool(want_phased), on_flush=_flush,
+                    flush_rows=flush_rows)
+            finally:
+                writer.close()
+            if verbose:
+                print(f"cugen.ld: streamed {total:,} rows to {output}")
+            return int(total)
         ii, jj, rr = _scan_gpu_fused(reader, rows, window, min_r2,
                                      tile_size=tile_size, verbose=verbose,
                                      tf32=use_tf32, phased=bool(want_phased))
