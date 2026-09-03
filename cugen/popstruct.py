@@ -622,6 +622,19 @@ def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
         rows.append(raw[marker_keep[k]])
     packed = np.concatenate(rows, axis=0) if len(rows) > 1 else rows[0]
     del rows
+    # Unpack on whichever device does the GEMM. _unpack_tile is pure shift/mask,
+    # so it runs on CuPy unchanged once the shift vector lives there too -- and
+    # it must, because at biobank n the per-block-pair unpack is the term that
+    # competes with the product. Leaving it on the host would serialise the GPU
+    # behind a numpy bit-twiddle. The packed panel is n/4 bytes per marker, so
+    # resident cost on device is 0.6 GB at n=500,000 / p=5,000.
+    _sh = _SHIFTS if xp is np else xp.asarray(_SHIFTS)
+    if xp is not np:
+        packed = xp.asarray(packed)
+
+    def _unp(blk, ns):
+        codes = (blk[:, :, None] >> _sh) & xp.uint8(3)
+        return codes.reshape(blk.shape[0], -1)[:, :ns]
 
     nb = (n + B - 1) // B
     n_block_pairs = nb * (nb + 1) // 2
@@ -640,9 +653,8 @@ def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
         # nb - a times; hoisting it roughly halves total unpack cost, which is
         # the term that competes with the GEMM at biobank n. Resident size is
         # markers x B float32 -- 82 MB at p=5,000 / B=4,096, 1.6 GB at p=100,000.
-        UA = xp.asarray(_unpack_tile(
-            packed[:, a0 // 4:(a1 + 3) // 4], a1 - a0)
-        ).astype(xp.float32) - xp.float32(1.0)
+        UA = _unp(packed[:, a0 // 4:(a1 + 3) // 4],
+                  a1 - a0).astype(xp.float32) - xp.float32(1.0)
 
         for b in range(a, nb):
             b0, b1 = b * B, min((b + 1) * B, n)
@@ -653,8 +665,7 @@ def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
                 if b == a:
                     acc += fa.T @ fa            # SYRK on the diagonal block
                 else:
-                    cb = xp.asarray(_unpack_tile(
-                        packed[t0:t1, b0 // 4:(b1 + 3) // 4], b1 - b0))
+                    cb = _unp(packed[t0:t1, b0 // 4:(b1 + 3) // 4], b1 - b0)
                     acc += fa.T @ (cb.astype(xp.float32) - xp.float32(1.0))
             hi_ = het[a0:a1][:, None]
             hj_ = het[b0:b1][None, :]
