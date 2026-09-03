@@ -75,10 +75,26 @@ disk. `open_king_matrix()` memory-maps it and every accessor takes a row index
 
 ```python
 km = open_king_matrix("cohort.king")
-km["NA12878", "NA12891"]      # one cell
-km.row("NA12878")             # that person against everyone
-km.related("NA12878")         # just their relatives, kinship descending
+km["NA12878", "NA12891"]              # one cell
+km.row("NA12878")                     # that person against everyone
+km.related("NA12878")                 # just their relatives, kinship descending
+km.submatrix(cases)                   # k x k block for a set of people
+km.submatrix(cases, cols=controls)    # rectangular, cases against controls
+km.submatrix(cases, as_frame=True)    # labelled by sample ID
 ```
+
+`submatrix` returns rows in the order you passed, not sorted, so they line up
+with your own list. Measured at n=602 (square layout, float32):
+
+| people | block | time |
+|---|---|---|
+| 10 | 10x10 | 0.01 ms |
+| 100 | 100x100 | 0.05 ms |
+| 300 | 300x300 | 0.36 ms |
+
+Cost is k contiguous row gathers under `square`. Under `triangle` it is one
+vectorised gather over up to k^2 scattered offsets, which is fine for a few
+hundred people and another reason `square` is the default.
 
 ### Layout is about access, not size
 

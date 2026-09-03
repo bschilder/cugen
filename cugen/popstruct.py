@@ -1110,6 +1110,56 @@ class KingMatrix:
             out[i + 1:] = self._deq(self._m[k * (k + 1) // 2 + i])
         return out
 
+    def indices_of(self, people):
+        """Resolve a mixed list of IDs and indices, PRESERVING their order."""
+        return np.fromiter((self.index_of(x) for x in people),
+                           dtype=np.int64, count=len(people))
+
+    def submatrix(self, people, cols=None, *, as_frame: bool = False,
+                  max_gb: float = 8.0):
+        """The kinship block for a set of people, in the order you asked for.
+
+        The cohort-level query: hand it 500 cases and get their 500 x 500 block
+        without touching the rest of an n x n file. ``cols`` makes it
+        rectangular -- cases against controls, say -- and defaults to ``people``
+        for the symmetric case.
+
+        Order is the caller's, not sorted, so rows line up with the list that
+        was passed in. Duplicates are allowed and give repeated rows, which is
+        occasionally what a caller wants and is never silently wrong.
+
+        Reading cost depends on the layout, as everything here does. Square
+        gathers whole rows, so k people cost k contiguous row reads. Triangle
+        has to compute an offset per cell, which is one vectorised gather but
+        touches up to k^2 scattered pages -- fine for a few hundred people,
+        and the reason ``square`` is the default.
+        """
+        ri = self.indices_of(list(people))
+        ci = ri if cols is None else self.indices_of(list(cols))
+        need = ri.size * ci.size * 8 / 1e9
+        if need > max_gb:
+            raise MemoryError(
+                f"the requested block is {ri.size:,} x {ci.size:,} = "
+                f"{need:,.1f} GB, over max_gb={max_gb}. Ask for fewer people, "
+                f"or raise max_gb deliberately.")
+
+        if self.layout == "square":
+            out = self._deq(self._m[np.ix_(ri, ci)])
+        else:
+            # offset(i, j) = max(i,j)*(max+1)/2 + min(i,j), vectorised over the
+            # whole block rather than looped, so one gather serves k^2 cells.
+            I = ri[:, None]
+            J = ci[None, :]
+            hi = np.maximum(I, J)
+            lo_ = np.minimum(I, J)
+            out = self._deq(self._m[hi * (hi + 1) // 2 + lo_])
+
+        if not as_frame:
+            return out
+        import pandas as pd  # noqa: PLC0415
+        lab = (lambda a: [self.ids[k] for k in a]) if self.ids else list
+        return pd.DataFrame(out, index=lab(ri), columns=lab(ci))
+
     def related(self, person, min_kinship: float = 0.0442, top: int = None):
         """That person's relatives, kinship descending. Self is excluded.
 

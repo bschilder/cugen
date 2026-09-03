@@ -642,3 +642,93 @@ def test_row_gather_is_vectorised_not_a_python_loop(tmp_path):
         got = km.row(r)
         assert got.shape == (n,)
         np.testing.assert_allclose(got, dense[r], rtol=0, atol=1e-6)
+
+
+# --------------------------------------------------------------------------
+# submatrix: many people at once
+# --------------------------------------------------------------------------
+def _km(tmp_path, layout="square", seed=70, n_unrel=40, p=2000, name=None):
+    G, lab = synth(n_unrel=n_unrel, p=p, seed=seed)
+    n = G.shape[0]
+    ids = _ids(n)
+    path = write_cg(tmp_path, G, f"sm{seed}{layout}.cugen")
+    f = king_matrix(path, tmp_path / (name or f"sm{seed}{layout}.bin"),
+                    encoding="float32", layout=layout, sample_ids=ids,
+                    sample_block=16, verbose=False)
+    return open_king_matrix(f), king(path, verbose=False), ids, lab
+
+
+@pytest.mark.parametrize("layout", ["square", "triangle"])
+def test_submatrix_matches_the_dense_subset(tmp_path, layout):
+    km, dense, ids, _ = _km(tmp_path, layout)
+    pick = [3, 17, 0, 29, 8]
+    got = km.submatrix(pick)
+    np.testing.assert_allclose(got, dense[np.ix_(pick, pick)], rtol=0, atol=1e-6)
+    assert got.shape == (5, 5)
+
+
+def test_submatrix_preserves_the_caller_order(tmp_path):
+    """Rows must line up with the list handed in, not a sorted version of it."""
+    km, dense, ids, _ = _km(tmp_path, seed=71)
+    pick = [29, 3, 17, 0]
+    got = km.submatrix(pick)
+    np.testing.assert_allclose(got, dense[np.ix_(pick, pick)], rtol=0, atol=1e-6)
+    assert got[0, 1] == pytest.approx(dense[29, 3], abs=1e-6)
+
+
+def test_submatrix_accepts_ids_and_mixes_them_with_indices(tmp_path):
+    km, dense, ids, _ = _km(tmp_path, seed=72)
+    pick = [ids[5], 11, ids[2]]
+    np.testing.assert_allclose(km.submatrix(pick),
+                               dense[np.ix_([5, 11, 2], [5, 11, 2])],
+                               rtol=0, atol=1e-6)
+
+
+def test_submatrix_rectangular_rows_against_cols(tmp_path):
+    """Cases against controls, without materialising either full row set."""
+    km, dense, ids, _ = _km(tmp_path, seed=73)
+    r, c = [1, 4, 9], [20, 21, 22, 23]
+    got = km.submatrix(r, cols=c)
+    assert got.shape == (3, 4)
+    np.testing.assert_allclose(got, dense[np.ix_(r, c)], rtol=0, atol=1e-6)
+
+
+def test_submatrix_is_symmetric_with_half_on_the_diagonal(tmp_path):
+    km, _, ids, _ = _km(tmp_path, seed=74)
+    S = km.submatrix([2, 7, 13, 4])
+    np.testing.assert_allclose(S, S.T, atol=1e-6)
+    np.testing.assert_allclose(np.diag(S), 0.5, atol=1e-6)
+
+
+def test_submatrix_recovers_planted_relatives(tmp_path):
+    km, _, ids, lab = _km(tmp_path, seed=75, p=6000)
+    dup, child = lab.index("dup0"), lab.index("child12")
+    S = km.submatrix([0, dup, 1, 2, child])
+    assert S[0, 1] == pytest.approx(0.5, abs=1e-6)      # 0 vs its duplicate
+    assert S[2, 4] > 0.2 and S[3, 4] > 0.2              # both parents vs child
+
+
+def test_submatrix_as_frame_is_labelled_by_id(tmp_path):
+    km, dense, ids, _ = _km(tmp_path, seed=76)
+    pick = [ids[6], ids[1]]
+    df = km.submatrix(pick, as_frame=True)
+    assert list(df.index) == pick and list(df.columns) == pick
+    assert df.loc[ids[6], ids[1]] == pytest.approx(dense[6, 1], abs=1e-6)
+
+
+def test_submatrix_refuses_a_result_that_will_not_fit(tmp_path):
+    km, _, _, _ = _km(tmp_path, seed=77)
+    with pytest.raises(MemoryError, match="max_gb"):
+        km.submatrix(list(range(40)), max_gb=1e-9)
+
+
+def test_submatrix_rejects_an_unknown_person(tmp_path):
+    km, _, _, _ = _km(tmp_path, seed=78)
+    with pytest.raises(KeyError, match="GHOST"):
+        km.submatrix([1, "GHOST"])
+
+
+def test_submatrix_of_one_person_is_the_diagonal(tmp_path):
+    km, _, _, _ = _km(tmp_path, seed=79)
+    S = km.submatrix([5])
+    assert S.shape == (1, 1) and S[0, 0] == pytest.approx(0.5, abs=1e-6)
