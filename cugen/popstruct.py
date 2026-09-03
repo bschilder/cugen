@@ -865,69 +865,88 @@ def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
 # --------------------------------------------------------------------------
 # Dense KING, on disk. For when the matrix genuinely is the deliverable.
 # --------------------------------------------------------------------------
-_KM_MAGIC = b"CUKING01"
+_KM_MAGIC = b"CUKING02"
 _KM_ENC = {"int16": (np.int16, 32767.0), "float32": (np.float32, 1.0)}
+_KM_LAYOUT = ("square", "triangle")
+#: magic(8) n(i8) enc(i4) layout(i4) id_bytes(i8); the ID block follows, then data
+_KM_HEADER = 32
 
 
 def king_matrix(cugen: Union[str, Path], out: Union[str, Path], *,
-                encoding: str = "int16", sample_block=4096,
-                variant_range=None, variants=None, maf_min: float = 0.0,
+                encoding: str = "int16", layout: str = "square",
+                sample_ids=None, sample_block=4096, variant_range=None,
+                variants=None, maf_min: float = 0.0,
                 tile_size: Optional[int] = None, backend: str = "auto",
                 device: int = 0, safety: float = 0.70, verbose: bool = True):
-    """The full dense matrix, written to disk as a lower triangle.
+    """The full dense matrix, written to disk and queryable BY PERSON.
 
-    :func:`king` holds the matrix in memory, so it stops at whatever the machine
-    has. This runs the same block walk as :func:`king_pairs` but writes every
-    block instead of thresholding it, so n is bounded by DISK rather than RAM.
-    Read it back with :func:`open_king_matrix`, which memory-maps it and gives
-    O(1) access to any ``(i, j)`` without loading the whole thing.
+    :func:`king` holds the matrix in memory, so n stops at what the machine has.
+    This runs the same block walk as :func:`king_pairs` but writes every block,
+    so n is bounded by DISK. Read it back with :func:`open_king_matrix`.
 
-    Sizes at n = 1,000,000, lower triangle including the diagonal
-    (500,000,500,000 entries):
+    LAYOUT IS THE DECISION THAT MATTERS, and it is about access, not size. In a
+    lower triangle, row i is one contiguous run of i+1 entries PLUS n-i-1
+    entries that each live in a different row -- so a per-person row query
+    touches up to n scattered pages spread across the whole file. At
+    n = 1,000,000 that is ~10 s per person on NVMe. Stored square, row i is one
+    contiguous 2 MB read: ~1 ms. Four orders of magnitude, for twice the bytes:
 
-        int16    1.0 TB     quantum 3.05e-5
-        float32  2.0 TB     exact to fp32
+        layout     n=1,000,000 int16   row query
+        square     2.0 TB             ~1 ms      (default)
+        triangle   1.0 TB             ~10 s
 
-    int16 is the default for the same reason ``.cugenld`` stores r that way: phi
-    lives in [-1, 0.5] and its own sampling error is around 1e-3 at 100,000
-    markers, so a 3.05e-5 quantum is two orders finer than the number is real to.
-    Storing float64 would be four decimal places of noise at twice the size.
+    ``square`` is the default because the reason to materialise a dense matrix
+    at all is random access; ``triangle`` is there for archival, where halving
+    1 TB matters and nobody is going to query a row.
 
-    BEFORE YOU RUN THIS, be sure you want a dense matrix. At n = 1,000,000 more
-    than 99.99% of the entries are phi ~ 0, and the same information as a pair
-    list is 0.06-0.6 GB -- three to four orders of magnitude smaller. Reach for
-    it when something downstream genuinely demands dense random access (a solver
-    that will not take a sparse operand, or an external tool wanting
-    plink/GCTA-style binary), and reach for :func:`king_pairs` otherwise.
+    Encoding is int16 by default, for the same reason ``.cugenld`` stores r that
+    way: phi lives in [-1, 0.5] and its own sampling error is ~1e-3 at 100,000
+    markers, so a 3.05e-5 quantum is two orders finer than the number is real
+    to. ``float32`` is available and exact to fp32.
 
-    The write is ~9 minutes for 1 TB on a 2 GB/s NVMe, against 377 s of measured
-    compute at n = 1,000,000 -- so at this scale it is an I/O job, not a
-    compute one.
+    ``sample_ids`` are stored in the file so queries can name people rather than
+    row offsets. If omitted, a ``<cugen>.samples.txt`` sidecar is used when one
+    exists -- ``.cugen`` itself does not carry IDs.
+
+    BEFORE YOU RUN THIS, be sure you want dense. At n = 1,000,000 more than
+    99.99% of entries are phi ~ 0, and the same information as a pair list is
+    0.06-0.6 GB, three to four orders smaller. Dense earns its place when
+    something downstream needs arbitrary (i, j) access or a plink/GCTA-style
+    binary; otherwise use :func:`king_pairs`.
     """
     if encoding not in _KM_ENC:
         raise ValueError(
             f"encoding must be one of {sorted(_KM_ENC)}, got {encoding!r}")
+    if layout not in _KM_LAYOUT:
+        raise ValueError(
+            f"layout must be one of {list(_KM_LAYOUT)}, got {layout!r}")
     dt, scale = _KM_ENC[encoding]
+    isz = np.dtype(dt).itemsize
 
     reader = read_cugen(str(cugen), device=device)
     n = int(reader.n_samples)
-    tri = n * (n + 1) // 2
-    nbytes = tri * np.dtype(dt).itemsize
-    if verbose:
-        print(f"cugen.popstruct: king_matrix n={n:,} -> {tri:,} entries, "
-              f"{nbytes/1e12:.3f} TB as {encoding}, to {out}", flush=True)
 
-    # Stream it, consuming the generator lazily. _king_blocks yields in a-major
-    # order over the LOWER block triangle, so the blocks for row-block a are
-    # exactly its columns 0..a1 -- one complete row-strip of the triangle. Fill
-    # the strip in the OUTPUT dtype, write its rows contiguously, release it.
-    # Peak is (B x n) * itemsize plus one (B, B) accumulator: 8 GB at B=4096,
-    # n=1e6, int16.
-    #
-    # An earlier version called king_pairs(min_kinship=-inf) and scattered the
-    # result into an (n, n) float64 array before writing. That is 8 TB at
-    # n=1e6 -- the exact allocation this function exists to avoid -- and it
-    # passed its tests only because they ran at n=122.
+    if sample_ids is None:
+        side = Path(str(cugen) + ".samples.txt")
+        if side.exists():
+            sample_ids = [x.strip() for x in side.read_text().split("\n")
+                          if x.strip()]
+    if sample_ids is not None:
+        sample_ids = [str(x) for x in sample_ids]
+        if len(sample_ids) != n:
+            raise ValueError(
+                f"{len(sample_ids):,} sample_ids for {n:,} samples in "
+                f"{cugen}. Mismatched IDs would silently mislabel every query, "
+                f"so this refuses rather than truncating.")
+    id_blob = ("\n".join(sample_ids)).encode() if sample_ids else b""
+
+    tri = n * (n + 1) // 2
+    cells = n * n if layout == "square" else tri
+    if verbose:
+        print(f"cugen.popstruct: king_matrix n={n:,} layout={layout} "
+              f"-> {cells:,} cells, {cells*isz/1e12:.3f} TB as {encoding}, "
+              f"to {out}", flush=True)
+
     lim = float(np.iinfo(dt).max) if encoding == "int16" else None
 
     def _q(v):
@@ -936,83 +955,183 @@ def king_matrix(cugen: Union[str, Path], out: Union[str, Path], *,
             v = np.clip(np.rint(v * scale), -lim, lim)
         return v.astype(dt)
 
-    state = {"cur": None, "strip": None, "written": 0}
+    gen = _king_blocks(
+        cugen, sample_block=sample_block, variant_range=variant_range,
+        variants=variants, maf_min=maf_min, tile_size=tile_size,
+        backend=backend, device=device, safety=safety, verbose=False)
+
     with open(str(out), "wb") as fh:
         fh.write(_KM_MAGIC)
         fh.write(np.array([n], dtype=np.int64).tobytes())
         fh.write(np.array([list(_KM_ENC).index(encoding)], dtype=np.int32)
                  .tobytes())
-        fh.write(b"\0" * 4)                     # pad the header to 24 bytes
+        fh.write(np.array([_KM_LAYOUT.index(layout)], dtype=np.int32).tobytes())
+        fh.write(np.array([len(id_blob)], dtype=np.int64).tobytes())
+        fh.write(id_blob)
+        data_off = fh.tell()
+        fh.truncate(data_off + cells * isz)
 
-        def _flush():
-            if state["strip"] is None:
-                return
-            r0, r1 = state["cur"]
-            for r in range(r0, r1):
-                fh.write(state["strip"][r - r0, :r + 1].tobytes())
-                state["written"] += r + 1
-            state["strip"] = None
+    if layout == "square":
+        # Blocks arrive over the LOWER block triangle, so each also fills its
+        # mirror. A memmap takes both placements without a second pass, and the
+        # kernel flushes dirty pages as it goes -- peak RSS stays bounded rather
+        # than tracking the file size.
+        M = np.memmap(str(out), dtype=dt, mode="r+", offset=data_off,
+                      shape=(n, n))
+        for a0, a1, b0, b1, phi in gen:
+            q = _q(phi)
+            M[a0:a1, b0:b1] = q
+            if a0 != b0:
+                M[b0:b1, a0:a1] = q.T
+        M.flush()
+        del M
+        written = cells
+    else:
+        # Ragged lower triangle: row i occupies i+1 entries at i(i+1)/2. Blocks
+        # come in a-major order, so the blocks for row-block a are exactly its
+        # columns 0..a1 -- one complete strip. Fill it, write, release.
+        state = {"cur": None, "strip": None, "written": 0}
+        with open(str(out), "r+b") as fh:
+            fh.seek(data_off)
 
-        for a0, a1, b0, b1, phi in _king_blocks(
-                cugen, sample_block=sample_block, variant_range=variant_range,
-                variants=variants, maf_min=maf_min, tile_size=tile_size,
-                backend=backend, device=device, safety=safety, verbose=False):
-            if state["cur"] != (a0, a1):
-                _flush()
-                state["cur"] = (a0, a1)
-                state["strip"] = np.zeros((a1 - a0, a1), dtype=dt)
-            state["strip"][:, b0:b1] = _q(phi)
-        _flush()
+            def _flush():
+                if state["strip"] is None:
+                    return
+                r0, r1 = state["cur"]
+                for r in range(r0, r1):
+                    fh.write(state["strip"][r - r0, :r + 1].tobytes())
+                    state["written"] += r + 1
+                state["strip"] = None
 
-    if state["written"] != tri:
-        raise RuntimeError(
-            f"wrote {state['written']:,} entries but the lower triangle of "
-            f"n={n:,} is {tri:,}; the strip walk missed part of the matrix.")
+            for a0, a1, b0, b1, phi in gen:
+                if state["cur"] != (a0, a1):
+                    _flush()
+                    state["cur"] = (a0, a1)
+                    state["strip"] = np.zeros((a1 - a0, a1), dtype=dt)
+                state["strip"][:, b0:b1] = _q(phi)
+            _flush()
+        written = state["written"]
+        if written != tri:
+            raise RuntimeError(
+                f"wrote {written:,} entries but the lower triangle of n={n:,} "
+                f"is {tri:,}; the strip walk missed part of the matrix.")
+
     if verbose:
-        print(f"cugen.popstruct: wrote {os.path.getsize(str(out))/1e9:.3f} GB",
-              flush=True)
+        print(f"cugen.popstruct: wrote {os.path.getsize(str(out))/1e9:.3f} GB "
+              f"({written:,} cells)", flush=True)
     return str(out)
 
 
 class KingMatrix:
-    """Memory-mapped reader for a :func:`king_matrix` file.
+    """Memory-mapped reader for a :func:`king_matrix` file, indexed by person.
 
-    Dense semantics without dense memory: ``km[i, j]`` is an O(1) seek into the
-    lower triangle, and ``km.row(i)`` returns one full row. ``to_numpy()``
-    materialises the whole square and refuses above ``max_gb`` rather than
-    quietly trying to allocate a terabyte.
+    Dense semantics without dense memory. Every accessor takes either a row
+    index or a sample ID, so callers work in the identifiers they already have:
+
+        km["NA12878", "NA12891"]        one cell
+        km.row("NA12878")               that person against everyone
+        km.related("NA12878")           just their relatives, sorted
+
+    ``to_numpy()`` materialises the whole square and refuses above ``max_gb``,
+    because this format exists for matrices that do not fit.
     """
 
     def __init__(self, path):
         self.path = str(path)
         with open(self.path, "rb") as fh:
-            head = fh.read(24)
-        if head[:8] != _KM_MAGIC:
-            raise ValueError(f"{path} is not a king_matrix file "
-                             f"(magic {head[:8]!r} != {_KM_MAGIC!r})")
-        self.n = int(np.frombuffer(head[8:16], dtype=np.int64)[0])
-        self.encoding = list(_KM_ENC)[
-            int(np.frombuffer(head[16:20], dtype=np.int32)[0])]
+            head = fh.read(_KM_HEADER)
+            if head[:8] != _KM_MAGIC:
+                raise ValueError(
+                    f"{path} is not a king_matrix file (magic {head[:8]!r} != "
+                    f"{_KM_MAGIC!r})")
+            self.n = int(np.frombuffer(head[8:16], dtype=np.int64)[0])
+            self.encoding = list(_KM_ENC)[
+                int(np.frombuffer(head[16:20], dtype=np.int32)[0])]
+            self.layout = _KM_LAYOUT[
+                int(np.frombuffer(head[20:24], dtype=np.int32)[0])]
+            id_bytes = int(np.frombuffer(head[24:32], dtype=np.int64)[0])
+            blob = fh.read(id_bytes) if id_bytes else b""
+            self._data_off = _KM_HEADER + id_bytes
+        self.ids = blob.decode().split("\n") if blob else None
+        self._pos = {v: i for i, v in enumerate(self.ids)} if self.ids else None
         self._dt, self._scale = _KM_ENC[self.encoding]
-        self._m = np.memmap(self.path, dtype=self._dt, mode="r", offset=24,
-                            shape=(self.n * (self.n + 1) // 2,))
+        cells = self.n * self.n if self.layout == "square" \
+            else self.n * (self.n + 1) // 2
+        shape = (self.n, self.n) if self.layout == "square" else (cells,)
+        self._m = np.memmap(self.path, dtype=self._dt, mode="r",
+                            offset=self._data_off, shape=shape)
+
+    # -- person -> row index ------------------------------------------------
+    def index_of(self, person):
+        """Row index for a sample ID, or the int itself if already an index."""
+        if isinstance(person, (int, np.integer)):
+            i = int(person)
+            if not 0 <= i < self.n:
+                raise IndexError(f"index {i} outside 0..{self.n - 1}")
+            return i
+        if self._pos is None:
+            raise KeyError(
+                f"{person!r} was given as a sample ID, but this file carries no "
+                f"IDs. Pass sample_ids= to king_matrix, or index by position.")
+        try:
+            return self._pos[str(person)]
+        except KeyError:
+            raise KeyError(
+                f"{person!r} is not in this matrix ({self.n:,} samples)"
+            ) from None
 
     def _deq(self, v):
         return np.asarray(v, dtype=np.float64) / self._scale
 
-    def __getitem__(self, ij):
-        i, j = ij
-        i, j = (int(i), int(j)) if i >= j else (int(j), int(i))
+    def __getitem__(self, key):
+        i, j = key
+        i, j = self.index_of(i), self.index_of(j)
+        if self.layout == "square":
+            return float(self._deq(self._m[i, j]))
+        if i < j:
+            i, j = j, i
         return float(self._deq(self._m[i * (i + 1) // 2 + j]))
 
-    def row(self, i):
-        """Row i as a length-n float64 vector."""
-        i = int(i)
+    def row(self, person):
+        """One person against everyone, as a length-n float64 vector."""
+        i = self.index_of(person)
+        if self.layout == "square":
+            return self._deq(self._m[i])           # one contiguous read
         out = np.empty(self.n, dtype=np.float64)
-        out[:i + 1] = self._deq(self._m[i * (i + 1) // 2: i * (i + 1) // 2 + i + 1])
-        for k in range(i + 1, self.n):          # the upper part lives in row k
-            out[k] = self._deq(self._m[k * (k + 1) // 2 + i])
+        base = i * (i + 1) // 2
+        out[:i + 1] = self._deq(self._m[base:base + i + 1])
+        # The upper part of the row lives one element per LATER row, at
+        # k(k+1)/2 + i. Gathered in one vectorised take rather than a Python
+        # loop over n reads -- the loop version cost a million interpreter round
+        # trips per person at n=1e6, which made the format unusable for the
+        # query it exists to serve.
+        if i + 1 < self.n:
+            k = np.arange(i + 1, self.n, dtype=np.int64)
+            out[i + 1:] = self._deq(self._m[k * (k + 1) // 2 + i])
         return out
+
+    def related(self, person, min_kinship: float = 0.0442, top: int = None):
+        """That person's relatives, kinship descending. Self is excluded.
+
+        The query this format is for. Note the threshold is one-sided on
+        purpose: pairs from different ancestries score NEGATIVE (see
+        :func:`king`), so a cutoff selects relatives and never returns the
+        population-difference tail.
+        """
+        import pandas as pd  # noqa: PLC0415
+
+        i = self.index_of(person)
+        r = self.row(i)
+        r[i] = -np.inf                             # never report self
+        sel = np.nonzero(r >= min_kinship)[0]
+        order = sel[np.argsort(-r[sel], kind="stable")]
+        if top is not None:
+            order = order[:int(top)]
+        return pd.DataFrame({
+            "id": [self.ids[k] for k in order] if self.ids else list(order),
+            "index_": order.astype(np.int64),
+            "kinship": r[order],
+        })
 
     def to_numpy(self, max_gb: float = 8.0):
         need = self.n * self.n * 8 / 1e9
@@ -1020,17 +1139,24 @@ class KingMatrix:
             raise MemoryError(
                 f"the full square is {need:,.1f} GB at n={self.n:,}, over "
                 f"max_gb={max_gb}. That limit exists because this format is for "
-                f"matrices that do not fit -- index with km[i, j] or km.row(i), "
-                f"or raise max_gb deliberately.")
+                f"matrices that do not fit -- use km[i, j], km.row(person) or "
+                f"km.related(person), or raise max_gb deliberately.")
+        if self.layout == "square":
+            return self._deq(np.asarray(self._m))
         M = np.empty((self.n, self.n), dtype=np.float64)
         for i in range(self.n):
-            M[i, :i + 1] = self._deq(
-                self._m[i * (i + 1) // 2: i * (i + 1) // 2 + i + 1])
-        return np.where(np.isnan(M), M.T, np.tril(M) + np.tril(M, -1).T)
+            base = i * (i + 1) // 2
+            M[i, :i + 1] = self._deq(self._m[base:base + i + 1])
+        L = np.tril(M)
+        return L + np.tril(L, -1).T
+
+    def __len__(self):
+        return self.n
 
     def __repr__(self):
-        return (f"KingMatrix(n={self.n:,}, encoding={self.encoding!r}, "
-                f"path={self.path!r})")
+        return (f"KingMatrix(n={self.n:,}, layout={self.layout!r}, "
+                f"encoding={self.encoding!r}, "
+                f"ids={'yes' if self.ids else 'no'}, path={self.path!r})")
 
 
 def open_king_matrix(path):

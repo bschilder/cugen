@@ -13,6 +13,7 @@ frequencies. KING conditions on each PAIR's heterozygosity instead, so two
 unrelated individuals from differentiated subpopulations score ~0 where a GRM
 scores clearly positive.
 """
+import os
 import shutil
 import subprocess
 
@@ -532,3 +533,112 @@ def test_rejects_a_file_that_is_not_a_king_matrix(tmp_path):
     bad.write_bytes(b"NOTKING1" + b"\0" * 32)
     with pytest.raises(ValueError, match="not a king_matrix"):
         open_king_matrix(bad)
+
+
+# --------------------------------------------------------------------------
+# Querying by person: sample IDs, fast rows, and per-person relative lookup
+# --------------------------------------------------------------------------
+def _ids(n):
+    return [f"IND{i:05d}" for i in range(n)]
+
+
+def test_sample_ids_round_trip_and_index_by_id(tmp_path):
+    G, _ = synth(n_unrel=30, p=1200, seed=60)
+    n = G.shape[0]
+    ids = _ids(n)
+    km = open_king_matrix(king_matrix(
+        write_cg(tmp_path, G), tmp_path / "id.bin", encoding="float32",
+        sample_block=16, sample_ids=ids, verbose=False))
+    assert list(km.ids) == ids
+    assert km.index_of("IND00007") == 7
+    # the same cell, addressed three ways
+    assert km["IND00003", "IND00009"] == pytest.approx(km[3, 9], abs=0)
+    assert km["IND00009", "IND00003"] == pytest.approx(km[3, 9], abs=0)
+
+
+def test_row_by_id_matches_row_by_index(tmp_path):
+    G, _ = synth(n_unrel=30, p=1200, seed=61)
+    n = G.shape[0]
+    km = open_king_matrix(king_matrix(
+        write_cg(tmp_path, G), tmp_path / "r.bin", encoding="float32",
+        sample_block=16, sample_ids=_ids(n), verbose=False))
+    np.testing.assert_array_equal(km.row("IND00011"), km.row(11))
+
+
+def test_unknown_id_raises_rather_than_returning_nonsense(tmp_path):
+    G, _ = synth(n_unrel=20, p=800, seed=62)
+    km = open_king_matrix(king_matrix(
+        write_cg(tmp_path, G), tmp_path / "u.bin", encoding="float32",
+        sample_block=16, sample_ids=_ids(G.shape[0]), verbose=False))
+    with pytest.raises(KeyError, match="NOPE"):
+        km.row("NOPE")
+
+
+def test_both_layouts_agree_with_dense_king(tmp_path):
+    """square costs 2x the bytes and buys ~10,000x on row latency; neither may
+    change a value."""
+    G, _ = synth(n_unrel=40, p=2000, seed=63)
+    path = write_cg(tmp_path, G)
+    dense = king(path, verbose=False)
+    for layout in ("triangle", "square"):
+        km = open_king_matrix(king_matrix(
+            path, tmp_path / f"{layout}.bin", encoding="float32",
+            layout=layout, sample_block=16, verbose=False))
+        assert km.layout == layout
+        np.testing.assert_allclose(km.to_numpy(), dense, rtol=0, atol=1e-6)
+        r = 7
+        np.testing.assert_allclose(km.row(r), dense[r], rtol=0, atol=1e-6)
+
+
+def test_square_is_twice_the_triangle_on_disk(tmp_path):
+    G, _ = synth(n_unrel=40, p=1000, seed=64)
+    path = write_cg(tmp_path, G)
+    n = G.shape[0]
+    t = os.path.getsize(king_matrix(path, tmp_path / "t.bin", layout="triangle",
+                                    sample_block=16, verbose=False))
+    s = os.path.getsize(king_matrix(path, tmp_path / "s.bin", layout="square",
+                                    sample_block=16, verbose=False))
+    assert s > t
+    # square is n^2, triangle is n(n+1)/2, so the ratio approaches 2
+    assert 1.8 < (s / t) < 2.2
+
+
+def test_related_returns_that_persons_relatives_sorted(tmp_path):
+    """The query the format exists for: who is related to this person?"""
+    G, lab = synth(n_unrel=60, p=6000, seed=65)
+    n = G.shape[0]
+    ids = _ids(n)
+    km = open_king_matrix(king_matrix(
+        write_cg(tmp_path, G), tmp_path / "rel.bin", encoding="float32",
+        layout="square", sample_block=16, sample_ids=ids, verbose=False))
+    dup = lab.index("dup0")
+    hits = km.related(0, min_kinship=0.0442)
+    assert ids[dup] in set(hits.id), "the duplicate must be found"
+    assert 0 not in set(hits.index_), "self must be excluded"
+    assert hits.kinship.is_monotonic_decreasing
+    assert float(hits.kinship.iloc[0]) == pytest.approx(0.5, abs=1e-6)
+    # and by id, identically
+    np.testing.assert_allclose(km.related(ids[0], min_kinship=0.0442).kinship,
+                               hits.kinship, rtol=0, atol=0)
+
+
+def test_row_gather_is_vectorised_not_a_python_loop(tmp_path):
+    """A triangle row must not cost n Python-level reads.
+
+    The first version looped `for k in range(i+1, n)` doing one memmap read per
+    element, which at n=1e6 is a million round trips through the interpreter for
+    a single person. Timing a small case is a weak signal, so this asserts the
+    shape of the result and that a mid-file row is correct -- the loop version
+    was correct too, just unusable -- and the layout test above covers values.
+    """
+    G, _ = synth(n_unrel=60, p=800, seed=66)
+    path = write_cg(tmp_path, G)
+    n = G.shape[0]
+    dense = king(path, verbose=False)
+    km = open_king_matrix(king_matrix(path, tmp_path / "v.bin",
+                                      encoding="float32", layout="triangle",
+                                      sample_block=16, verbose=False))
+    for r in (0, 1, n // 2, n - 2, n - 1):
+        got = km.row(r)
+        assert got.shape == (n,)
+        np.testing.assert_allclose(got, dense[r], rtol=0, atol=1e-6)

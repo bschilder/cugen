@@ -66,3 +66,43 @@ is n=1,000,000 in 16.6 GB, not throughput at n=2,504.
 End to end on a 4090 at this shape, original CPU implementation to current GPU:
 9.41 s -> 0.048 s, about **196x** (the two CPU timings come from different 4090
 instances, same GPU model and same benchmark).
+
+## The dense matrix on disk, queryable by person
+
+`king_matrix()` writes what `king()` would hold in memory, so n is bounded by
+disk. `open_king_matrix()` memory-maps it and every accessor takes a row index
+**or a sample ID**:
+
+```python
+km = open_king_matrix("cohort.king")
+km["NA12878", "NA12891"]      # one cell
+km.row("NA12878")             # that person against everyone
+km.related("NA12878")         # just their relatives, kinship descending
+```
+
+### Layout is about access, not size
+
+In a lower triangle, row i is one contiguous run of i+1 entries **plus n−i−1
+entries that each live in a different row** — so a per-person query touches up
+to n scattered pages across the whole file.
+
+| layout | n=1,000,000 int16 | row query |
+|---|---|---|
+| `square` (default) | 2.0 TB | ~1 ms (one contiguous 2 MB read) |
+| `triangle` | 1.0 TB | ~10 s (up to 1M scattered page touches) |
+
+Four orders of magnitude on latency for twice the bytes. `square` is the default
+because the reason to materialise a dense matrix at all is random access;
+`triangle` is for archival, where halving 1 TB matters and nobody queries a row.
+
+### Format
+
+```
+magic "CUKING02" (8) | n int64 (8) | encoding int32 (4) | layout int32 (4)
+                     | id_bytes int64 (8) | ids (newline-joined utf8) | data
+```
+
+Sample IDs are stored in the file because `.cugen` does not carry them — they
+live in a `<file>.cugen.samples.txt` sidecar, which `king_matrix` picks up
+automatically when `sample_ids=` is omitted. A count mismatch is refused rather
+than truncated, since mislabelled IDs would silently corrupt every query.
