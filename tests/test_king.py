@@ -457,3 +457,78 @@ def test_king_pairs_auto_block_matches_an_explicit_block(tmp_path):
                        verbose=False).sort_values(["i", "j"]).reset_index(drop=True)
     np.testing.assert_array_equal(auto.i, fixed.i)
     np.testing.assert_allclose(auto.kinship, fixed.kinship, rtol=0, atol=0)
+
+
+# --------------------------------------------------------------------------
+# king_matrix: dense on disk, for when the matrix is the deliverable
+# --------------------------------------------------------------------------
+from cugen.popstruct import king_matrix, open_king_matrix  # noqa: E402
+
+
+def test_king_matrix_float32_is_exact_against_dense_king(tmp_path):
+    G, _ = synth(n_unrel=40, p=2000, seed=50)
+    n = G.shape[0]
+    path = write_cg(tmp_path, G)
+    dense = king(path, verbose=False)
+    km = open_king_matrix(king_matrix(path, tmp_path / "k.bin",
+                                      encoding="float32", sample_block=16,
+                                      verbose=False))
+    assert km.n == n and km.encoding == "float32"
+    got = km.to_numpy()
+    np.testing.assert_allclose(got, dense, rtol=0, atol=1e-6)
+
+
+def test_king_matrix_int16_is_within_its_own_quantum(tmp_path):
+    """3.05e-5 is the promise; anything looser is a bug, not a rounding."""
+    G, _ = synth(n_unrel=40, p=2000, seed=51)
+    path = write_cg(tmp_path, G)
+    dense = king(path, verbose=False)
+    km = open_king_matrix(king_matrix(path, tmp_path / "k16.bin",
+                                      sample_block=16, verbose=False))
+    assert km.encoding == "int16"
+    assert np.abs(km.to_numpy() - dense).max() <= 1.0 / 32767.0
+
+
+def test_king_matrix_is_symmetric_and_half_on_the_diagonal(tmp_path):
+    G, _ = synth(n_unrel=30, p=1200, seed=52)
+    km = open_king_matrix(king_matrix(write_cg(tmp_path, G),
+                                      tmp_path / "s.bin", encoding="float32",
+                                      sample_block=16, verbose=False))
+    M = km.to_numpy()
+    np.testing.assert_allclose(M, M.T, atol=0)
+    np.testing.assert_allclose(np.diag(M), 0.5, atol=1e-6)
+
+
+def test_indexed_access_matches_the_materialised_matrix(tmp_path):
+    """km[i,j] and km.row(i) are the point of the format -- they must agree."""
+    G, _ = synth(n_unrel=30, p=1200, seed=53)
+    n = G.shape[0]
+    km = open_king_matrix(king_matrix(write_cg(tmp_path, G),
+                                      tmp_path / "i.bin", encoding="float32",
+                                      sample_block=16, verbose=False))
+    M = km.to_numpy()
+    rng = np.random.default_rng(0)
+    for _ in range(40):
+        i, j = int(rng.integers(n)), int(rng.integers(n))
+        assert km[i, j] == pytest.approx(M[i, j], abs=1e-6)
+        assert km[i, j] == km[j, i], "must be order-independent"
+    r = int(rng.integers(n))
+    np.testing.assert_allclose(km.row(r), M[r], atol=1e-6)
+
+
+def test_to_numpy_refuses_a_matrix_that_does_not_fit(tmp_path):
+    """The format exists for matrices that do not fit; materialising one
+    silently would defeat the whole point."""
+    G, _ = synth(n_unrel=20, p=800, seed=54)
+    km = open_king_matrix(king_matrix(write_cg(tmp_path, G),
+                                      tmp_path / "b.bin", encoding="float32",
+                                      sample_block=16, verbose=False))
+    with pytest.raises(MemoryError, match="max_gb"):
+        km.to_numpy(max_gb=1e-9)
+
+
+def test_rejects_a_file_that_is_not_a_king_matrix(tmp_path):
+    bad = tmp_path / "nope.bin"
+    bad.write_bytes(b"NOTKING1" + b"\0" * 32)
+    with pytest.raises(ValueError, match="not a king_matrix"):
+        open_king_matrix(bad)

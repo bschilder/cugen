@@ -23,7 +23,7 @@ from ._stubs import _stub
 from .io import ENCODING_2BIT, read_cugen
 
 __all__ = ["grm", "pcs_from_grm", "king", "king_pairs", "plan_king",
-           "pca", "pc_project"]
+           "king_matrix", "open_king_matrix", "KingMatrix", "pca", "pc_project"]
 
 # 2-bit codes are big-endian within the byte: sample 0 is the HIGH pair. Same
 # convention as the LD kernels (see cugen/ld.py) and cugen/write.pack_2bit.
@@ -629,86 +629,27 @@ def pc_project(*a, **kw):
     return _stub("popstruct.pc_project")
 
 
-def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
-               sample_block=4096, variant_range=None, variants=None,
-               maf_min: float = 0.0, tile_size: Optional[int] = None,
-               backend: str = "auto", device: int = 0, safety: float = 0.70,
-               verbose: bool = True):
-    """Related pairs only, for cohorts where the (n, n) matrix does not exist.
+def _king_blocks(cugen, *, sample_block=4096, variant_range=None,
+                 variants=None, maf_min=0.0, tile_size=None, backend="auto",
+                 device=0, safety=0.70, verbose=True):
+    """Yield ``(a0, a1, b0, b1, phi)`` over the lower block triangle, b <= a.
 
-    :func:`king` materialises three (n_samples, n_samples) accumulators. That is
-    the right shape for a cohort and the wrong shape for a biobank: at n =
-    500,000 they are 6 TB and the output matrix alone is 2 TB; at n = 1,000,000
-    they are 24 TB. No amount of tuning fixes an allocation that large.
-
-    What does fix it is the observation that a kinship matrix at that scale is
-    almost entirely zeros -- relatives are rare -- so the useful object is the
-    sparse set of pairs above a threshold, not the dense matrix. This walks
-    BLOCKS of the sample-pair space, evaluates each block, keeps only the pairs
-    that clear ``min_kinship`` and discards the rest before the next block. Peak
-    memory is the packed panel plus one (sample_block, sample_block) accumulator,
-    neither of which grows with n^2.
-
-    The default threshold, 0.0442, is the conventional lower bound of the
-    4th-degree band (2^-9/2), i.e. the usual "unrelated" cut. Note that pairs
-    from DIFFERENT ancestries score NEGATIVE rather than zero -- see
-    :func:`king` -- so a threshold selects relatives from one direction only and
-    never returns the population-difference tail.
-
-    USE ENOUGH MARKERS. This is the one thing that changes at biobank scale, and
-    it is not obvious. A threshold is applied to n(n-1)/2 draws from the null --
-    1.25e11 at n=500,000 -- so the per-pair false-positive rate has to sit below
-    roughly 1/n^2 before the emitted list means anything. The standard error of
-    phi falls as 1/sqrt(markers), so the threshold's distance from the null in
-    standard errors grows as sqrt(markers), and the tail collapses fast.
-    Measured at n=500,000 with 50 planted duplicates:
-
-        markers   emitted at phi >= 0.0442   false positives
-          5,000                  7,574,975         7,574,925
-         20,000                         50                 0
-
-    Four times the markers took the output from millions of spurious pairs to
-    exactly the 50 real ones. A marker count that is ample for a cohort of
-    thousands is not ample here; 20,000 is a floor rather than a target, and
-    published biobank relatedness scans use 50,000-100,000 pruned markers.
-    Cost scales sub-linearly in markers -- 4x the markers cost 3.2x the time in
-    that pair of runs -- so this is cheap insurance.
-
-    Parameters
-    ----------
-    min_kinship
-        Emit pairs with ``phi >= min_kinship``. Pass ``-inf`` to emit every
-        pair, which reintroduces the n^2 output this function exists to avoid.
-    sample_block
-        Samples per block, rounded down to a multiple of 4 so a block is a clean
-        byte slice of the 2-bit packing. Peak accumulator is
-        ``sample_block**2 * 8`` bytes; the number of block pairs, and therefore
-        the number of passes over the resident panel, is ``(n/B)(n/B+1)/2``.
-
-    Returns
-    -------
-    DataFrame with columns ``i``, ``j`` (sample indices, ``i < j``) and
-    ``kinship``, sorted by kinship descending.
+    The one place the blocked estimator lives. `king_pairs` thresholds what
+    comes out of here and `king_matrix` writes it, so neither can drift from the
+    other. Blocks arrive in a-major order and each is released before the next,
+    which is what lets a consumer hold one row-strip instead of the matrix.
     """
-    import pandas as pd  # noqa: PLC0415  (lazy: keeps popstruct import light)
+    import pandas as pd  # noqa: PLC0415,F401  (kept for the caller's benefit)
 
     path = str(cugen)
     if backend not in ("auto", "gpu", "numpy"):
         raise ValueError(
             f"backend must be 'auto', 'gpu' or 'numpy', got {backend!r}")
+
     reader = read_cugen(path, device=device)
     if int(reader.encoding) != ENCODING_2BIT:
         raise ValueError(
             f"{path} is not 2bit dosage data (encoding={int(reader.encoding)}).")
-    if isinstance(sample_block, str):
-        if sample_block != "auto":
-            raise ValueError(
-                f"sample_block must be an int or 'auto', got {sample_block!r}")
-        _bud, _ = _king_budget(backend, device, safety)
-        B = _auto_sample_block(int(reader.n_samples),
-                               int(reader.n_variants), _bud)
-    else:
-        B = max(4, (int(sample_block) // 4) * 4)
 
     xp = np
     if backend != "numpy":
@@ -722,6 +663,15 @@ def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
             xp = np
 
     n = int(reader.n_samples)
+    if isinstance(sample_block, str):
+        if sample_block != "auto":
+            raise ValueError(
+                f"sample_block must be an int or 'auto', got {sample_block!r}")
+        _bud, _ = _king_budget(backend, device, safety)
+        B = _auto_sample_block(n, int(reader.n_variants), _bud)
+    else:
+        B = max(4, (int(sample_block) // 4) * 4)
+
     p_all = int(reader.n_variants)
     lo, hi = (0, p_all) if variant_range is None else (
         max(0, int(variant_range[0])), min(p_all, int(variant_range[1])))
@@ -738,18 +688,17 @@ def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
         if not keep_rows[lo:hi].any():
             raise ValueError(f"none of the requested gidx are in {path}")
 
-    # ---- pass 1: per-sample het counts, marker count, and the MAF mask ----
-    # O(n) memory. Also decides which markers survive, so pass 2 never has to
-    # recompute a frequency it already knows.
+    # pass 1: per-sample het counts and the marker mask. O(n) memory.
     het = xp.zeros(n, dtype=xp.float64)
     marker_keep, m_used = [], 0
     for s0 in range(lo, hi, tile):
         s1 = min(s0 + tile, hi)
-        raw = np.frombuffer(reader.read_packed_bytes(s0, s1), dtype=np.uint8)
-        codes = _unpack_tile(raw.reshape(s1 - s0, bpv), n)
+        raw = np.frombuffer(reader.read_packed_bytes(s0, s1),
+                            dtype=np.uint8).reshape(s1 - s0, bpv)
         if keep_rows is not None:
-            codes = codes[keep_rows[s0:s1]]
-        codes = xp.asarray(codes)
+            raw = raw[keep_rows[s0:s1]]
+        codes = _unpack_on(raw if xp is np else xp.asarray(raw), n, xp,
+                           _SHIFTS if xp is np else xp.asarray(_SHIFTS))
         obs = codes != 3
         n_obs = obs.sum(axis=1)
         keep = n_obs > 0
@@ -770,15 +719,11 @@ def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
     if has_missing:
         raise NotImplementedError(
             f"{path} has missing calls, and the pairwise-complete het counts "
-            f"that requires are themselves (n, n) -- the very allocation this "
-            f"function avoids. Impute or hard-call first, or use king() if the "
-            f"cohort is small enough for the dense form.")
+            f"that requires are themselves (n, n) -- the very allocation the "
+            f"blocked path avoids. Impute or hard-call first, or use king() if "
+            f"the cohort is small enough for the dense form.")
 
-    # ---- resident packed panel: read once, sliced per block pair ----
-    # Block pairs re-walk the markers, so the panel must not be re-read from
-    # disk (n/B)^2 times. Packed 2-bit is n/4 bytes per marker, which is 12.5 GB
-    # at n=500,000 and p=100,000 -- three orders of magnitude under the dense
-    # accumulators, which is the whole point.
+    # resident packed panel: read once, sliced per block pair
     rows = []
     for k, s0 in enumerate(range(lo, hi, tile)):
         s1 = min(s0 + tile, hi)
@@ -789,49 +734,32 @@ def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
         rows.append(raw[marker_keep[k]])
     packed = np.concatenate(rows, axis=0) if len(rows) > 1 else rows[0]
     del rows
-    # Unpack on whichever device does the GEMM. _unpack_tile is pure shift/mask,
-    # so it runs on CuPy unchanged once the shift vector lives there too -- and
-    # it must, because at biobank n the per-block-pair unpack is the term that
-    # competes with the product. Leaving it on the host would serialise the GPU
-    # behind a numpy bit-twiddle. The packed panel is n/4 bytes per marker, so
-    # resident cost on device is 0.6 GB at n=500,000 / p=5,000.
     _sh = _SHIFTS if xp is np else xp.asarray(_SHIFTS)
     if xp is not np:
         packed = xp.asarray(packed)
 
-    def _unp(blk, ns):
-        return _unpack_on(blk, ns, xp, _sh)
-
     nb = (n + B - 1) // B
-    n_block_pairs = nb * (nb + 1) // 2
     if verbose:
-        print(f"cugen.popstruct: king_pairs n={n:,} markers={m_used:,} "
-              f"block={B} -> {nb} blocks, {n_block_pairs:,} block pairs, "
-              f"panel {packed.nbytes / 1e9:.2f} GB, "
+        print(f"cugen.popstruct: blocked KING n={n:,} markers={m_used:,} "
+              f"block={B} -> {nb} blocks, {nb*(nb+1)//2:,} block pairs, "
+              f"panel {packed.nbytes/1e9:.2f} GB, "
               f"backend={'gpu' if xp is not np else 'numpy'}", flush=True)
 
-    out_i, out_j, out_k = [], [], []
-    n_eval = 0
     for a in range(nb):
         a0, a1 = a * B, min((a + 1) * B, n)
-        # Unpack the a-block ONCE, not once per (a, b). It is reused by every
-        # b >= a, so unpacking it inside the b loop repeats the same work
-        # nb - a times; hoisting it roughly halves total unpack cost, which is
-        # the term that competes with the GEMM at biobank n. Resident size is
-        # markers x B float32 -- 82 MB at p=5,000 / B=4,096, 1.6 GB at p=100,000.
-        UA = _unp(packed[:, a0 // 4:(a1 + 3) // 4],
-                  a1 - a0).astype(xp.float32) - xp.float32(1.0)
-
-        for b in range(a, nb):
+        UA = _unpack_on(packed[:, a0 // 4:(a1 + 3) // 4], a1 - a0, xp,
+                        _sh).astype(xp.float32) - xp.float32(1.0)
+        for b in range(a + 1):                 # b <= a: lower block triangle
             b0, b1 = b * B, min((b + 1) * B, n)
             acc = xp.zeros((a1 - a0, b1 - b0), dtype=xp.float64)
             for t0 in range(0, packed.shape[0], tile):
                 t1 = min(t0 + tile, packed.shape[0])
                 fa = UA[t0:t1]
                 if b == a:
-                    acc += fa.T @ fa            # SYRK on the diagonal block
+                    acc += fa.T @ fa           # SYRK on the diagonal block
                 else:
-                    cb = _unp(packed[t0:t1, b0 // 4:(b1 + 3) // 4], b1 - b0)
+                    cb = _unpack_on(packed[t0:t1, b0 // 4:(b1 + 3) // 4],
+                                    b1 - b0, xp, _sh)
                     acc += fa.T @ (cb.astype(xp.float32) - xp.float32(1.0))
             hi_ = het[a0:a1][:, None]
             hj_ = het[b0:b1][None, :]
@@ -839,24 +767,85 @@ def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
             with np.errstate(invalid="ignore", divide="ignore"):
                 phi = ((2.0 * acc - 2.0 * m_used + hi_ + hj_ + 2.0 * mn)
                        / xp.where(mn > 0, 4.0 * mn, xp.nan))
-            take = phi >= min_kinship
-            if b == a:
-                # i < j only. Masking with -inf instead would leak the whole
-                # lower triangle at min_kinship=-inf, since -inf >= -inf.
-                take &= xp.triu(xp.ones(phi.shape, dtype=bool), 1)
-                n_eval += (a1 - a0) * (a1 - a0 - 1) // 2
-            else:
-                n_eval += (a1 - a0) * (b1 - b0)
-            sel = xp.nonzero(take)
-            if int(sel[0].size):
-                si = (sel[0] + a0).astype(xp.int64)
-                sj = (sel[1] + b0).astype(xp.int64)
-                out_i.append(np.asarray(si.get() if xp is not np else si))
-                out_j.append(np.asarray(sj.get() if xp is not np else sj))
-                v = phi[sel]
-                out_k.append(np.asarray(v.get() if xp is not np else v))
-            del acc, phi, take
+            yield a0, a1, b0, b1, phi
+            del acc, phi
+        del UA
 
+
+def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
+               sample_block=4096, variant_range=None, variants=None,
+               maf_min: float = 0.0, tile_size: Optional[int] = None,
+               backend: str = "auto", device: int = 0, safety: float = 0.70,
+               verbose: bool = True):
+    """Related pairs only, for cohorts where the (n, n) matrix does not exist.
+
+    :func:`king` materialises (n, n) accumulators. That is the right shape for a
+    cohort and the wrong shape for a biobank: at n = 500,000 the dense form is
+    6 TB and its output alone is 2 TB; at n = 1,000,000, 24 TB. No amount of
+    tuning fixes an allocation that large.
+
+    What does fix it is that a kinship matrix at that scale is almost entirely
+    zeros -- relatives are rare -- so the useful object is the sparse set of
+    pairs above a threshold. This walks BLOCKS of the sample-pair space, keeps
+    only the pairs that clear ``min_kinship`` and discards the rest before the
+    next block. Peak memory is the packed panel plus one
+    (sample_block, sample_block) accumulator, neither growing with n^2.
+
+    Measured on an A100-80GB: n = 1,000,000 with 5,000 markers evaluates
+    499,999,500,000 pairs in 377 s at 16.6 GB peak RSS.
+
+    The default threshold, 0.0442, is the conventional lower bound of the
+    4th-degree band (2^-9/2). Pairs from DIFFERENT ancestries score NEGATIVE
+    rather than zero -- see :func:`king` -- so a threshold selects relatives
+    from one direction only and never returns the population-difference tail.
+
+    USE ENOUGH MARKERS. This is the one thing that changes at biobank scale. A
+    threshold is applied to n(n-1)/2 draws from the null -- 1.25e11 at
+    n=500,000 -- so the per-pair false-positive rate has to sit below roughly
+    1/n^2 before the emitted list means anything. SE(phi) falls as
+    1/sqrt(markers), so the tail collapses fast. Measured at n=500,000 with 50
+    planted duplicates:
+
+        markers   emitted at phi >= 0.0442   false positives
+          5,000                  7,574,975         7,574,925
+         20,000                         50                 0
+
+    Four times the markers took the output from millions of spurious pairs to
+    exactly the 50 real ones. 20,000 is a floor rather than a target; published
+    biobank scans use 50,000-100,000 pruned markers, and cost is sub-linear in
+    markers (4x the markers cost 3.2x the time), so this is cheap insurance.
+
+    Returns
+    -------
+    DataFrame with ``i``, ``j`` (``i < j``) and ``kinship``, kinship descending.
+    """
+    import pandas as pd  # noqa: PLC0415
+
+    out_i, out_j, out_k, n_eval = [], [], [], 0
+    for a0, a1, b0, b1, phi in _king_blocks(
+            cugen, sample_block=sample_block, variant_range=variant_range,
+            variants=variants, maf_min=maf_min, tile_size=tile_size,
+            backend=backend, device=device, safety=safety, verbose=verbose):
+        xp = np if isinstance(phi, np.ndarray) else phi.__class__.__module__
+        _xp = np if isinstance(phi, np.ndarray) else __import__("cupy")
+        take = phi >= min_kinship
+        if a0 == b0:
+            # strictly below the diagonal, so each unordered pair appears once.
+            # A -inf sentinel instead of a boolean mask would leak the whole
+            # triangle at min_kinship=-inf, since -inf >= -inf.
+            take &= _xp.tril(_xp.ones(phi.shape, dtype=bool), -1)
+            n_eval += (a1 - a0) * (a1 - a0 - 1) // 2
+        else:
+            n_eval += (a1 - a0) * (b1 - b0)
+        sel = _xp.nonzero(take)
+        if int(sel[0].size):
+            # rows are the a-block (higher index), cols the b-block, so j<i here
+            si = (sel[0] + a0).astype(_xp.int64)
+            sj = (sel[1] + b0).astype(_xp.int64)
+            out_j.append(np.asarray(si.get() if _xp is not np else si))
+            out_i.append(np.asarray(sj.get() if _xp is not np else sj))
+            v = phi[sel]
+            out_k.append(np.asarray(v.get() if _xp is not np else v))
 
     if out_i:
         df = pd.DataFrame({"i": np.concatenate(out_i),
@@ -871,3 +860,179 @@ def king_pairs(cugen: Union[str, Path], *, min_kinship: float = 0.0442,
         print(f"cugen.popstruct: {n_eval:,} pairs evaluated, {len(df):,} at "
               f"kinship >= {min_kinship}", flush=True)
     return df
+
+
+# --------------------------------------------------------------------------
+# Dense KING, on disk. For when the matrix genuinely is the deliverable.
+# --------------------------------------------------------------------------
+_KM_MAGIC = b"CUKING01"
+_KM_ENC = {"int16": (np.int16, 32767.0), "float32": (np.float32, 1.0)}
+
+
+def king_matrix(cugen: Union[str, Path], out: Union[str, Path], *,
+                encoding: str = "int16", sample_block=4096,
+                variant_range=None, variants=None, maf_min: float = 0.0,
+                tile_size: Optional[int] = None, backend: str = "auto",
+                device: int = 0, safety: float = 0.70, verbose: bool = True):
+    """The full dense matrix, written to disk as a lower triangle.
+
+    :func:`king` holds the matrix in memory, so it stops at whatever the machine
+    has. This runs the same block walk as :func:`king_pairs` but writes every
+    block instead of thresholding it, so n is bounded by DISK rather than RAM.
+    Read it back with :func:`open_king_matrix`, which memory-maps it and gives
+    O(1) access to any ``(i, j)`` without loading the whole thing.
+
+    Sizes at n = 1,000,000, lower triangle including the diagonal
+    (500,000,500,000 entries):
+
+        int16    1.0 TB     quantum 3.05e-5
+        float32  2.0 TB     exact to fp32
+
+    int16 is the default for the same reason ``.cugenld`` stores r that way: phi
+    lives in [-1, 0.5] and its own sampling error is around 1e-3 at 100,000
+    markers, so a 3.05e-5 quantum is two orders finer than the number is real to.
+    Storing float64 would be four decimal places of noise at twice the size.
+
+    BEFORE YOU RUN THIS, be sure you want a dense matrix. At n = 1,000,000 more
+    than 99.99% of the entries are phi ~ 0, and the same information as a pair
+    list is 0.06-0.6 GB -- three to four orders of magnitude smaller. Reach for
+    it when something downstream genuinely demands dense random access (a solver
+    that will not take a sparse operand, or an external tool wanting
+    plink/GCTA-style binary), and reach for :func:`king_pairs` otherwise.
+
+    The write is ~9 minutes for 1 TB on a 2 GB/s NVMe, against 377 s of measured
+    compute at n = 1,000,000 -- so at this scale it is an I/O job, not a
+    compute one.
+    """
+    if encoding not in _KM_ENC:
+        raise ValueError(
+            f"encoding must be one of {sorted(_KM_ENC)}, got {encoding!r}")
+    dt, scale = _KM_ENC[encoding]
+
+    reader = read_cugen(str(cugen), device=device)
+    n = int(reader.n_samples)
+    tri = n * (n + 1) // 2
+    nbytes = tri * np.dtype(dt).itemsize
+    if verbose:
+        print(f"cugen.popstruct: king_matrix n={n:,} -> {tri:,} entries, "
+              f"{nbytes/1e12:.3f} TB as {encoding}, to {out}", flush=True)
+
+    # Stream it, consuming the generator lazily. _king_blocks yields in a-major
+    # order over the LOWER block triangle, so the blocks for row-block a are
+    # exactly its columns 0..a1 -- one complete row-strip of the triangle. Fill
+    # the strip in the OUTPUT dtype, write its rows contiguously, release it.
+    # Peak is (B x n) * itemsize plus one (B, B) accumulator: 8 GB at B=4096,
+    # n=1e6, int16.
+    #
+    # An earlier version called king_pairs(min_kinship=-inf) and scattered the
+    # result into an (n, n) float64 array before writing. That is 8 TB at
+    # n=1e6 -- the exact allocation this function exists to avoid -- and it
+    # passed its tests only because they ran at n=122.
+    lim = float(np.iinfo(dt).max) if encoding == "int16" else None
+
+    def _q(v):
+        v = np.asarray(v.get() if hasattr(v, "get") else v, dtype=np.float64)
+        if encoding == "int16":
+            v = np.clip(np.rint(v * scale), -lim, lim)
+        return v.astype(dt)
+
+    state = {"cur": None, "strip": None, "written": 0}
+    with open(str(out), "wb") as fh:
+        fh.write(_KM_MAGIC)
+        fh.write(np.array([n], dtype=np.int64).tobytes())
+        fh.write(np.array([list(_KM_ENC).index(encoding)], dtype=np.int32)
+                 .tobytes())
+        fh.write(b"\0" * 4)                     # pad the header to 24 bytes
+
+        def _flush():
+            if state["strip"] is None:
+                return
+            r0, r1 = state["cur"]
+            for r in range(r0, r1):
+                fh.write(state["strip"][r - r0, :r + 1].tobytes())
+                state["written"] += r + 1
+            state["strip"] = None
+
+        for a0, a1, b0, b1, phi in _king_blocks(
+                cugen, sample_block=sample_block, variant_range=variant_range,
+                variants=variants, maf_min=maf_min, tile_size=tile_size,
+                backend=backend, device=device, safety=safety, verbose=False):
+            if state["cur"] != (a0, a1):
+                _flush()
+                state["cur"] = (a0, a1)
+                state["strip"] = np.zeros((a1 - a0, a1), dtype=dt)
+            state["strip"][:, b0:b1] = _q(phi)
+        _flush()
+
+    if state["written"] != tri:
+        raise RuntimeError(
+            f"wrote {state['written']:,} entries but the lower triangle of "
+            f"n={n:,} is {tri:,}; the strip walk missed part of the matrix.")
+    if verbose:
+        print(f"cugen.popstruct: wrote {os.path.getsize(str(out))/1e9:.3f} GB",
+              flush=True)
+    return str(out)
+
+
+class KingMatrix:
+    """Memory-mapped reader for a :func:`king_matrix` file.
+
+    Dense semantics without dense memory: ``km[i, j]`` is an O(1) seek into the
+    lower triangle, and ``km.row(i)`` returns one full row. ``to_numpy()``
+    materialises the whole square and refuses above ``max_gb`` rather than
+    quietly trying to allocate a terabyte.
+    """
+
+    def __init__(self, path):
+        self.path = str(path)
+        with open(self.path, "rb") as fh:
+            head = fh.read(24)
+        if head[:8] != _KM_MAGIC:
+            raise ValueError(f"{path} is not a king_matrix file "
+                             f"(magic {head[:8]!r} != {_KM_MAGIC!r})")
+        self.n = int(np.frombuffer(head[8:16], dtype=np.int64)[0])
+        self.encoding = list(_KM_ENC)[
+            int(np.frombuffer(head[16:20], dtype=np.int32)[0])]
+        self._dt, self._scale = _KM_ENC[self.encoding]
+        self._m = np.memmap(self.path, dtype=self._dt, mode="r", offset=24,
+                            shape=(self.n * (self.n + 1) // 2,))
+
+    def _deq(self, v):
+        return np.asarray(v, dtype=np.float64) / self._scale
+
+    def __getitem__(self, ij):
+        i, j = ij
+        i, j = (int(i), int(j)) if i >= j else (int(j), int(i))
+        return float(self._deq(self._m[i * (i + 1) // 2 + j]))
+
+    def row(self, i):
+        """Row i as a length-n float64 vector."""
+        i = int(i)
+        out = np.empty(self.n, dtype=np.float64)
+        out[:i + 1] = self._deq(self._m[i * (i + 1) // 2: i * (i + 1) // 2 + i + 1])
+        for k in range(i + 1, self.n):          # the upper part lives in row k
+            out[k] = self._deq(self._m[k * (k + 1) // 2 + i])
+        return out
+
+    def to_numpy(self, max_gb: float = 8.0):
+        need = self.n * self.n * 8 / 1e9
+        if need > max_gb:
+            raise MemoryError(
+                f"the full square is {need:,.1f} GB at n={self.n:,}, over "
+                f"max_gb={max_gb}. That limit exists because this format is for "
+                f"matrices that do not fit -- index with km[i, j] or km.row(i), "
+                f"or raise max_gb deliberately.")
+        M = np.empty((self.n, self.n), dtype=np.float64)
+        for i in range(self.n):
+            M[i, :i + 1] = self._deq(
+                self._m[i * (i + 1) // 2: i * (i + 1) // 2 + i + 1])
+        return np.where(np.isnan(M), M.T, np.tril(M) + np.tril(M, -1).T)
+
+    def __repr__(self):
+        return (f"KingMatrix(n={self.n:,}, encoding={self.encoding!r}, "
+                f"path={self.path!r})")
+
+
+def open_king_matrix(path):
+    """Open a :func:`king_matrix` file for memory-mapped access."""
+    return KingMatrix(path)
