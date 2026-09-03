@@ -40,3 +40,29 @@ python benchmarks/king/scale.py 500000 5000  --block 8192 --backend gpu
 python benchmarks/king/scale.py 1000000 5000 --block 8192 --backend gpu
 python benchmarks/king/scale.py 500000 20000 --block 8192 --backend gpu
 ```
+
+## GPU vs CPU, on the shipped one-GEMM code
+
+RTX 4090, n=2,504, p=100,000, min of 3 reps, both backends asserted bit-identical:
+
+| | CPU | GPU | speedup |
+|---|---|---|---|
+| `king()` dense | 3.812 s (26,231 markers/s) | **0.048 s** (2,096,974 markers/s) | **79.9x** |
+| `king_pairs()` at phi >= 0.0442 | 8.496 s | 0.877 s | 9.7x |
+
+An earlier 11.7x figure for `king()` was measured on the two-product version and
+should not be quoted: it predates both the algebraic change and the device-side
+unpack. Re-measuring is what exposed the second one. Cancelling a matrix product
+moved the GPU wall-clock from 0.81 s to 0.868 s -- i.e. not at all -- while the
+CPU side improved 2.4x, because `king()` was still unpacking 2-bit codes on the
+host and was never GEMM-bound on GPU. Fixing that took it to 0.048 s.
+
+**`king_pairs` is not the fast path, it is the possible path.** Its 9.7x reflects
+a deliberate trade: bounding memory at (B, B) means each block pair re-walks the
+markers, so at small n that redundancy is pure overhead. Use `king()` while the
+(n, n) matrix fits and `king_pairs` when it does not -- the point of the latter
+is n=1,000,000 in 16.6 GB, not throughput at n=2,504.
+
+End to end on a 4090 at this shape, original CPU implementation to current GPU:
+9.41 s -> 0.048 s, about **196x** (the two CPU timings come from different 4090
+instances, same GPU model and same benchmark).
