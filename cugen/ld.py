@@ -2258,6 +2258,41 @@ def _build_dosage(packed2d, rows, n_samples, bytes_per_variant):
     return G, G2, M
 
 
+_LD_R_MOMENTS_KERNEL = None
+
+
+def _r_from_moments_gpu(n, sA, sB, qA, qB, S):
+    """Evaluate the moment epilogue in double, retaining float32 output.
+
+    The scan's sample bound keeps the nonnegative integer raw moments exact
+    in float32, but their products and cancellation need more precision.
+    Match the fused epilogue without allocating six double-precision tiles.
+    """
+    global _LD_R_MOMENTS_KERNEL
+    if _LD_R_MOMENTS_KERNEL is None:
+        _LD_R_MOMENTS_KERNEL = cp.ElementwiseKernel(
+            "float32 n, float32 sa, float32 sb, float32 qa, float32 qb, float32 s",
+            "float32 r",
+            """
+            const double nn = (double)n;
+            const double a = (double)sa, b = (double)sb;
+            const double va = nn * (double)qa - a * a;
+            const double vb = nn * (double)qb - b * b;
+            if (nn > 0.0 && va > 0.0 && vb > 0.0) {
+                double value = (nn * (double)s - a * b)
+                               / (sqrt(va) * sqrt(vb));
+                if (value > 1.0) value = 1.0;
+                if (value < -1.0) value = -1.0;
+                r = (float)value;
+            } else {
+                r = nanf("");
+            }
+            """,
+            "cugen_ld_r_from_moments",
+        )
+    return _LD_R_MOMENTS_KERNEL(n, sA, sB, qA, qB, S)
+
+
 def _r_block(pl_a, pl_b, n_samples, has_missing):
     """Pairwise-complete r for one tile, without materialising the 3x3 table.
 
@@ -2281,16 +2316,10 @@ def _r_block(pl_a, pl_b, n_samples, has_missing):
         sB = cp.broadcast_to(Gb.sum(axis=1)[None, :], S.shape)
         qA = cp.broadcast_to(G2a.sum(axis=1)[:, None], S.shape)
         qB = cp.broadcast_to(G2b.sum(axis=1)[None, :], S.shape)
-    vA = n * qA - sA * sA
-    vB = n * qB - sB * sB
-    ok = (vA > 0) & (vB > 0)
-    if has_missing:
-        ok &= n > 0
-    den = cp.sqrt(cp.where(ok, vA, 1.0)) * cp.sqrt(cp.where(ok, vB, 1.0))
-    r = cp.where(ok, (n * S - sA * sB) / den, cp.nan)
+    r = _r_from_moments_gpu(n, sA, sB, qA, qB, S)
     # With no missingness every pair sees every sample, so return the scalar
     # rather than materialising a B x B array of a constant.
-    return cp.clip(r, -1.0, 1.0), (n if has_missing else float(ns))
+    return r, (n if has_missing else float(ns))
 
 
 def _build_planes(packed2d, rows, n_samples, bytes_per_variant):
@@ -2356,11 +2385,7 @@ def _r_from_counts_gpu(c):
     qA = c[1].sum(axis=0) + 4.0 * c[2].sum(axis=0)
     qB = c[:, 1].sum(axis=0) + 4.0 * c[:, 2].sum(axis=0)
     S = c[1, 1] + 2.0 * c[1, 2] + 2.0 * c[2, 1] + 4.0 * c[2, 2]
-    vA, vB = n * qA - sA * sA, n * qB - sB * sB
-    ok = (n > 0) & (vA > 0) & (vB > 0)
-    den = cp.sqrt(cp.where(ok, vA, 1.0)) * cp.sqrt(cp.where(ok, vB, 1.0))
-    r = cp.where(ok, (n * S - sA * sB) / den, cp.nan)
-    return cp.clip(r, -1.0, 1.0), n
+    return _r_from_moments_gpu(n, sA, sB, qA, qB, S), n
 
 
 def _tile_size_for(n_samples: int, budget_frac: float = 0.35,
