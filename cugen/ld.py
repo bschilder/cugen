@@ -2976,232 +2976,235 @@ def ld_matrix(
             "path (correct but not fast).")
 
     reader = read_cugen(path, device=device)
-    want_phased = [s for s in stats if s in _PHASED_STATS]
-    want_dosage = [s for s in stats if s not in _PHASED_STATS]
-    enc = int(reader.encoding)
-    if enc == ENCODING_HAP2BIT:
-        if want_dosage:
+    try:
+        want_phased = [s for s in stats if s in _PHASED_STATS]
+        want_dosage = [s for s in stats if s not in _PHASED_STATS]
+        enc = int(reader.encoding)
+        if enc == ENCODING_HAP2BIT:
+            if want_dosage:
+                raise ValueError(
+                    f"{path} is phased (hap2bit); {want_dosage} are dosage "
+                    f"statistics. hap2bit and 2bit share bytes but not meaning, so "
+                    f"serving them here would return plausible wrong numbers. Ask "
+                    f"for {sorted(_PHASED_STATS)} instead.")
+        elif enc != ENCODING_2BIT:
+            raise NotImplementedError(
+                f"cugen.ld requires 2-bit encoding (encoding={ENCODING_2BIT}); this "
+                f"file has encoding={enc}. Re-convert with cg.convert.")
+        elif want_phased:
             raise ValueError(
-                f"{path} is phased (hap2bit); {want_dosage} are dosage "
-                f"statistics. hap2bit and 2bit share bytes but not meaning, so "
-                f"serving them here would return plausible wrong numbers. Ask "
-                f"for {sorted(_PHASED_STATS)} instead.")
-    elif enc != ENCODING_2BIT:
-        raise NotImplementedError(
-            f"cugen.ld requires 2-bit encoding (encoding={ENCODING_2BIT}); this "
-            f"file has encoding={enc}. Re-convert with cg.convert.")
-    elif want_phased:
-        raise ValueError(
-            f"{want_phased} need TRUE phase, which a 2bit file does not carry. "
-            f"Convert a phased VCF with cg.convert.vcf2cugenh().")
+                f"{want_phased} need TRUE phase, which a 2bit file does not carry. "
+                f"Convert a phased VCF with cg.convert.vcf2cugenh().")
 
-    p_all = int(reader.n_variants)
-    gidx_all = np.asarray(reader.gidx, dtype=np.int64)
-    maf_all = np.asarray(reader.maf, dtype=np.float32)
+        p_all = int(reader.n_variants)
+        gidx_all = np.asarray(reader.gidx, dtype=np.int64)
+        maf_all = np.asarray(reader.maf, dtype=np.float32)
 
-    # ---- row selection ---------------------------------------------------
-    rows = np.arange(p_all, dtype=np.int64)
-    if variant_range is not None:
-        s, e = variant_range
-        rows = rows[max(0, int(s)):min(p_all, int(e))]
-    if variants is not None:
-        want = set(_resolve_gidx(variants).tolist())
-        rows = rows[np.isin(gidx_all[rows], list(want))]
-    if region is not None:
-        chrom, start, end = _parse_region(region)
-        sub = ann[ann["CHR"].astype(str) == str(chrom)]
-        if start is not None:
-            sub = sub[(sub["POS"] >= start) & (sub["POS"] <= end)]
-        rows = rows[np.isin(gidx_all[rows], np.asarray(sub["gidx"], dtype=np.int64))]
-    if maf_min > 0:
-        rows = rows[maf_all[rows] >= maf_min]
-    if rows.size == 0:
-        return _empty_pairs(stats)
-
-    positions = None
-    if ann is not None:
-        pos_map = dict(zip(np.asarray(ann["gidx"], dtype=np.int64),
-                           np.asarray(ann["POS"], dtype=np.int64)))
-        positions = np.array([pos_map.get(int(g), 0) for g in gidx_all[rows]],
-                             dtype=np.int64)
-
-    n_pairs = _count_pairs(len(rows), positions, window, window_kb)
-    if n_pairs > max_pairs and not count_only:
-        raise ValueError(
-            f"plan would emit {n_pairs:,} pairs, above max_pairs={max_pairs:,}. "
-            f"Narrow it with window= or window_kb=, raise min_r2, or raise "
-            f"max_pairs if you really want this.")
-    if n_pairs == 0:
-        return _empty_pairs(stats)
-
-    # ---- counts ----------------------------------------------------------
-    # D and D' need the 3x3 table; r-family statistics do not, and skipping it
-    # avoids ~9x the memory traffic per tile.
-    need_table = bool({"d", "dp"} & set(stats))
-
-    use_tf32 = _resolve_precision(precision, int(reader.n_samples), verbose)
-
-    # cuDF fast path: r-family stats only, and only when we are writing a file.
-    # The survivors are already in device memory, so keeping them there and
-    # letting cudf wrap them avoids a host round trip we would immediately undo.
-    # The cuDF/output preconditions exist to avoid a host round trip when
-    # SERIALISING. count_only serialises nothing, so they do not apply.
-    on_device = (use_gpu and not need_table and annotation is None
-                 and (count_only or (HAS_CUDF and output is not None)))
-    # The fused single-kernel scan handles the clean r-only case: no
-    # missingness, no bp window, no D/D'. That is the hot path, and it is
-    # where the device was sitting at 1-4% SM utilisation.
-    # A hap2bit file cannot encode missingness at all, so the no-missing
-    # precondition is structural there rather than a property of this file.
-    fused_ok_phased = (not want_phased
-                       or set(want_phased) <= {"r_phased", "r2_phased"})
-    fused = (on_device and not reader.has_missing and window_kb is None
-             and min_obs <= reader.n_samples and fused_ok_phased)
-
-    if stream and output is None:
-        raise ValueError(
-            "stream=True writes the result incrementally and returns a row "
-            "count, so it needs output=. Streaming to nowhere is a no-op.")
-    if stream and not (use_gpu and fused):
-        raise ValueError(
-            "stream=True needs the fused GPU scan; it is the only path whose "
-            "output is produced tile by tile.")
-    if count_only and not (use_gpu and fused):
-        raise ValueError(
-            "count_only needs the fused GPU scan, which is the only path with "
-            "a survivor counter. It is unavailable here because "
-            f"{'D/D-prime were requested' if need_table else ''}"
-            f"{'the file has missing calls' if reader.has_missing else ''}"
-            f"{'window_kb was set' if window_kb is not None else ''}"
-            f"{'no GPU is available' if not use_gpu else ''}"
-            f"{'an annotation was passed' if annotation is not None else ''}"
-            ". Returning a DataFrame instead of a count would be worse: the "
-            "caller would treat a frame as a number.")
-
-    if use_gpu and fused:
-        cp.cuda.Device(device).use()
-        if count_only:
-            return _scan_gpu_fused(reader, rows, window, min_r2,
-                                   tile_size=tile_size, verbose=verbose,
-                                   tf32=use_tf32, phased=bool(want_phased),
-                                   count_only=True)
-        if stream:
-            n_obs_s = (2 * int(reader.n_samples) if want_phased
-                       else int(reader.n_samples))
-            writer = _ChunkWriter(str(output))
-
-            def _flush(ii_d, jj_d, rr_d):
-                g = _assemble_device(
-                    cp.stack([ii_d, jj_d], axis=1),
-                    (rr_d, cp.full(ii_d.size, float(n_obs_s),
-                                   dtype=cp.float32)),
-                    reader, rows, stats, sign_reference, path, False,
-                    n_planned=n_pairs)
-                writer.write(g)
-
-            try:
-                total = _scan_gpu_fused(
-                    reader, rows, window, min_r2, tile_size=tile_size,
-                    verbose=verbose, tf32=use_tf32,
-                    phased=bool(want_phased), on_flush=_flush,
-                    flush_rows=flush_rows)
-            finally:
-                writer.close()
-            if verbose:
-                print(f"cugen.ld: streamed {total:,} rows to {output}")
-            return int(total)
-        ii, jj, rr = _scan_gpu_fused(reader, rows, window, min_r2,
-                                     tile_size=tile_size, verbose=verbose,
-                                     tf32=use_tf32, phased=bool(want_phased))
-        if ii.size == 0:
+        # ---- row selection ---------------------------------------------------
+        rows = np.arange(p_all, dtype=np.int64)
+        if variant_range is not None:
+            s, e = variant_range
+            rows = rows[max(0, int(s)):min(p_all, int(e))]
+        if variants is not None:
+            want = set(_resolve_gidx(variants).tolist())
+            rows = rows[np.isin(gidx_all[rows], list(want))]
+        if region is not None:
+            chrom, start, end = _parse_region(region)
+            sub = ann[ann["CHR"].astype(str) == str(chrom)]
+            if start is not None:
+                sub = sub[(sub["POS"] >= start) & (sub["POS"] <= end)]
+            rows = rows[np.isin(gidx_all[rows], np.asarray(sub["gidx"], dtype=np.int64))]
+        if maf_min > 0:
+            rows = rows[maf_all[rows] >= maf_min]
+        if rows.size == 0:
             return _empty_pairs(stats)
-        pairs_local = cp.stack([ii, jj], axis=1)
-        n_obs = (2 * int(reader.n_samples) if want_phased
-                 else int(reader.n_samples))
-        n_dev = cp.full(ii.size, float(n_obs), dtype=cp.float32)
-        df = _assemble_device(pairs_local, (rr, n_dev), reader, rows, stats,
-                              sign_reference, path, verbose, n_planned=n_pairs)
-        _write_df(df, str(output))
-        if verbose:
-            print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs "
-                  f"planned, {len(df):,} emitted  (gpu, fused kernel)")
-        return df
 
-    if use_gpu:
-        cp.cuda.Device(device).use()
-        pairs_local, payload = _scan_gpu(
-            reader, rows, window, window_kb, positions, min_r2, min_obs,
-            tile_size=tile_size, verbose=verbose, need_table=need_table,
-            keep_device=on_device)
-        if len(pairs_local) == 0:
+        positions = None
+        if ann is not None:
+            pos_map = dict(zip(np.asarray(ann["gidx"], dtype=np.int64),
+                               np.asarray(ann["POS"], dtype=np.int64)))
+            positions = np.array([pos_map.get(int(g), 0) for g in gidx_all[rows]],
+                                 dtype=np.int64)
+
+        n_pairs = _count_pairs(len(rows), positions, window, window_kb)
+        if n_pairs > max_pairs and not count_only:
+            raise ValueError(
+                f"plan would emit {n_pairs:,} pairs, above max_pairs={max_pairs:,}. "
+                f"Narrow it with window= or window_kb=, raise min_r2, or raise "
+                f"max_pairs if you really want this.")
+        if n_pairs == 0:
             return _empty_pairs(stats)
-        if on_device:
-            df = _assemble_device(pairs_local, payload, reader, rows, stats,
+
+        # ---- counts ----------------------------------------------------------
+        # D and D' need the 3x3 table; r-family statistics do not, and skipping it
+        # avoids ~9x the memory traffic per tile.
+        need_table = bool({"d", "dp"} & set(stats))
+
+        use_tf32 = _resolve_precision(precision, int(reader.n_samples), verbose)
+
+        # cuDF fast path: r-family stats only, and only when we are writing a file.
+        # The survivors are already in device memory, so keeping them there and
+        # letting cudf wrap them avoids a host round trip we would immediately undo.
+        # The cuDF/output preconditions exist to avoid a host round trip when
+        # SERIALISING. count_only serialises nothing, so they do not apply.
+        on_device = (use_gpu and not need_table and annotation is None
+                     and (count_only or (HAS_CUDF and output is not None)))
+        # The fused single-kernel scan handles the clean r-only case: no
+        # missingness, no bp window, no D/D'. That is the hot path, and it is
+        # where the device was sitting at 1-4% SM utilisation.
+        # A hap2bit file cannot encode missingness at all, so the no-missing
+        # precondition is structural there rather than a property of this file.
+        fused_ok_phased = (not want_phased
+                           or set(want_phased) <= {"r_phased", "r2_phased"})
+        fused = (on_device and not reader.has_missing and window_kb is None
+                 and min_obs <= reader.n_samples and fused_ok_phased)
+
+        if stream and output is None:
+            raise ValueError(
+                "stream=True writes the result incrementally and returns a row "
+                "count, so it needs output=. Streaming to nowhere is a no-op.")
+        if stream and not (use_gpu and fused):
+            raise ValueError(
+                "stream=True needs the fused GPU scan; it is the only path whose "
+                "output is produced tile by tile.")
+        if count_only and not (use_gpu and fused):
+            raise ValueError(
+                "count_only needs the fused GPU scan, which is the only path with "
+                "a survivor counter. It is unavailable here because "
+                f"{'D/D-prime were requested' if need_table else ''}"
+                f"{'the file has missing calls' if reader.has_missing else ''}"
+                f"{'window_kb was set' if window_kb is not None else ''}"
+                f"{'no GPU is available' if not use_gpu else ''}"
+                f"{'an annotation was passed' if annotation is not None else ''}"
+                ". Returning a DataFrame instead of a count would be worse: the "
+                "caller would treat a frame as a number.")
+
+        if use_gpu and fused:
+            cp.cuda.Device(device).use()
+            if count_only:
+                return _scan_gpu_fused(reader, rows, window, min_r2,
+                                       tile_size=tile_size, verbose=verbose,
+                                       tf32=use_tf32, phased=bool(want_phased),
+                                       count_only=True)
+            if stream:
+                n_obs_s = (2 * int(reader.n_samples) if want_phased
+                           else int(reader.n_samples))
+                writer = _ChunkWriter(str(output))
+
+                def _flush(ii_d, jj_d, rr_d):
+                    g = _assemble_device(
+                        cp.stack([ii_d, jj_d], axis=1),
+                        (rr_d, cp.full(ii_d.size, float(n_obs_s),
+                                       dtype=cp.float32)),
+                        reader, rows, stats, sign_reference, path, False,
+                        n_planned=n_pairs)
+                    writer.write(g)
+
+                try:
+                    total = _scan_gpu_fused(
+                        reader, rows, window, min_r2, tile_size=tile_size,
+                        verbose=verbose, tf32=use_tf32,
+                        phased=bool(want_phased), on_flush=_flush,
+                        flush_rows=flush_rows)
+                finally:
+                    writer.close()
+                if verbose:
+                    print(f"cugen.ld: streamed {total:,} rows to {output}")
+                return int(total)
+            ii, jj, rr = _scan_gpu_fused(reader, rows, window, min_r2,
+                                         tile_size=tile_size, verbose=verbose,
+                                         tf32=use_tf32, phased=bool(want_phased))
+            if ii.size == 0:
+                return _empty_pairs(stats)
+            pairs_local = cp.stack([ii, jj], axis=1)
+            n_obs = (2 * int(reader.n_samples) if want_phased
+                     else int(reader.n_samples))
+            n_dev = cp.full(ii.size, float(n_obs), dtype=cp.float32)
+            df = _assemble_device(pairs_local, (rr, n_dev), reader, rows, stats,
                                   sign_reference, path, verbose, n_planned=n_pairs)
             _write_df(df, str(output))
             if verbose:
                 print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs "
-                      f"planned, {len(df):,} emitted  (gpu, cudf device write)")
+                      f"planned, {len(df):,} emitted  (gpu, fused kernel)")
             return df
-        if need_table:
-            res = ld_from_counts(payload, dprime_method=dprime_method)
+
+        if use_gpu:
+            cp.cuda.Device(device).use()
+            pairs_local, payload = _scan_gpu(
+                reader, rows, window, window_kb, positions, min_r2, min_obs,
+                tile_size=tile_size, verbose=verbose, need_table=need_table,
+                keep_device=on_device)
+            if len(pairs_local) == 0:
+                return _empty_pairs(stats)
+            if on_device:
+                df = _assemble_device(pairs_local, payload, reader, rows, stats,
+                                      sign_reference, path, verbose, n_planned=n_pairs)
+                _write_df(df, str(output))
+                if verbose:
+                    print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs "
+                          f"planned, {len(df):,} emitted  (gpu, cudf device write)")
+                return df
+            if need_table:
+                res = ld_from_counts(payload, dprime_method=dprime_method)
+            else:
+                r_arr, n_arr = payload
+                res = _r_only_result(r_arr, n_arr, reader, rows, pairs_local)
         else:
-            r_arr, n_arr = payload
-            res = _r_only_result(r_arr, n_arr, reader, rows, pairs_local)
-    else:
-        pairs_local, _ = _plan_pairs(len(rows), positions, window, window_kb)
-        if want_phased:
-            hap = _haplotypes_numpy(reader)[rows]
-            res = phased_from_haplotypes(hap, pairs_local)
-        else:
-            dos = _dosages_numpy(reader)[rows]
-            tables = contingency_tables(dos, pairs_local)
-            res = ld_from_counts(tables, dprime_method=dprime_method)
+            pairs_local, _ = _plan_pairs(len(rows), positions, window, window_kb)
+            if want_phased:
+                hap = _haplotypes_numpy(reader)[rows]
+                res = phased_from_haplotypes(hap, pairs_local)
+            else:
+                dos = _dosages_numpy(reader)[rows]
+                tables = contingency_tables(dos, pairs_local)
+                res = ld_from_counts(tables, dprime_method=dprime_method)
 
-    # ---- orientation -----------------------------------------------------
-    # Flipping BOTH variants leaves r unchanged; flipping exactly one negates
-    # r, D and D'. plink2 orients by the major allele (Chang et al. 2015).
-    if sign_reference == "major":
-        flip = (res["pA"] > 0.5) ^ (res["pB"] > 0.5)
-        for k in ("r", "r2_signed", "d", "dp", "r_phased", "d_phased",
-                  "dp_phased"):
-            if k in res:
-                res[k] = np.where(flip, -res[k], res[k])
+        # ---- orientation -----------------------------------------------------
+        # Flipping BOTH variants leaves r unchanged; flipping exactly one negates
+        # r, D and D'. plink2 orients by the major allele (Chang et al. 2015).
+        if sign_reference == "major":
+            flip = (res["pA"] > 0.5) ^ (res["pB"] > 0.5)
+            for k in ("r", "r2_signed", "d", "dp", "r_phased", "d_phased",
+                      "dp_phased"):
+                if k in res:
+                    res[k] = np.where(flip, -res[k], res[k])
 
-    # the phased path produces r_phased and no dosage r; filter on whichever
-    # this call actually computed rather than assuming "r" is present
-    r_key = "r" if "r" in res else "r_phased"
-    r2_key = "r2" if "r2" in res else "r2_phased"
-    keep = np.isfinite(res[r_key]) & (res["n"] >= min_obs)
-    if min_r2 > 0:
-        keep &= res[r2_key] >= min_r2
-    idx = np.flatnonzero(keep)
-    if idx.size == 0:
-        return _empty_pairs(stats)
+        # the phased path produces r_phased and no dosage r; filter on whichever
+        # this call actually computed rather than assuming "r" is present
+        r_key = "r" if "r" in res else "r_phased"
+        r2_key = "r2" if "r2" in res else "r2_phased"
+        keep = np.isfinite(res[r_key]) & (res["n"] >= min_obs)
+        if min_r2 > 0:
+            keep &= res[r2_key] >= min_r2
+        idx = np.flatnonzero(keep)
+        if idx.size == 0:
+            return _empty_pairs(stats)
 
-    ga = gidx_all[rows[pairs_local[idx, 0]]]
-    gb = gidx_all[rows[pairs_local[idx, 1]]]
-    df = pd.DataFrame({
-        "gidx_a": ga, "gidx_b": gb,
-        "MAF_A": maf_all[rows[pairs_local[idx, 0]]],
-        "MAF_B": maf_all[rows[pairs_local[idx, 1]]],
-        "N_OBS": res["n"][idx].astype(np.int32),
-    })
-    for s in _STATS:
-        if s in stats:
-            df[_STAT_COL[s]] = res[s][idx]
+        ga = gidx_all[rows[pairs_local[idx, 0]]]
+        gb = gidx_all[rows[pairs_local[idx, 1]]]
+        df = pd.DataFrame({
+            "gidx_a": ga, "gidx_b": gb,
+            "MAF_A": maf_all[rows[pairs_local[idx, 0]]],
+            "MAF_B": maf_all[rows[pairs_local[idx, 1]]],
+            "N_OBS": res["n"][idx].astype(np.int32),
+        })
+        for s in _STATS:
+            if s in stats:
+                df[_STAT_COL[s]] = res[s][idx]
 
-    chrom_fallback = 0
-    m = re.search(r"chr(\d+)", os.path.basename(path))
-    if m:
-        chrom_fallback = int(m.group(1))
-    df = _merge_annotation(df, ann, chrom_fallback)
-    df = _finalize(df, stats)
+        chrom_fallback = 0
+        m = re.search(r"chr(\d+)", os.path.basename(path))
+        if m:
+            chrom_fallback = int(m.group(1))
+        df = _merge_annotation(df, ann, chrom_fallback)
+        df = _finalize(df, stats)
 
-    if verbose:
-        print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs planned, "
-              f"{len(df):,} emitted  (backend={'gpu' if use_gpu else 'numpy'}, "
-              f"dprime={dprime_method}, sign={sign_reference})")
-    if output is not None:
-        _write_df(df, str(output))
-    return df
+        if verbose:
+            print(f"cugen.ld: {len(rows):,} variants -> {n_pairs:,} pairs planned, "
+                  f"{len(df):,} emitted  (backend={'gpu' if use_gpu else 'numpy'}, "
+                  f"dprime={dprime_method}, sign={sign_reference})")
+        if output is not None:
+            _write_df(df, str(output))
+        return df
+    finally:
+        reader.close()
