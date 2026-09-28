@@ -22,3 +22,7 @@ venv/
 *.pid
 test_smoke/
 benchmarks/results/*.parquet
+
+# tabix/bcftools cache the remote index into cwd when streaming a URL
+*.vcf.gz.tbi
+*.vcf.gz.csi

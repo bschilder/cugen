@@ -686,7 +686,55 @@ def gpu_susie_rss(XtX, Xty, var_y, n_samples, L=10, max_iter=100,
     sd_y = cp.float32(np.sqrt(var_y))
     z = cp.sqrt(cp.float32(n)) * beta_hat * sd / sd_y
 
-    # Add small ridge to R diagonal for numerical stability
+    return gpu_susie_rss_from_ld(R, z, n_samples, L=L, max_iter=max_iter,
+                                 prior_var=prior_var, tol=tol,
+                                 prior_pi=prior_pi, verbose=verbose)
+
+
+def gpu_susie_rss_from_ld(R, z, n_samples, L=10, max_iter=100,
+                          prior_var=50.0, tol=1e-4, prior_pi=None,
+                          verbose=True):
+    """GPU-native SuSiE-RSS from a correlation matrix and z-scores.
+
+    The summary-statistics form: everything IBSS needs is (R, z, n), so this is
+    the entry point for fine-mapping against a STORED LD panel -- a
+    ``.cugenld`` via :meth:`cugen.ldio.LDReader.dense`, or an
+    :class:`cugen.ld.LDMatrix` -- where individual genotypes are unavailable.
+    :func:`gpu_susie_rss` is now a thin wrapper that derives R and z from
+    sufficient statistics and calls this.
+
+    R is copied before the ridge is added, so a caller's matrix -- possibly a
+    read-only view over a memory-mapped file -- is never mutated.
+
+    Args:
+        R: (p, p) CuPy array -- correlation matrix, unit diagonal
+        z: (p,) CuPy array -- marginal z-scores, same variant order as R
+        n_samples: int
+        L: number of single effects
+        max_iter: maximum IBSS iterations
+        prior_var: prior variance for each effect, in z-score scale
+        tol: ELBO convergence tolerance
+        prior_pi: (p,) CuPy array of prior inclusion probabilities, or None
+        verbose: print progress
+
+    Returns:
+        pips: (p,) numpy array
+        cs_list: list of dicts with credible set info
+    """
+    R = cp.asarray(R)
+    z = cp.asarray(z).ravel()
+    if R.ndim != 2 or R.shape[0] != R.shape[1]:
+        raise ValueError(f"R must be square, got shape {R.shape}")
+    if z.size != R.shape[0]:
+        raise ValueError(
+            f"z has length {z.size} but R is {R.shape[0]}x{R.shape[0]}; the "
+            f"z-scores and the LD matrix must be in the same variant order")
+    p = R.shape[0]
+    n = n_samples
+
+    # Add small ridge to R diagonal for numerical stability. On a copy: R may
+    # be a caller's array, and dense() can hand back a view.
+    R = R.astype(cp.float32, copy=True)
     R[cp.arange(p), cp.arange(p)] += cp.float32(1e-4)
 
     # Initialize SuSiE parameters
@@ -775,7 +823,10 @@ def gpu_susie_rss(XtX, Xty, var_y, n_samples, L=10, max_iter=100,
         })
 
     # Cleanup
-    del R, z, alpha, mu, mu2, r_l, beta_hat, sd, diag_XtX, log_bf
+    # beta_hat/sd/diag_XtX belong to gpu_susie_rss, which derives R and z and
+    # then calls this; they are not in scope here and CPython frees them when
+    # that wrapper returns.
+    del R, z, alpha, mu, mu2, r_l, log_bf
     cp.get_default_memory_pool().free_all_blocks()
 
     if verbose:

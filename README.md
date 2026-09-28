@@ -150,6 +150,53 @@ cg.score(weights="weights.tsv", cugen_dir="data/")  # ≈ plink2 --score
 cg.plot.qq(sumstats); cg.plot.manhattan(sumstats)
 ```
 
+## Preparing input
+
+`.cugen` is built from a VCF/BCF, a PLINK1 `.bed`, or a pgen:
+
+```bash
+python -m cugen.convert vcf  input.vcf.gz chr22.cugen --region chr22
+python -m cugen.convert bed  input.bed    chr22.cugen
+python -m cugen.convert pgen input.pgen   chr22.cugen
+```
+
+```python
+from cugen.convert import vcf2cugen, vcf2cugenh
+vcf2cugen("input.vcf.gz", "chr22.cugen", region="chr22")       # dosages
+vcf2cugenh("phased.vcf.gz", "chr22_ph.cugen", region="chr22")  # haplotypes
+```
+
+### Input must be biallelic
+
+A site with more than one ALT has no honest 0/1/2 dosage column, so
+`vcf2cugen` **refuses** it rather than guess, and `vcf2cugenh` skips it.
+Split upstream, once:
+
+```bash
+bcftools norm -m -any in.vcf.gz -Oz -o split.vcf.gz
+bcftools index -t split.vcf.gz
+```
+
+CuGen deliberately does not split multi-allelic sites. Splitting renormalises
+REF/ALT against the reference sequence, which CuGen never sees; bcftools does
+it correctly, preserves phase, and is lossless for per-allele dosage — a `1|2`
+genotype at a triallelic site becomes `1|0` and `0|1` at the two resulting
+records, i.e. dosage 1 at each.
+
+Two things worth knowing:
+
+- **`plink2 --max-alleles 2` does not split.** It *excludes* variants with more
+  than the given number of alleles (`--max-alleles <ct> : Exclude variants with
+  more than the given # of alleles`). plink2 has no multi-allelic splitter;
+  `bcftools norm` is the tool.
+- **Most reference panels already ship split.** The 1kGP 30x GRCh38 panel
+  carries zero records with more than one ALT (chr21: 1,002,753 records, 0
+  multi-allelic) — its multi-allelic sites appear as several biallelic records
+  sharing a POS, which is the post-split form. Those per-ALT records then sit at
+  distance 0 from one another, carrying LD forced by the representation rather
+  than by haplotype structure; see
+  [#18](https://github.com/yuj1r0/cugen/issues/18).
+
 ## The `.cugen` file format
 
 A single fixed-layout binary supporting both streaming and random
@@ -217,9 +264,16 @@ locus without scanning unrelated variants.
 | `--freq`        |                               | `freq`             |
 | `--glm`         | `linear_regression_rows`      | `glm`              |
 | `--score`       |                               | `score`            |
-| `--clump`       |                               | `clump` *(v0.2)*   |
-| `--king`        | `realized_relationship_matrix`| `make_king` *(v0.2)* |
+| `--r2` / `--ld` |                               | `r2` / `ld_matrix` |
+| `--clump`       |                               | `clump`            |
+| `--indep-pairwise` |                            | `prune`            |
+| `--make-grm`    | `realized_relationship_matrix`| `make_grm` / `grm` |
+| `--king`        |                               | `make_king` *(v0.2)* |
 |                 | `hwe_normalized_pca`          | `pca` *(v0.2)*     |
+
+LD significance testing (`chi2`, `p`, exact conditional, Bonferroni/BH-FDR,
+inflation control) has no PLINK equivalent -- plink2 emits no LD p-values.
+See `ld_matrix` and `cugen ld --help`.
 
 ## Workflow JSON
 
